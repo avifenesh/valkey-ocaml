@@ -2,6 +2,7 @@ module Error : sig
   type t =
     | Tcp_refused of string
     | Dns_failed of string
+    | Tls_failed of string
     | Handshake_rejected of Valkey_error.t
     | Auth_failed of Valkey_error.t
     | Protocol_violation of string
@@ -46,6 +47,7 @@ module Config : sig
     command_timeout : float option;
     push_buffer_size : int;
     max_queued_bytes : int;
+    tls : Tls_config.t option;
   }
   val default : t
 end

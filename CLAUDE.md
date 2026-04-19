@@ -45,4 +45,31 @@ Every new OCaml, Eio, or ecosystem concept is explained before it's used. Pace i
 
 ## Conventions
 
-_To be filled in as we learn and decide together._
+### Documentation-first per command
+Before writing OCaml code for any Valkey command, we always:
+1. Fetch the current page on `valkey.io/commands/<name>/`.
+2. Quote the exact syntax and argument list.
+3. Enumerate every documented reply type (success + error).
+4. Flag any undocumented edge case (e.g., RESP3 PING-in-subscribe) as "needs empirical verification" — never guess and move on.
+
+Rationale: semantics drift across versions (e.g., HELLO gained `availability_zone` in 8.1; `protover` became optional in 6.2). My training data lags; valkey.io is the source of truth.
+
+### API surface: typed, not raw
+The public API exposes **typed command functions** — `Client.ping c`, `Client.hello c ~proto:3` — returning semantically-typed replies (`ping_reply`, `hello`), not raw `resp3` values. A raw-reply escape hatch may exist for power users, but the default is typed.
+
+Rationale: users shouldn't pattern-match on `Bulk_string`/`Simple_string` for every call. The client knows what each command returns; it's the client's job to decode.
+
+### Error type: domain-typed, not raw
+Command errors surface as a named `valkey_error` record with fields like `code` (e.g., `"WRONGTYPE"`, `"NOPROTO"`) and `message`, not bare `resp3`. Callers match on `code`.
+
+Rationale: matching `code = "WRONGTYPE"` is idiomatic; pattern-matching a raw `Error { kind; msg }` variant nested inside `resp3` is awkward and leaks protocol details.
+
+### Connection: abstract behind a signature
+The connection type is abstract — defined by a module signature (`.mli`), its representation hidden from callers. Internals (sockets, buffers, reader fibers) are free to evolve without breaking users.
+
+Rationale: connection internals will change a lot (pipelining, reconnect state, cluster-node variant). Abstract from day 1 so we never have to un-leak implementation details.
+
+### Connection-setup errors: exceptions, not `result`
+Handshake failures (TCP refused, `HELLO` rejected, AUTH wrong) raise exceptions during `connect`. Per-command failures (WRONGTYPE, MOVED, …) return `result`.
+
+Rationale: if the connection can't be established, there's nothing to `result`-handle. Users get a clean "connection failed" exception at the boundary and proceed normally after.

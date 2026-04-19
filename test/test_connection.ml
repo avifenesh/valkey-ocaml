@@ -134,6 +134,48 @@ let test_availability_zone () =
   let _ = C.availability_zone conn in
   ()
 
+let tls_port = 6390
+
+let rec find_repo_file rel dir =
+  let candidate = Filename.concat dir rel in
+  if Sys.file_exists candidate then candidate
+  else
+    let parent = Filename.dirname dir in
+    if parent = dir then
+      Alcotest.failf "cannot locate %s walking up from %s" rel (Sys.getcwd ())
+    else find_repo_file rel parent
+
+let ca_pem () =
+  let path = find_repo_file "tls/ca.crt" (Sys.getcwd ()) in
+  In_channel.with_open_bin path In_channel.input_all
+
+let with_tls_connection ~tls f =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config = { C.Config.default with tls = Some tls } in
+  let conn =
+    C.connect ~sw ~net ~clock ~config ~host:"localhost" ~port:tls_port ()
+  in
+  let r = f conn in
+  C.close conn;
+  r
+
+let test_tls_insecure () =
+  with_tls_connection ~tls:(Valkey.Tls_config.insecure ()) @@ fun conn ->
+  expect_simple_eq ~ctx:"PING over TLS (insecure)" ~expected:"PONG"
+    (C.request conn [| "PING" |])
+
+let test_tls_ca_verify () =
+  let ca_pem = ca_pem () in
+  let tls =
+    Valkey.Tls_config.with_ca_cert ~server_name:"localhost" ~ca_pem ()
+  in
+  with_tls_connection ~tls @@ fun conn ->
+  expect_simple_eq ~ctx:"PING over TLS (CA-verified)" ~expected:"PONG"
+    (C.request conn [| "PING" |])
+
 (* Second connection kills first's socket; first should recover + serve. *)
 let test_recovery_client_kill () =
   Eio_main.run @@ fun env ->
@@ -226,4 +268,6 @@ let tests =
     Alcotest.test_case "timeout_late_reply" `Quick test_timeout_late_reply;
     Alcotest.test_case "stress" `Quick test_stress;
     Alcotest.test_case "budget_exhaustion" `Quick test_budget_exhaustion;
+    Alcotest.test_case "tls_insecure" `Quick test_tls_insecure;
+    Alcotest.test_case "tls_ca_verify" `Quick test_tls_ca_verify;
   ]

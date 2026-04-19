@@ -1,12 +1,12 @@
 # Dev-only Valkey target for the client.
-# Standalone single node on :6379. No auth, no TLS — that's client-concern territory
-# we'll exercise in dedicated compose files later.
+# Exposes :6379 (plain) and :6390 (TLS).
 #
 # Usage:
-#   docker compose up -d          # start
-#   docker compose logs -f valkey # tail
-#   docker compose down           # stop & remove
-#   docker compose down -v        # stop & wipe data volume
+#   bash scripts/gen-tls-certs.sh   # once; self-signed certs in ./tls/
+#   docker compose up -d
+#   docker compose logs -f valkey
+#   docker compose down             # stop & remove
+#   docker compose down -v          # stop & wipe data
 
 services:
   valkey:
@@ -14,13 +14,20 @@ services:
     container_name: ocaml-valkey-dev
     ports:
       - "6379:6379"
-    # No volume on purpose: fresh state each `up`. Add a volume only when we
-    # deliberately want persistence tests (RDB/AOF).
+      - "6390:6390"
+    volumes:
+      - ./tls:/tls:ro
     command: >-
       valkey-server
       --appendonly no
       --save ""
       --protected-mode no
+      --port 6379
+      --tls-port 6390
+      --tls-cert-file /tls/server.crt
+      --tls-key-file /tls/server.key
+      --tls-ca-cert-file /tls/ca.crt
+      --tls-auth-clients no
     healthcheck:
       test: ["CMD", "valkey-cli", "-p", "6379", "PING"]
       interval: 2s

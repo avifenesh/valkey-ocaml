@@ -1,4 +1,7 @@
 (library
  (name valkey)
  (public_name valkey)
- (libraries eio eio.unix eio_main))
+ (libraries
+  eio eio.unix eio_main
+  tls tls-eio x509 ca-certs domain-name
+  mirage-crypto-rng.unix))

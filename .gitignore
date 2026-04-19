@@ -48,3 +48,6 @@ coverage/
 
 # Session tooling artifacts (not project code)
 .remember/
+
+# Generated TLS dev certs
+tls/

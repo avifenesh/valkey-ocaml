@@ -73,6 +73,7 @@ module Error = struct
   type t =
     | Tcp_refused of string
     | Dns_failed of string
+    | Tls_failed of string
     | Handshake_rejected of Valkey_error.t
     | Auth_failed of Valkey_error.t
     | Protocol_violation of string
@@ -88,6 +89,7 @@ module Error = struct
   let pp ppf = function
     | Tcp_refused s -> Format.fprintf ppf "Tcp_refused(%s)" s
     | Dns_failed s -> Format.fprintf ppf "Dns_failed(%s)" s
+    | Tls_failed s -> Format.fprintf ppf "Tls_failed(%s)" s
     | Handshake_rejected e ->
         Format.fprintf ppf "Handshake_rejected(%a)" Valkey_error.pp e
     | Auth_failed e -> Format.fprintf ppf "Auth_failed(%a)" Valkey_error.pp e
@@ -101,7 +103,7 @@ module Error = struct
 
   let is_terminal = function
     | Auth_failed _ | Protocol_violation _ | Closed | Terminal _ -> true
-    | Handshake_rejected _ -> true
+    | Handshake_rejected _ | Tls_failed _ -> true
     | Tcp_refused _ | Dns_failed _ | Timeout | Interrupted | Queue_full
     | Server_error _ -> false
 end
@@ -147,6 +149,7 @@ module Config = struct
     command_timeout : float option;
     push_buffer_size : int;
     max_queued_bytes : int;
+    tls : Tls_config.t option;
   }
   let default = {
     handshake = Handshake.default;
@@ -154,6 +157,7 @@ module Config = struct
     command_timeout = None;
     push_buffer_size = 1024;
     max_queued_bytes = 10 * 1024 * 1024;
+    tls = None;
   }
 end
 
@@ -275,7 +279,22 @@ let full_handshake (sock : socket) (hs : Handshake.t) :
             | Ok () -> Ok (hello_map, az)
             | Error e -> Error e))
 
-let make_tcp_connector ~sw ~net ~host ~port =
+let wrap_with_tls ~tls_cfg sock =
+  match
+    Tls.Config.client ~authenticator:(Tls_config.authenticator tls_cfg) ()
+  with
+  | Error (`Msg m) -> Error (Error.Tls_failed ("client config: " ^ m))
+  | Ok client_cfg ->
+      (try
+         let flow =
+           Tls_eio.client_of_flow client_cfg
+             ?host:(Tls_config.server_name tls_cfg)
+             sock
+         in
+         Ok flow
+       with exn -> Error (Error.Tls_failed (Printexc.to_string exn)))
+
+let make_tcp_connector ~sw ~net ~host ~port ~tls =
   fun () ->
     match
       try
@@ -286,13 +305,29 @@ let make_tcp_connector ~sw ~net ~host ~port =
     | Ok [] -> Error (Error.Dns_failed host)
     | Ok (addr :: _) ->
         (try
-           let s = Eio.Net.connect ~sw net addr in
-           let reader = Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) s in
-           let write bytes = Eio.Flow.copy_string bytes s in
-           let close () =
-             try Eio.Resource.close s with _ -> ()
-           in
-           Ok { write; reader; close }
+           let tcp = Eio.Net.connect ~sw net addr in
+           match tls with
+           | None ->
+               let reader =
+                 Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) tcp
+               in
+               let write bytes = Eio.Flow.copy_string bytes tcp in
+               let close () = try Eio.Resource.close tcp with _ -> () in
+               Ok { write; reader; close }
+           | Some tls_cfg ->
+               (match wrap_with_tls ~tls_cfg tcp with
+                | Error e ->
+                    (try Eio.Resource.close tcp with _ -> ());
+                    Error e
+                | Ok flow ->
+                    let reader =
+                      Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) flow
+                    in
+                    let write bytes = Eio.Flow.copy_string bytes flow in
+                    let close () =
+                      try Eio.Resource.close flow with _ -> ()
+                    in
+                    Ok { write; reader; close })
          with exn -> Error (Error.Tcp_refused (Printexc.to_string exn)))
 
 let connect_and_handshake t : (socket * Resp3.t * string option, Error.t) result =
@@ -488,7 +523,7 @@ let rec supervisor_run t =
     | _ -> ()
 
 let connect ~sw ~net ~clock ?(config = Config.default) ~host ~port () =
-  let connect_once = make_tcp_connector ~sw ~net ~host ~port in
+  let connect_once = make_tcp_connector ~sw ~net ~host ~port ~tls:config.tls in
   let sleep d = Eio.Time.sleep clock d in
   let now () = Eio.Time.now clock in
   let with_timeout : 'a. float -> (unit -> 'a) -> ('a, [ `Timeout ]) result =
