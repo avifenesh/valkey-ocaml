@@ -105,12 +105,41 @@ let err_terminal fmt =
    and retries after a redirect. *)
 let send_once ?timeout conn args = Connection.request ?timeout conn args
 
-(* CLUSTERDOWN: slots are unassigned cluster-wide — operator action or
-   failover in progress. Short back-off and trigger refresh.
-   TRYAGAIN: the keys span a slot currently being migrated. Short
-   back-off and re-dispatch to the same target. *)
-let clusterdown_backoff = 0.1
+(* Back-off intervals (seconds) for the various retryable conditions.
+   CLUSTERDOWN:  slots are unassigned cluster-wide; operator action
+                 or failover in progress.
+   TRYAGAIN:     the keys span a slot currently being migrated.
+   Conn_lost:    the connection was torn down mid-flight (server-side
+                 kill, docker restart, network partition). Retried
+                 up to max_redirects times for every command, matching
+                 GLIDE / SE.Redis / lettuce convention: at-least-once
+                 semantics over at-most-once. The bound prevents
+                 runaway duplication; applications that cannot
+                 tolerate a tiny double-apply window under chaos
+                 should use MULTI/EXEC or application-level
+                 idempotency keys. *)
+(* Fixed waits for the low-severity conditions. A slot migration
+   (TRYAGAIN) and a torn-down connection typically clear in tens of
+   ms, so a small fixed pause works fine. *)
 let tryagain_backoff = 0.05
+let conn_lost_backoff = 0.05
+
+(* CLUSTERDOWN often lasts longer than the others — a failover has
+   to elect + gossip + accept writes again, which can take a few
+   seconds. Fixed 100 ms × max_redirects (≈ 500 ms total) was too
+   tight and routinely exhausted the retry budget. Exponential
+   back-off spends most of that budget at the tail:
+     attempt 0 → 100 ms
+     attempt 1 → 200 ms
+     attempt 2 → 400 ms
+     attempt 3 → 800 ms
+     attempt 4 → 1.6 s     (cumulative ≈ 3.1 s)
+   Capped at 1.6 s so we never block a user command indefinitely. *)
+let clusterdown_backoff_for_attempt attempt =
+  let base = 0.1 in
+  let cap = 1.6 in
+  let multiplier = 2. ** float_of_int attempt in
+  Float.min cap (base *. multiplier)
 
 let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
     ?timeout ~dispatch args =
@@ -147,13 +176,25 @@ let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
          | None ->
              (match ve.code with
               | "CLUSTERDOWN" ->
-                  Eio.Time.sleep clock clusterdown_backoff;
+                  Eio.Time.sleep clock
+                    (clusterdown_backoff_for_attempt attempt);
                   trigger_refresh ();
                   loop (attempt + 1) (dispatch ())
               | "TRYAGAIN" ->
                   Eio.Time.sleep clock tryagain_backoff;
                   loop (attempt + 1) (dispatch ())
               | _ -> result))
+    | Error (Connection.Error.Interrupted | Connection.Error.Closed)
+      when attempt < max_redirects ->
+        (* Connection went away under this request. Wake the refresh
+           fiber (the node may have fallen over) and re-dispatch;
+           the pool entry will either reconnect, or the refreshed
+           topology will route us to the new owner. Bounded by
+           max_redirects so a persistently-down target still
+           surfaces the error to the caller. *)
+        trigger_refresh ();
+        Eio.Time.sleep clock conn_lost_backoff;
+        loop (attempt + 1) (dispatch ())
     | Error _ -> result
   in
   loop 0 (dispatch ())
