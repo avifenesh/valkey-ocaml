@@ -5,6 +5,7 @@ let () =
       "valkey_error", Test_valkey_error.tests;
       "slot", Test_slot.tests;
       "topology", Test_topology.tests;
+      "discovery", Test_discovery.tests;
       "connection (needs docker valkey :6379)", Test_connection.tests;
       "client (needs docker valkey :6379)", Test_client.tests;
     ]
