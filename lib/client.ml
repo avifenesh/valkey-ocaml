@@ -662,3 +662,40 @@ let script_flush ?timeout ?mode t =
   | Error e -> Error e
   | Ok (Resp3.Simple_string "OK") -> Ok ()
   | Ok v -> Error (protocol_violation "SCRIPT FLUSH" v)
+
+(* ---------- iteration ---------- *)
+
+type scan_page = { cursor : string; keys : string list }
+
+let scan ?timeout ?read_from ?match_ ?count ?type_ t ~cursor =
+  let match_a = match match_ with
+    | None -> []
+    | Some p -> [ "MATCH"; p ]
+  in
+  let count_a = match count with
+    | None -> []
+    | Some n -> [ "COUNT"; string_of_int n ]
+  in
+  let type_a = match type_ with
+    | None -> []
+    | Some t -> [ "TYPE"; t ]
+  in
+  let args =
+    Array.of_list ([ "SCAN"; cursor ] @ match_a @ count_a @ type_a)
+  in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok (Resp3.Array [ cursor_v; Resp3.Array items ]) ->
+      (match extract_string "SCAN cursor" cursor_v with
+       | Error e -> Error e
+       | Ok cursor ->
+           (match strings_of_resp3_collection "SCAN keys" items with
+            | Error e -> Error e
+            | Ok keys -> Ok { cursor; keys }))
+  | Ok v -> Error (protocol_violation "SCAN" v)
+
+let keys ?timeout ?read_from t pattern =
+  match exec ?timeout ?read_from t [| "KEYS"; pattern |] with
+  | Error e -> Error e
+  | Ok (Resp3.Array items) -> strings_of_resp3_collection "KEYS" items
+  | Ok v -> Error (protocol_violation "KEYS" v)

@@ -602,6 +602,32 @@ let tests =
               | Error e -> Format.asprintf "Error %a" E.pp e));
       let _ = C.del c [ key ] in
       ());
+    Alcotest.test_case "SCAN + KEYS" `Quick (fun () ->
+      with_client @@ fun c ->
+      let prefix = "ocaml:c:scan:" in
+      let n = 25 in
+      let keys = List.init n (fun i -> prefix ^ string_of_int i) in
+      List.iter (fun k -> ignore (C.set c k "v")) keys;
+      (* SCAN iterates until cursor = "0" *)
+      let rec drain cursor acc =
+        match C.scan c ~cursor ~match_:(prefix ^ "*") ~count:10 with
+        | Error e -> Alcotest.failf "SCAN: %a" E.pp e
+        | Ok page ->
+            let acc = page.keys @ acc in
+            if page.cursor = "0" then acc else drain page.cursor acc
+      in
+      let found = drain "0" [] in
+      let dedup =
+        List.sort_uniq compare found |> List.filter (fun k ->
+          String.length k >= String.length prefix
+          && String.sub k 0 (String.length prefix) = prefix)
+      in
+      Alcotest.(check int) "SCAN found all seeded keys" n (List.length dedup);
+      (match C.keys c (prefix ^ "*") with
+       | Ok ks ->
+           Alcotest.(check int) "KEYS found all seeded" n (List.length ks)
+       | Error e -> Alcotest.failf "KEYS: %a" E.pp e);
+      List.iter (fun k -> ignore (C.del c [ k ])) keys);
     Alcotest.test_case "HINCRBY" `Quick (fun () ->
       with_client @@ fun c ->
       let key = "ocaml:c:h4" in

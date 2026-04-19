@@ -421,3 +421,27 @@ val script_flush :
   ?timeout:float ->
   ?mode:script_flush_mode ->
   t -> (unit, Connection.Error.t) result
+
+(** {1 Iteration} *)
+
+type scan_page = {
+  cursor : string;
+    (** ["0"] when iteration is complete; any other value is the next
+        cursor to pass back. *)
+  keys : string list;
+}
+
+val scan :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  ?match_:string ->
+  ?count:int ->
+  ?type_:string ->
+  t -> cursor:string -> (scan_page, Connection.Error.t) result
+
+val keys :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> (string list, Connection.Error.t) result
+(** [KEYS pattern]. Use [scan] in production; [KEYS] is O(N) and blocks
+    the server. *)
