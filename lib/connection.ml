@@ -254,7 +254,8 @@ end
 
 type socket = {
   write : string -> unit;
-  reader : Eio.Buf_read.t;
+  reader : Eio.Buf_read.t;              (* only used during handshake *)
+  read_into : Cstruct.t -> int;         (* used by in_pump post-handshake *)
   close : unit -> unit;
 }
 
@@ -405,8 +406,9 @@ let make_tcp_connector ~sw ~net ~host ~port ~tls =
                  Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) tcp
                in
                let write bytes = Eio.Flow.copy_string bytes tcp in
+               let read_into buf = Eio.Flow.single_read tcp buf in
                let close () = try Eio.Resource.close tcp with _ -> () in
-               Ok { write; reader; close }
+               Ok { write; reader; read_into; close }
            | Some tls_cfg ->
                (match wrap_with_tls ~tls_cfg tcp with
                 | Error e ->
@@ -417,10 +419,11 @@ let make_tcp_connector ~sw ~net ~host ~port ~tls =
                       Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) flow
                     in
                     let write bytes = Eio.Flow.copy_string bytes flow in
+                    let read_into buf = Eio.Flow.single_read flow buf in
                     let close () =
                       try Eio.Resource.close flow with _ -> ()
                     in
-                    Ok { write; reader; close })
+                    Ok { write; reader; read_into; close })
          with exn -> Error (Error.Tcp_refused (Printexc.to_string exn)))
 
 let connect_and_handshake t : (socket * Resp3.t * string option, Error.t) result =
@@ -465,9 +468,9 @@ let jittered_backoff (policy : Reconnect.t) attempts =
   let amount = base *. policy.jitter in
   base +. (Random.float (2.0 *. amount)) -. amount
 
-let write_worker (t : t) (sock : socket) : exn option =
+let out_pump (t : t) (sock : socket) : unit =
   let rec loop () =
-    if Atomic.get t.closing then None
+    if Atomic.get t.closing then ()
     else begin
       let q =
         match t.unsent with
@@ -481,35 +484,59 @@ let write_worker (t : t) (sock : socket) : exn option =
         with exn -> Error exn
       in
       match write_result with
-      | Error exn ->
-          t.unsent <- Some q;
-          Some exn
+      | Error _ ->
+          t.unsent <- Some q
+          (* leave loop; raise disconnect by returning *)
       | Ok () ->
           Queue.push q.entry t.sent;
           loop ()
     end
   in
-  try loop ()
-  with Exit -> None
+  try loop () with Exit -> ()
 
-let read_worker (t : t) (sock : socket) : [ `Closed | `Error ] =
+let in_pump (t : t) (sock : socket) (bytes_chan : Cstruct.t Eio.Stream.t)
+    (reader : Byte_reader.t) : unit =
   let rec loop () =
-    if Atomic.get t.closing then `Closed
+    if Atomic.get t.closing then ()
+    else
+      let buf = Cstruct.create 8192 in
+      match
+        try
+          let n = sock.read_into buf in
+          if n = 0 then `Eof else `N n
+        with End_of_file -> `Eof
+           | _ -> `Err
+      with
+      | `Eof | `Err -> ()
+      | `N n ->
+          let chunk = Cstruct.sub buf 0 n in
+          Eio.Stream.add bytes_chan chunk;
+          loop ()
+  in
+  (try loop () with _ -> ());
+  (* Signal the parser fiber that no more bytes are coming. *)
+  Byte_reader.close reader
+
+let parse_worker (t : t) (byte_src : Resp3_parser.byte_source) : unit =
+  let rec loop () =
+    if Atomic.get t.closing then ()
     else
       let outcome =
         try
           Eio.Fiber.first
-            (fun () -> `Read (Resp3_parser.read (Resp3_parser.of_buf_read sock.reader)))
+            (fun () -> `Read (Resp3_parser.read byte_src))
             (fun () ->
               Eio.Promise.await t.cancel_signal;
               `Cancelled)
         with
-        | End_of_file | Resp3_parser.Parse_error _ | Eio.Io _ -> `Err
+        | Byte_reader.End_of_stream
+        | Resp3_parser.Parse_error _
+        | End_of_file
+        | Eio.Io _ -> `Err
         | _ -> `Err
       in
       match outcome with
-      | `Cancelled -> `Closed
-      | `Err -> `Error
+      | `Cancelled | `Err -> ()
       | `Read (Push _ as p) ->
           Eio.Stream.add t.pushes p;
           loop ()
@@ -529,22 +556,17 @@ let read_worker (t : t) (sock : socket) : [ `Closed | `Error ] =
   loop ()
 
 let run_connection (t : t) (sock : socket) : [ `Closed | `Disconnected ] =
-  let outcome =
-    try
-      Eio.Fiber.first
-        (fun () ->
-          match read_worker t sock with
-          | `Closed -> `Reader_closed
-          | `Error -> `Reader_error)
-        (fun () ->
-          match write_worker t sock with
-          | None -> `Writer_closed
-          | Some _ -> `Writer_error)
-    with _ -> `Reader_error
-  in
-  match outcome with
-  | `Reader_closed | `Writer_closed -> `Closed
-  | `Reader_error | `Writer_error -> `Disconnected
+  let bytes_chan : Cstruct.t Eio.Stream.t = Eio.Stream.create 128 in
+  let reader = Byte_reader.create bytes_chan in
+  let byte_src = Byte_reader.to_byte_source reader in
+  (try
+     Eio.Fiber.any
+       [ (fun () -> in_pump t sock bytes_chan reader);
+         (fun () -> parse_worker t byte_src);
+         (fun () -> out_pump t sock);
+       ]
+   with _ -> ());
+  if Atomic.get t.closing then `Closed else `Disconnected
 
 let recovery_loop (t : t) : unit =
   let policy = t.config.reconnect in
