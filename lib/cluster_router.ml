@@ -57,27 +57,37 @@ let pick_random nodes =
   | [] -> None
   | _ -> Some (List.nth nodes (Random.int (List.length nodes)))
 
+(* AZ-affinity fallback chain matches GLIDE / lettuce / SE.Redis:
+     tier 1  preferred candidate set (in-AZ replicas, or in-AZ
+             nodes for the +primary variant)
+     tier 2  any other replica (still off the primary)
+     tier 3  primary
+   The earlier implementation jumped straight from tier 1 to
+   tier 3, which gave up unnecessary read capacity whenever no
+   replica lived in the requested AZ. *)
 let pick_node_by_read_from (rf : Router.Read_from.t) (shard : Topology.Shard.t) =
   let in_az az nodes =
     List.filter
       (fun (n : Topology.Node.t) -> n.availability_zone = Some az)
       nodes
   in
+  let any_replica_or_primary () =
+    match pick_random shard.replicas with
+    | Some r -> r
+    | None -> shard.primary
+  in
   match rf with
   | Router.Read_from.Primary -> shard.primary
-  | Router.Read_from.Prefer_replica ->
-      (match pick_random shard.replicas with
-       | Some r -> r
-       | None -> shard.primary)
+  | Router.Read_from.Prefer_replica -> any_replica_or_primary ()
   | Router.Read_from.Az_affinity { az } ->
       (match pick_random (in_az az shard.replicas) with
        | Some r -> r
-       | None -> shard.primary)
+       | None -> any_replica_or_primary ())
   | Router.Read_from.Az_affinity_replicas_and_primary { az } ->
-      let all_nodes = shard.primary :: shard.replicas in
-      (match pick_random (in_az az all_nodes) with
+      let in_az_pool = in_az az (shard.primary :: shard.replicas) in
+      (match pick_random in_az_pool with
        | Some n -> n
-       | None -> shard.primary)
+       | None -> any_replica_or_primary ())
 
 let build_pool ~sw ~net ~clock ?domain_mgr ~connection_config ~prefer_hostname
     topology =

@@ -26,17 +26,33 @@ which node actually served the request. Expected output for a
   12  <primary id>
 
 [Prefer_replica] for slot 0, 12 probes:
-  12  <some replica id>      ← all to one replica per process; varies between runs
+  ~6  <replica A id>     ← split across replicas because pick_node_by_read_from
+  ~6  <replica B id>        randomises across the candidate set
 ```
 
-The `Prefer_replica` distribution is randomised per call (see
+`Prefer_replica` is randomised per call (see
 [`lib/cluster_router.ml`](../../lib/cluster_router.ml)
-`pick_random`), so successive runs hit different replicas.
+`pick_random`), so over many calls the distribution spreads
+across replicas.
 
-The AZ-affinity probes show the fall-back-to-primary behaviour
-because docker-compose doesn't simulate availability zones — this
-is exactly what you'd see in a single-AZ deployment with the AZ
-flag set.
+### AZ-affinity fallback chain
+
+`Az_affinity { az }` and `Az_affinity_replicas_and_primary { az }`
+have a 3-tier fallback:
+
+1. Pick a replica in the requested AZ.
+2. If none, pick any other replica.
+3. If no replicas at all, the primary.
+
+The docker-compose cluster doesn't set `availability_zone` on its
+nodes (no `--availability-zone` flag in `docker-compose.cluster.yml`),
+so tier 1 always returns empty and the example demonstrates tier
+2 — the distribution should match `Prefer_replica`.
+
+To exercise tier 1 against a real multi-AZ cluster (e.g. AWS
+ElastiCache), pass the AZ string the cluster reports — visible
+via `CLUSTER SHARDS` on the `availability-zone` field of each
+node.
 
 ## tls.ml
 

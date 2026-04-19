@@ -68,15 +68,28 @@ let () =
         ~label:"Primary" 12;
       probe ~client ~slot ~read_from:R.Read_from.Prefer_replica
         ~label:"Prefer_replica" 12;
-      (* AZ paths: docker-compose cluster doesn't simulate multi-AZ,
-         so the AZ filter likely returns [] and we fall back to
-         primary. Output proves the fall-back path is active. *)
+
+      (* AZ-affinity fallback chain (3 tiers):
+           1. replica in the requested AZ
+           2. any other replica
+           3. primary
+         The docker-compose cluster doesn't set availability_zone on
+         any node, so tier 1 always returns []. Tier 2 kicks in and
+         spreads across the local replicas; tier 3 only fires if the
+         shard somehow has zero replicas (e.g. mid-failover). The
+         distribution below should match Prefer_replica because tier
+         1 is empty.
+
+         To exercise tier 1 against a real multi-AZ cluster (e.g.
+         AWS ElastiCache), pass the AZ string the cluster reports
+         (visible via `CLUSTER SHARDS` -> "availability-zone" field
+         on each node). *)
       probe ~client ~slot
         ~read_from:(R.Read_from.Az_affinity { az = "us-east-1a" })
-        ~label:"Az_affinity (no replicas in AZ -> primary)" 6;
+        ~label:"Az_affinity (no in-AZ -> tier 2: any replica)" 12;
       probe ~client ~slot
         ~read_from:
           (R.Read_from.Az_affinity_replicas_and_primary
              { az = "us-east-1a" })
-        ~label:"Az_affinity_replicas_and_primary"
-        6
+        ~label:"Az_affinity_replicas_and_primary (no in-AZ -> tier 2)"
+        12
