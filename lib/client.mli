@@ -47,8 +47,6 @@ val connect :
 val close : t -> unit
 
 val raw_connection : t -> Connection.t
-(** Escape hatch for observability / advanced use. Do not send on this
-    directly under normal use — go through [exec] or the typed commands. *)
 
 val exec :
   ?timeout:float ->
@@ -57,10 +55,8 @@ val exec :
   t ->
   string array ->
   (Resp3.t, Connection.Error.t) result
-(** Send a raw RESP command. Routing hints are accepted but ignored in
-    standalone mode — they matter once a cluster router is wired. *)
 
-(** {1 Typed commands (Tier 1 — being filled in progressively)} *)
+(** {1 Strings, counters, TTL} *)
 
 val get :
   ?timeout:float ->
@@ -72,10 +68,96 @@ val set :
   ?ex_seconds:float ->
   ?nx:bool ->
   ?xx:bool ->
+  ?ifeq:string ->
   t -> string -> string -> (bool, Connection.Error.t) result
-(** [true] on success; [false] when [NX]/[XX] condition prevented the set. *)
+(** [true] on success; [false] when NX/XX/IFEQ prevented the write. *)
+
+val set_and_get :
+  ?timeout:float ->
+  ?ex_seconds:float ->
+  ?nx:bool ->
+  ?xx:bool ->
+  ?ifeq:string ->
+  t -> string -> string -> (string option, Connection.Error.t) result
+(** SET ... GET variant. Returns the old value (None if key didn't exist). *)
 
 val del :
   ?timeout:float ->
   t -> string list -> (int, Connection.Error.t) result
-(** Returns the number of keys that were removed. *)
+
+val unlink :
+  ?timeout:float ->
+  t -> string list -> (int, Connection.Error.t) result
+(** Async-delete; returns count of keys removed. *)
+
+val delifeq :
+  ?timeout:float ->
+  t -> string -> value:string -> (bool, Connection.Error.t) result
+(** Valkey 9+. Deletes key only if its current value equals [value]. *)
+
+val setex :
+  ?timeout:float ->
+  t -> string -> seconds:int -> string -> (unit, Connection.Error.t) result
+
+val setnx :
+  ?timeout:float ->
+  t -> string -> string -> (bool, Connection.Error.t) result
+
+val mget :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string list -> (string option list, Connection.Error.t) result
+
+type value_type =
+  | T_none
+  | T_string
+  | T_list
+  | T_hash
+  | T_set
+  | T_zset
+  | T_stream
+  | T_other of string
+
+val type_of :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> (value_type, Connection.Error.t) result
+
+type expiry_state =
+  | Absent
+      (** Key does not exist. *)
+  | Persistent
+      (** Key exists but has no TTL. *)
+  | Expires_in of int
+      (** Remaining time. Unit depends on which function you called:
+          seconds for [ttl], milliseconds for [pttl]. *)
+
+val ttl :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> (expiry_state, Connection.Error.t) result
+
+val pttl :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> (expiry_state, Connection.Error.t) result
+
+val expire :
+  ?timeout:float ->
+  t -> string -> seconds:int -> (bool, Connection.Error.t) result
+
+val pexpire :
+  ?timeout:float ->
+  t -> string -> millis:int -> (bool, Connection.Error.t) result
+
+val pexpireat :
+  ?timeout:float ->
+  t -> string -> at_unix_millis:int -> (bool, Connection.Error.t) result
+
+val incr :
+  ?timeout:float ->
+  t -> string -> (int64, Connection.Error.t) result
+
+val incrby :
+  ?timeout:float ->
+  t -> string -> int -> (int64, Connection.Error.t) result
