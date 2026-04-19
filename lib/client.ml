@@ -1815,3 +1815,277 @@ let object_idletime ?timeout ?read_from t key =
 
 let object_freq ?timeout ?read_from t key =
   object_int_subcommand "OBJECT" "FREQ" ?timeout ?read_from t key
+
+(* ---------- Geo ---------- *)
+
+type geo_unit = Meters | Kilometers | Miles | Feet
+
+let geo_unit_arg = function
+  | Meters -> "M" | Kilometers -> "KM"
+  | Miles -> "MI" | Feet -> "FT"
+
+type geo_coord = { longitude : float; latitude : float }
+
+type geo_point = {
+  longitude : float;
+  latitude : float;
+  member : string;
+}
+
+type geoadd_cond = Geoadd_nx | Geoadd_xx
+
+let geoadd_cond_arg = function
+  | Geoadd_nx -> "NX"
+  | Geoadd_xx -> "XX"
+
+let geoadd ?timeout ?cond ?(ch = false) t key ~points =
+  let cond_args = match cond with
+    | None -> []
+    | Some c -> [ geoadd_cond_arg c ]
+  in
+  let ch_args = if ch then [ "CH" ] else [] in
+  let point_args =
+    List.concat_map
+      (fun { longitude; latitude; member } ->
+        [ Printf.sprintf "%.17g" longitude;
+          Printf.sprintf "%.17g" latitude;
+          member ])
+      points
+  in
+  let args =
+    Array.of_list ("GEOADD" :: key :: cond_args @ ch_args @ point_args)
+  in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "GEOADD" v)
+
+let parse_double_string cmd s =
+  try Ok (float_of_string s)
+  with _ ->
+    Error
+      (Connection.Error.Protocol_violation
+         (Printf.sprintf "%s: non-numeric reply %S" cmd s))
+
+let geodist ?timeout ?read_from ?unit t key ~member1 ~member2 =
+  let unit_args = match unit with
+    | None -> []
+    | Some u -> [ geo_unit_arg u ]
+  in
+  let args =
+    Array.of_list ("GEODIST" :: key :: member1 :: member2 :: unit_args)
+  in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok Resp3.Null -> Ok None
+  | Ok (Resp3.Bulk_string s) ->
+      (match parse_double_string "GEODIST" s with
+       | Ok f -> Ok (Some f)
+       | Error e -> Error e)
+  | Ok (Resp3.Double f) -> Ok (Some f)
+  | Ok v -> Error (protocol_violation "GEODIST" v)
+
+(* Parse a 2-element array as a coord, or Null as missing. *)
+let parse_geo_coord_reply cmd = function
+  | Resp3.Null -> Ok None
+  | Resp3.Array [ lon_v; lat_v ] ->
+      let to_float v =
+        match v with
+        | Resp3.Bulk_string s | Resp3.Simple_string s ->
+            (try Ok (float_of_string s)
+             with _ ->
+               Error
+                 (Connection.Error.Protocol_violation
+                    (Printf.sprintf "%s: non-numeric coord %S" cmd s)))
+        | Resp3.Double f -> Ok f
+        | other -> Error (protocol_violation cmd other)
+      in
+      (match to_float lon_v, to_float lat_v with
+       | Ok longitude, Ok latitude ->
+           Ok (Some { longitude; latitude })
+       | Error e, _ | _, Error e -> Error e)
+  | v -> Error (protocol_violation cmd v)
+
+let geopos ?timeout ?read_from t key ~members =
+  let args = Array.of_list ("GEOPOS" :: key :: members) in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok (Resp3.Array items) ->
+      let rec loop acc = function
+        | [] -> Ok (List.rev acc)
+        | v :: rest ->
+            (match parse_geo_coord_reply "GEOPOS" v with
+             | Ok o -> loop (o :: acc) rest
+             | Error e -> Error e)
+      in
+      loop [] items
+  | Ok v -> Error (protocol_violation "GEOPOS" v)
+
+let geohash ?timeout ?read_from t key ~members =
+  let args = Array.of_list ("GEOHASH" :: key :: members) in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok (Resp3.Array items) ->
+      let rec loop acc = function
+        | [] -> Ok (List.rev acc)
+        | Resp3.Null :: rest -> loop (None :: acc) rest
+        | Resp3.Bulk_string s :: rest
+        | Resp3.Simple_string s :: rest ->
+            loop (Some s :: acc) rest
+        | v :: _ -> Error (protocol_violation "GEOHASH" v)
+      in
+      loop [] items
+  | Ok v -> Error (protocol_violation "GEOHASH" v)
+
+type geo_from =
+  | From_member of string
+  | From_lonlat of { longitude : float; latitude : float }
+
+type geo_shape =
+  | By_radius of { radius : float; unit : geo_unit }
+  | By_box of { width : float; height : float; unit : geo_unit }
+
+type geo_order = Geo_asc | Geo_desc
+
+type geo_count = {
+  count : int;
+  any : bool;
+}
+
+type geo_search_result = {
+  member : string;
+  distance : float option;
+  hash : int64 option;
+  coord : geo_coord option;
+}
+
+let geo_from_args = function
+  | From_member m -> [ "FROMMEMBER"; m ]
+  | From_lonlat { longitude; latitude } ->
+      [ "FROMLONLAT";
+        Printf.sprintf "%.17g" longitude;
+        Printf.sprintf "%.17g" latitude ]
+
+let geo_shape_args = function
+  | By_radius { radius; unit } ->
+      [ "BYRADIUS"; Printf.sprintf "%.17g" radius; geo_unit_arg unit ]
+  | By_box { width; height; unit } ->
+      [ "BYBOX";
+        Printf.sprintf "%.17g" width;
+        Printf.sprintf "%.17g" height;
+        geo_unit_arg unit ]
+
+let geo_order_args = function
+  | None -> []
+  | Some Geo_asc -> [ "ASC" ]
+  | Some Geo_desc -> [ "DESC" ]
+
+let geo_count_args = function
+  | None -> []
+  | Some { count; any = false } -> [ "COUNT"; string_of_int count ]
+  | Some { count; any = true } ->
+      [ "COUNT"; string_of_int count; "ANY" ]
+
+(* Decode one search-result entry.
+
+   With no WITH* flags, each entry is just a Bulk_string member
+   name. With any WITH* flag, the entry is an Array whose first
+   element is the member name and subsequent elements appear in
+   the fixed order DIST, HASH, COORD when their flag is set. *)
+let decode_search_result ~with_coord ~with_dist ~with_hash v =
+  match v with
+  | Resp3.Bulk_string m | Resp3.Simple_string m
+    when not (with_coord || with_dist || with_hash) ->
+      Ok { member = m; distance = None; hash = None; coord = None }
+  | Resp3.Array (member_v :: rest) ->
+      let member =
+        match member_v with
+        | Resp3.Bulk_string s | Resp3.Simple_string s -> Ok s
+        | other -> Error (protocol_violation "GEOSEARCH member" other)
+      in
+      (match member with
+       | Error e -> Error e
+       | Ok member ->
+           let rec consume ~with_dist ~with_hash ~with_coord
+                   acc rest =
+             match with_dist, with_hash, with_coord, rest with
+             | true, _, _, (Resp3.Bulk_string s | Resp3.Simple_string s) :: rest' ->
+                 (match parse_double_string "GEOSEARCH dist" s with
+                  | Error e -> Error e
+                  | Ok f ->
+                      consume ~with_dist:false ~with_hash
+                        ~with_coord
+                        { acc with distance = Some f } rest')
+             | true, _, _, Resp3.Double f :: rest' ->
+                 consume ~with_dist:false ~with_hash ~with_coord
+                   { acc with distance = Some f } rest'
+             | false, true, _, Resp3.Integer n :: rest' ->
+                 consume ~with_dist ~with_hash:false ~with_coord
+                   { acc with hash = Some n } rest'
+             | false, false, true, coord_v :: rest' ->
+                 (match parse_geo_coord_reply "GEOSEARCH coord" coord_v with
+                  | Error e -> Error e
+                  | Ok c ->
+                      consume ~with_dist ~with_hash
+                        ~with_coord:false { acc with coord = c } rest')
+             | false, false, false, [] -> Ok acc
+             | _ ->
+                 Error
+                   (Connection.Error.Protocol_violation
+                      "GEOSEARCH: reply shape does not match WITH* flags")
+           in
+           consume ~with_dist ~with_hash ~with_coord
+             { member; distance = None; hash = None; coord = None }
+             rest)
+  | v -> Error (protocol_violation "GEOSEARCH" v)
+
+let geosearch
+    ?timeout ?read_from ?order ?count
+    ?(with_coord = false) ?(with_dist = false) ?(with_hash = false)
+    t key ~from ~shape =
+  let with_args =
+    (if with_coord then [ "WITHCOORD" ] else [])
+    @ (if with_dist then [ "WITHDIST" ] else [])
+    @ (if with_hash then [ "WITHHASH" ] else [])
+  in
+  let args =
+    Array.of_list
+      ("GEOSEARCH" :: key
+       :: (geo_from_args from
+           @ geo_shape_args shape
+           @ geo_order_args order
+           @ geo_count_args count
+           @ with_args))
+  in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok (Resp3.Array items) ->
+      let rec loop acc = function
+        | [] -> Ok (List.rev acc)
+        | v :: rest ->
+            (match
+               decode_search_result ~with_coord ~with_dist ~with_hash v
+             with
+             | Ok r -> loop (r :: acc) rest
+             | Error e -> Error e)
+      in
+      loop [] items
+  | Ok v -> Error (protocol_violation "GEOSEARCH" v)
+
+let geosearchstore
+    ?timeout ?order ?count ?(store_dist = false)
+    t ~destination ~source ~from ~shape =
+  let store_dist_args = if store_dist then [ "STOREDIST" ] else [] in
+  let args =
+    Array.of_list
+      ("GEOSEARCHSTORE" :: destination :: source
+       :: (geo_from_args from
+           @ geo_shape_args shape
+           @ geo_order_args order
+           @ geo_count_args count
+           @ store_dist_args))
+  in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "GEOSEARCHSTORE" v)

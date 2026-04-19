@@ -1054,3 +1054,121 @@ val object_freq :
   ?read_from:Read_from.t ->
   t -> string ->
   (int option, Connection.Error.t) result
+
+(** {1 Geo}
+
+    Valkey stores geo data in a sorted set under the hood; this
+    module exposes only the geo-shaped typed API. Longitude range
+    is [[-180, 180]], latitude range is [[-85.05112878, 85.05112878]]. *)
+
+type geo_unit = Meters | Kilometers | Miles | Feet
+
+type geo_coord = { longitude : float; latitude : float }
+
+type geo_point = {
+  longitude : float;
+  latitude : float;
+  member : string;
+}
+
+(** Mutually exclusive existence condition on [GEOADD]; [NX | XX]. *)
+type geoadd_cond = Geoadd_nx | Geoadd_xx
+
+val geoadd :
+  ?timeout:float ->
+  ?cond:geoadd_cond ->
+  ?ch:bool ->
+  t -> string -> points:geo_point list ->
+  (int, Connection.Error.t) result
+(** [GEOADD key [NX | XX] [CH] lon lat member ...]. Returns the
+    count: number of new elements added, or (with [ch:true]) the
+    number of elements that were added {i or} updated in place. *)
+
+val geodist :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  ?unit:geo_unit ->
+  t -> string -> member1:string -> member2:string ->
+  (float option, Connection.Error.t) result
+(** [GEODIST key m1 m2 [unit]]. [None] when either member is
+    missing. Distance is always positive. *)
+
+val geopos :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> members:string list ->
+  (geo_coord option list, Connection.Error.t) result
+(** [GEOPOS key member ...]. One entry per input member, in input
+    order. [None] for members that don't exist. *)
+
+val geohash :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> members:string list ->
+  (string option list, Connection.Error.t) result
+(** [GEOHASH key member ...]. One Geohash-encoded string per
+    input member, in input order; [None] for missing members. *)
+
+(** Search origin — either an existing member's position or a
+    concrete longitude/latitude pair. *)
+type geo_from =
+  | From_member of string
+  | From_lonlat of { longitude : float; latitude : float }
+
+(** Search area. [BYPOLYGON] is not exposed in this release — open
+    an issue if you need it. *)
+type geo_shape =
+  | By_radius of { radius : float; unit : geo_unit }
+  | By_box of { width : float; height : float; unit : geo_unit }
+
+type geo_order = Geo_asc | Geo_desc
+
+type geo_count = {
+  count : int;
+  any : bool;
+  (** [ANY] returns the first [count] matches without the
+      nearest-first guarantee — cheaper when you just need "some". *)
+}
+
+(** A single GEOSEARCH result. Every optional field corresponds to
+    a [WITH*] flag on the call:
+    - [distance] filled when [?with_dist:true]
+    - [hash] filled when [?with_hash:true]
+    - [coord] filled when [?with_coord:true]
+    Otherwise [None]. *)
+type geo_search_result = {
+  member : string;
+  distance : float option;
+  hash : int64 option;
+  coord : geo_coord option;
+}
+
+val geosearch :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  ?order:geo_order ->
+  ?count:geo_count ->
+  ?with_coord:bool ->
+  ?with_dist:bool ->
+  ?with_hash:bool ->
+  t -> string ->
+  from:geo_from ->
+  shape:geo_shape ->
+  (geo_search_result list, Connection.Error.t) result
+(** [GEOSEARCH key <FROM...> <BY...> [ASC|DESC] [COUNT n [ANY]]
+      [WITHCOORD] [WITHDIST] [WITHHASH]]. *)
+
+val geosearchstore :
+  ?timeout:float ->
+  ?order:geo_order ->
+  ?count:geo_count ->
+  ?store_dist:bool ->
+  t -> destination:string -> source:string ->
+  from:geo_from ->
+  shape:geo_shape ->
+  (int, Connection.Error.t) result
+(** [GEOSEARCHSTORE destination source <FROM...> <BY...>
+      [ASC|DESC] [COUNT n [ANY]] [STOREDIST]]. Returns the number
+    of elements stored. In cluster mode, [source] and
+    [destination] must hash to the same slot. [STOREDIST] stores
+    distances instead of the geo positions. *)

@@ -16,6 +16,7 @@ let () =
       "bitmap (needs docker valkey :6379)", Test_bitmap.tests;
       "hll + generic (needs docker valkey :6379)",
         Test_generic_hll.tests;
+      "geo (needs docker valkey :6379)", Test_geo.tests;
       "cluster (needs docker compose -f docker-compose.cluster.yml)",
         Test_cluster.tests;
     ]
