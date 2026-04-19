@@ -1,0 +1,81 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.3.0"
+
+      - name: Install opam deps + odoc
+        run: |
+          opam install . --deps-only --yes
+          opam install odoc --yes
+
+      - name: Build odoc HTML
+        run: opam exec -- dune build @doc
+
+      # Stage docs for gh-pages. odoc produces output at
+      # _build/default/_doc/_html; we drop the hand-written guides
+      # alongside it under /guides/ so a single deploy hits both
+      # the API reference and the prose docs.
+      - name: Stage site
+        run: |
+          mkdir -p site
+          cp -r _build/default/_doc/_html/* site/
+          mkdir -p site/guides
+          if [ -d docs ]; then
+            cp -r docs/* site/guides/ || true
+          fi
+          # Minimal landing page that links to both.
+          cat > site/index.html <<'EOF'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>ocaml-valkey docs</title>
+          <style>
+            body { font: 16px/1.5 -apple-system,system-ui,sans-serif;
+                   max-width: 48rem; margin: 3rem auto; padding: 0 1rem; }
+            a { text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            h1 { margin-bottom: 0.25rem; }
+            ul { padding-left: 1.2rem; }
+          </style>
+          <h1>ocaml-valkey</h1>
+          <p>Modern Valkey client for OCaml 5 + Eio. RESP3 only, no legacy baggage.</p>
+          <ul>
+            <li><a href="valkey/Valkey/index.html">API reference</a> (odoc)</li>
+            <li><a href="guides/">Hand-written guides</a></li>
+            <li><a href="https://github.com/avifenesh/valkey-ocaml">Source</a></li>
+          </ul>
+          EOF
+
+      - name: Upload site artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: site/
+          retention-days: 14
+
+      # Deploy only on main pushes. PRs just build + upload artifact.
+      - name: Deploy to GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages
