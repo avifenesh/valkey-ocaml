@@ -12,7 +12,13 @@ stability fuzzer, parser fuzzer, pre-push gate). See
 
 ---
 
-## Phase 1 — Command surface completion
+## Phase 1 — Command surface completion ✅ done
+
+**Shipped.** Six batches landed at commits `63dde75..d450897`:
+bitmap, HLL + generic keyspace, geo, CLIENT admin, FUNCTION + FCALL
++ CLUSTER introspection + LATENCY + MEMORY, COMMAND INFO
+spec-validation test. 191 tests (+48).
+
 
 **Goal.** Every Valkey 7.2–9.x command callable with correct cluster
 routing and (for the common ones) a typed wrapper that doesn't leak
@@ -66,7 +72,15 @@ becomes "Valkey-complete."
 
 ---
 
-## Phase 2 — Testing rigour + internal audit
+## Phase 2 — Testing rigour + internal audit ✅ done
+
+**Shipped.** Seven commits (round-trip proptest, Command_spec
+property tests over live cluster, retry state-machine tests via
+`Cluster_router.For_testing`, parser fuzzer mutation + shrinker at
+10 M strict clean, `bin/soak/`, toxiproxy TCP chaos, audit pass
+with fixes + narrowed exception handlers). 211 tests. Audit +
+deferred items catalogued in [AUDIT.md](AUDIT.md).
+
 
 **Goal.** Everything the existing tests assert remains true under
 hostile inputs, weird key distributions, and long running. No
@@ -141,7 +155,15 @@ property-test it).
 
 ---
 
-## Phase 3 — CI / CD + test coverage
+## Phase 3 — CI / CD + test coverage ✅ done
+
+**Shipped.** Five commits landing `ci.yml` (Ubuntu × 5.3/5.4 full
+integration + macOS × 5.3/5.4 portability), `coverage.yml` (bisect_ppx
+instrumentation, 60 % floor, gh-pages deploy), `fuzz-nightly.yml`
+(200 M parser + 15 min cluster chaos + auto-issue), `bench.yml`
+(per-PR delta + 10 % regression gate + baseline to `bench-history`),
+and `bin/bench_compare/`.
+
 
 **Goal.** Every push is validated on every supported OCaml version
 and OS before a human reads the PR. Coverage is measured and
@@ -202,7 +224,15 @@ enforced. Benchmarks are tracked over time. Fuzzing runs nightly.
 
 ---
 
-## Phase 4 — Documentation
+## Phase 4 — Documentation ✅ done
+
+**Shipped.** One big commit: 9 hand-written guides under `docs/`
+(getting-started, cluster, transactions, pubsub, tls, performance,
+troubleshooting, security, migration-from-ocaml-redis),
+`CONTRIBUTING.md`, a rewritten `CHANGELOG.md` covering Phase 0-3,
+and `docs.yml` building odoc + staging guides under `/guides/` on
+gh-pages. `dune build @doc` is warning-clean on all 20 modules.
+
 
 **Goal.** A new user can go from `opam install valkey` to running
 a cluster-aware app in 15 minutes, without reading the source.

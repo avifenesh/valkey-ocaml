@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Phase 4 (documentation)
+
+- `docs/` — 9 hand-written guides covering getting-started, cluster,
+  transactions, pub/sub, TLS, performance, troubleshooting,
+  security, and migration from `ocaml-redis`.
+- `CONTRIBUTING.md` at repo root — build/test/fuzz/bench/coverage
+  workflow, style rules, PR checklist.
+- `CHANGELOG.md` rewritten to explicitly cover Phases 0 → 3 (was
+  stale, reported 82 tests).
+- `.github/workflows/docs.yml` — builds odoc HTML on every push/PR,
+  stages guides under `/guides/`, deploys to `gh-pages` on main.
+- `dune build @doc` is warning-clean on all 20 modules; the
+  previously-hidden constructor warning on `Connection.Error.t`
+  was resolved during this pass.
+
 ### Added — Phase 3 (CI/CD + coverage)
 
 - GitHub Actions workflows:
