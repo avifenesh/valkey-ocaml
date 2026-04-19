@@ -1,0 +1,4 @@
+(executable
+ (name bench_redis)
+ (public_name valkey-bench-redis)
+ (libraries redis-sync threads.posix))

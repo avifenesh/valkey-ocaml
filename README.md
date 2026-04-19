@@ -191,6 +191,10 @@ This client is **multiplexed**. Sending a blocking command (BLPOP, BRPOP, BLMOVE
 
 `Client.connect ~host ~port` builds a synthetic single-shard topology, puts the one connection in a `Node_pool`, and wraps it with the same `Cluster_router` used for real clusters. The only code path that differs is the absence of a refresh fiber — there is nothing to refresh against a single seed. Everything else (slot dispatch, MOVED handling, `Read_from`, typed commands) runs identically.
 
+## Benchmarks
+
+Side-by-side with [ocaml-redis](https://github.com/0xffea/ocaml-redis) (RESP2, blocking) and `valkey-benchmark` (the C client, as a reference ceiling). Single-fiber we're at parity; **at high concurrency we're ~3x faster** than ocaml-redis and within 80–91 % of the C-client pipeline. See [BENCHMARKS.md](BENCHMARKS.md) for the full matrix, run with `bash scripts/run-bench.sh`.
+
 ## Pre-push gate
 
 The repo ships a tracked pre-push hook (`scripts/git-hooks/pre-push`) that runs `dune build`, the full test suite, and a 30-second stability fuzz against a standalone Valkey (and the docker-compose cluster if it is up) with a **zero-error threshold**. Set it up once:

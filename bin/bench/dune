@@ -1,0 +1,4 @@
+(executable
+ (name bench)
+ (public_name valkey-bench)
+ (libraries valkey eio_main))
