@@ -105,7 +105,7 @@ let err_terminal fmt =
    and retries after a redirect. *)
 let send_once ?timeout conn args = Connection.request ?timeout conn args
 
-let handle_redirect ~pool ~topology_ref ~max_redirects
+let handle_redirect ~pool ~topology_ref ~max_redirects ~trigger_refresh
     ?timeout first_result args =
   let rec loop attempt result =
     match result with
@@ -118,8 +118,10 @@ let handle_redirect ~pool ~topology_ref ~max_redirects
                 Topology.find_node_by_address !topology_ref ~host ~port
               with
               | None ->
-                  (* Unknown address — future work: trigger topology
-                     refresh, retry. For now surface the error. *)
+                  (* Unknown address: wake the refresh fiber so the next
+                     call sees the new layout. Surface this attempt's
+                     error now rather than blocking on the refresh. *)
+                  trigger_refresh ();
                   result
               | Some node ->
                   (match Node_pool.get pool node.id with
@@ -139,7 +141,7 @@ let handle_redirect ~pool ~topology_ref ~max_redirects
   in
   loop 0 first_result
 
-let make_exec ~pool ~topology_ref ~max_redirects ?timeout
+let make_exec ~pool ~topology_ref ~max_redirects ~trigger_refresh ?timeout
     (target : Router.Target.t) (rf : Router.Read_from.t)
     (args : string array) =
   let topology = !topology_ref in
@@ -167,13 +169,15 @@ let make_exec ~pool ~topology_ref ~max_redirects ?timeout
     | Router.Target.By_channel _ ->
         err_terminal "cluster router: sharded pub/sub not yet implemented"
   in
-  handle_redirect ~pool ~topology_ref ~max_redirects ?timeout
-    (dispatch_initial ()) args
+  handle_redirect ~pool ~topology_ref ~max_redirects ~trigger_refresh
+    ?timeout (dispatch_initial ()) args
 
 let from_pool_and_topology ?(max_redirects = 5) ~pool ~topology () =
   let topology_ref = ref topology in
+  let trigger_refresh () = () in
   let exec ?timeout target rf args =
-    make_exec ~pool ~topology_ref ~max_redirects ?timeout target rf args
+    make_exec ~pool ~topology_ref ~max_redirects ~trigger_refresh
+      ?timeout target rf args
   in
   let close () = Node_pool.close_all pool in
   let primary () =
@@ -304,12 +308,13 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
           refresh_loop ~sw ~net ~clock ?domain_mgr ~cfg ~pool
             ~topology_atomic ~refresh_signal ~refresh_mutex ~closing ());
       let topology_ref = ref topology in
+      let trigger_refresh () = Eio.Condition.broadcast refresh_signal in
       let exec ?timeout target rf args =
         (* Thread the atomic's latest value through the existing ref-based
            dispatch. On refresh the ref is re-synced. *)
         topology_ref := Atomic.get topology_atomic;
         make_exec ~pool ~topology_ref ~max_redirects:cfg.max_redirects
-          ?timeout target rf args
+          ~trigger_refresh ?timeout target rf args
       in
       let close () =
         Atomic.set closing true;
