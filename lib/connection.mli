@@ -45,7 +45,7 @@ module Config : sig
     reconnect : Reconnect.t;
     command_timeout : float option;
     push_buffer_size : int;
-    max_pending : int;
+    max_queued_bytes : int;
   }
   val default : t
 end

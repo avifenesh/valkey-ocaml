@@ -1,3 +1,28 @@
+module Byte_sem = struct
+  type t = {
+    mutable available : int;
+    mutex : Eio.Mutex.t;
+    cond : Eio.Condition.t;
+  }
+
+  let make n =
+    { available = n;
+      mutex = Eio.Mutex.create ();
+      cond = Eio.Condition.create () }
+
+  let acquire t n =
+    Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
+        while t.available < n do
+          Eio.Condition.await t.cond t.mutex
+        done;
+        t.available <- t.available - n)
+
+  let release t n =
+    Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
+        t.available <- t.available + n;
+        Eio.Condition.broadcast t.cond)
+end
+
 module Error = struct
   type t =
     | Tcp_refused of string
@@ -75,14 +100,14 @@ module Config = struct
     reconnect : Reconnect.t;
     command_timeout : float option;
     push_buffer_size : int;
-    max_pending : int;
+    max_queued_bytes : int;
   }
   let default = {
     handshake = Handshake.default;
     reconnect = Reconnect.default;
     command_timeout = None;
     push_buffer_size = 1024;
-    max_pending = 10_000;
+    max_queued_bytes = 10 * 1024 * 1024;
   }
 end
 
@@ -92,7 +117,16 @@ type socket = {
   close : unit -> unit;
 }
 
-type pending = (Resp3.t, Error.t) result Eio.Promise.u
+type entry = {
+  resolver : (Resp3.t, Error.t) result Eio.Promise.u;
+  size : int;
+  mutable abandoned : bool;
+}
+
+type queued = {
+  entry : entry;
+  bytes : string;
+}
 
 type state =
   | Connecting
@@ -106,9 +140,9 @@ type t = {
   state_mutex : Eio.Mutex.t;
   state_changed : Eio.Condition.t;
   writer_mutex : Eio.Mutex.t;
-  sent : pending Queue.t;
-  pending : (pending * string) Queue.t;
-  slots : Eio.Semaphore.t;
+  sent : entry Queue.t;
+  pending : queued Queue.t;
+  budget : Byte_sem.t;
   config : Config.t;
   pushes : Resp3.t Eio.Stream.t;
   connect_once : unit -> (socket, Error.t) result;
@@ -155,8 +189,7 @@ let extract_string_field key = function
         kvs
   | _ -> None
 
-let run_hello (sock : socket) (hs : Handshake.t) :
-    (Resp3.t, Error.t) result =
+let run_hello (sock : socket) (hs : Handshake.t) : (Resp3.t, Error.t) result =
   sock.write (Resp3_writer.command_to_string (hello_args hs));
   match Resp3_parser.read sock.reader with
   | Map _ as m -> Ok m
@@ -226,26 +259,37 @@ let connect_and_handshake t : (socket * Resp3.t * string option, Error.t) result
            sock.close ();
            Error e)
 
-let resolve_all q result =
-  Queue.iter (fun r -> Eio.Promise.resolve r result) q;
-  Queue.clear q
+let drain_sent t (result : (Resp3.t, Error.t) result) =
+  Queue.iter
+    (fun e ->
+      Byte_sem.release t.budget e.size;
+      if not e.abandoned then Eio.Promise.resolve e.resolver result)
+    t.sent;
+  Queue.clear t.sent
 
-let resolve_all_pending q result =
-  Queue.iter (fun (r, _) -> Eio.Promise.resolve r result) q;
-  Queue.clear q
+let drain_pending t (result : (Resp3.t, Error.t) result) =
+  Queue.iter
+    (fun q ->
+      Byte_sem.release t.budget q.entry.size;
+      if not q.entry.abandoned then
+        Eio.Promise.resolve q.entry.resolver result)
+    t.pending;
+  Queue.clear t.pending
 
 let flush_pending_through (t : t) (sock : socket) =
   Eio.Mutex.use_rw ~protect:true t.writer_mutex (fun () ->
       while not (Queue.is_empty t.pending) do
-        let (resolver, bytes) = Queue.pop t.pending in
+        let q = Queue.pop t.pending in
         (try
-           sock.write bytes;
-           Queue.push resolver t.sent
+           sock.write q.bytes;
+           Queue.push q.entry t.sent
          with exn ->
-           Eio.Promise.resolve resolver
-             (Error
-                (Error.Tcp_refused
-                   ("write failed: " ^ Printexc.to_string exn))))
+           Byte_sem.release t.budget q.entry.size;
+           if not q.entry.abandoned then
+             Eio.Promise.resolve q.entry.resolver
+               (Error
+                  (Error.Tcp_refused
+                     ("write failed: " ^ Printexc.to_string exn))))
       done)
 
 let set_state t new_state =
@@ -287,14 +331,16 @@ let reader_loop (t : t) (sock : socket) : [ `Disconnected | `Closed ] =
       | `Read value ->
           Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
               match Queue.take_opt t.sent with
-              | Some resolver ->
-                  let result =
-                    match value with
-                    | Resp3.Simple_error s | Resp3.Bulk_error s ->
-                        Error (Error.Server_error (Valkey_error.of_string s))
-                    | v -> Ok v
-                  in
-                  Eio.Promise.resolve resolver result
+              | Some e ->
+                  Byte_sem.release t.budget e.size;
+                  if not e.abandoned then
+                    let result =
+                      match value with
+                      | Resp3.Simple_error s | Resp3.Bulk_error s ->
+                          Error (Error.Server_error (Valkey_error.of_string s))
+                      | v -> Ok v
+                    in
+                    Eio.Promise.resolve e.resolver result
               | None -> ());
           loop ()
   in
@@ -315,16 +361,15 @@ let recovery_loop (t : t) : unit =
       | Some m -> n >= m
     in
     if t.closing then ()
-    else if timed_out_total || maxed_attempts then (
+    else if timed_out_total || maxed_attempts then
       Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
           set_state t (Dead (Terminal "reconnect budget exhausted"));
-          resolve_all t.sent (Error Error.Interrupted);
-          resolve_all_pending t.pending (Error Error.Interrupted));
-    )
+          drain_sent t (Error Error.Interrupted);
+          drain_pending t (Error Error.Interrupted))
     else
       match
-        let deadline = policy.handshake_timeout in
-        t.with_timeout deadline (fun () -> connect_and_handshake t)
+        t.with_timeout policy.handshake_timeout (fun () ->
+            connect_and_handshake t)
       with
       | Error `Timeout ->
           t.sleep (jittered_backoff policy n);
@@ -332,14 +377,14 @@ let recovery_loop (t : t) : unit =
       | Ok (Error e) when Error.is_terminal e ->
           Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
               set_state t (Dead e);
-              resolve_all t.sent (Error e);
-              resolve_all_pending t.pending (Error e))
+              drain_sent t (Error e);
+              drain_pending t (Error e))
       | Ok (Error _) ->
           t.sleep (jittered_backoff policy n);
           attempt (n + 1)
       | Ok (Ok (sock, info, az)) ->
           Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
-              resolve_all t.sent (Error Error.Interrupted);
+              drain_sent t (Error Error.Interrupted);
               t.current <- Some sock;
               t.server_info <- Some info;
               t.availability_zone <- az;
@@ -388,7 +433,7 @@ let connect ~sw ~net ~clock ?(config = Config.default) ~host ~port () =
     writer_mutex = Eio.Mutex.create ();
     sent = Queue.create ();
     pending = Queue.create ();
-    slots = Eio.Semaphore.make config.max_pending;
+    budget = Byte_sem.make config.max_queued_bytes;
     config;
     pushes = Eio.Stream.create config.push_buffer_size;
     connect_once;
@@ -417,22 +462,22 @@ let connect ~sw ~net ~clock ?(config = Config.default) ~host ~port () =
   Eio.Fiber.fork ~sw (fun () -> supervisor_run t);
   t
 
-let try_send_now t resolver bytes : [ `Sent | `Queued | `Dead of Error.t ] =
+let try_enqueue t q : [ `Dead of Error.t | `In_queue ] =
   Eio.Mutex.use_rw ~protect:true t.writer_mutex (fun () ->
       Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
           match t.state, t.current with
           | Dead e, _ -> `Dead e
           | Alive, Some sock ->
               (try
-                 sock.write bytes;
-                 Queue.push resolver t.sent;
-                 `Sent
+                 sock.write q.bytes;
+                 Queue.push q.entry t.sent;
+                 `In_queue
                with _exn ->
-                 Queue.push (resolver, bytes) t.pending;
-                 `Queued)
+                 Queue.push q t.pending;
+                 `In_queue)
           | _ ->
-              Queue.push (resolver, bytes) t.pending;
-              `Queued))
+              Queue.push q t.pending;
+              `In_queue))
 
 let request ?timeout t args =
   let timeout =
@@ -440,34 +485,30 @@ let request ?timeout t args =
     | Some _ as v -> v
     | None -> t.config.command_timeout
   in
-  Eio.Semaphore.acquire t.slots;
-  let release_slot = ref false in
-  let release () =
-    if not !release_slot then (
-      release_slot := true;
-      Eio.Semaphore.release t.slots)
-  in
-  try
-    let bytes = Resp3_writer.command_to_string args in
-    let promise, resolver = Eio.Promise.create () in
-    (match try_send_now t resolver bytes with
-     | `Dead e ->
-         release ();
-         Error e
-     | `Sent | `Queued ->
-         let result =
-           match timeout with
-           | None -> Eio.Promise.await promise
-           | Some secs ->
-               (match t.with_timeout secs (fun () -> Eio.Promise.await promise) with
-                | Ok v -> v
-                | Error `Timeout -> Error Error.Timeout)
-         in
-         release ();
-         result)
-  with exn ->
-    release ();
-    raise exn
+  let bytes = Resp3_writer.command_to_string args in
+  let size = String.length bytes in
+  if size > t.config.max_queued_bytes then Error Error.Queue_full
+  else
+    let run () =
+      Byte_sem.acquire t.budget size;
+      let promise, resolver = Eio.Promise.create () in
+      let entry = { resolver; size; abandoned = false } in
+      match try_enqueue t { entry; bytes } with
+      | `Dead e ->
+          Byte_sem.release t.budget size;
+          Error e
+      | `In_queue ->
+          (try Eio.Promise.await promise
+           with exn ->
+             entry.abandoned <- true;
+             raise exn)
+    in
+    match timeout with
+    | None -> run ()
+    | Some secs ->
+        (match t.with_timeout secs run with
+         | Ok v -> v
+         | Error `Timeout -> Error Error.Timeout)
 
 let pushes t = t.pushes
 let availability_zone t = t.availability_zone
@@ -485,8 +526,8 @@ let close t =
         (match t.state with
          | Dead _ -> ()
          | _ -> set_state t (Dead Closed));
-        resolve_all t.sent (Error Closed);
-        resolve_all_pending t.pending (Error Closed);
+        drain_sent t (Error Closed);
+        drain_pending t (Error Closed);
         c)
   in
   match sock_to_close with
