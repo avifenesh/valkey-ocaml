@@ -122,6 +122,25 @@ let test_keys_fans_to_all_primaries () =
     ignore (C.del client [ prefix ^ string_of_int i ])
   done
 
+let test_custom_command_routes_correctly () =
+  (* Exercise the custom entry point with a command we do NOT have
+     a typed wrapper for: BITCOUNT. Command_spec says rk 1, so the
+     router must send it to the slot owning the key. If it did not,
+     we would get a MOVED-chain but the redirect retry hides it; a
+     direct Ok result is the strongest signal our table is right. *)
+  with_cluster_client @@ fun client ->
+  let key = "custom:bitcount:k" in
+  let _ =
+    C.custom client [| "SET"; key; "hello" |]
+  in
+  (match C.custom client [| "BITCOUNT"; key |] with
+   | Error e -> Alcotest.failf "BITCOUNT via custom: %a" err_pp e
+   | Ok (Valkey.Resp3.Integer _) -> ()
+   | Ok v ->
+       Alcotest.failf "BITCOUNT returned %a, expected Integer"
+         Valkey.Resp3.pp v);
+  ignore (C.del client [ key ])
+
 let test_cross_slot_surfaces_crossslot () =
   with_cluster_client @@ fun client ->
   let _ = C.set client "noslot:a" "1" in
@@ -149,6 +168,8 @@ let tests =
     tc "SCRIPT LOAD reaches every primary"
       test_script_load_reaches_every_primary;
     tc "KEYS fans to all primaries" test_keys_fans_to_all_primaries;
+    tc "custom command routes via Command_spec"
+      test_custom_command_routes_correctly;
     tc "cross-slot DEL surfaces CROSSSLOT"
       test_cross_slot_surfaces_crossslot;
   ]

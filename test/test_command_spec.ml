@@ -67,6 +67,68 @@ let test_eval_key_index_3 () =
   | Some (T.By_slot s, RF.Primary) when s = slot_of "mykey" -> ()
   | _ -> Alcotest.fail "EVAL: first key at index 3"
 
+let test_bitop_key_index_2 () =
+  (* BITOP AND dest src1 src2 - destination at index 2 *)
+  let args = args_of_list [ "BITOP"; "AND"; "dest"; "src1"; "src2" ] in
+  match CS.target_and_rf RF.Primary args with
+  | Some (T.By_slot s, RF.Primary) when s = slot_of "dest" -> ()
+  | _ -> Alcotest.fail "BITOP: destination at index 2"
+
+let test_object_encoding_key_index_2 () =
+  let args = args_of_list [ "OBJECT"; "ENCODING"; "mykey" ] in
+  match CS.target_and_rf RF.Prefer_replica args with
+  | Some (T.By_slot s, RF.Prefer_replica) when s = slot_of "mykey" -> ()
+  | _ ->
+      Alcotest.fail
+        "OBJECT ENCODING: readonly, By_slot, rf preserved"
+
+let test_memory_usage_key_index_2 () =
+  let args = args_of_list [ "MEMORY"; "USAGE"; "mykey" ] in
+  match CS.target_and_rf RF.Prefer_replica args with
+  | Some (T.By_slot s, RF.Prefer_replica) when s = slot_of "mykey" -> ()
+  | _ -> Alcotest.fail "MEMORY USAGE: readonly, By_slot"
+
+let test_pfcount_multi_key () =
+  let args = args_of_list [ "PFCOUNT"; "hll:1"; "hll:2" ] in
+  match CS.target_and_rf RF.Primary args with
+  | Some (T.By_slot s, _) when s = slot_of "hll:1" -> ()
+  | _ -> Alcotest.fail "PFCOUNT: multi-key readonly, slot of first"
+
+let test_zunionstore_dest_is_key () =
+  (* ZUNIONSTORE dest numkeys k1 k2 ... — destination at index 1 *)
+  let args =
+    args_of_list [ "ZUNIONSTORE"; "dest"; "2"; "k1"; "k2" ]
+  in
+  match CS.target_and_rf RF.Primary args with
+  | Some (T.By_slot s, RF.Primary) when s = slot_of "dest" -> ()
+  | _ -> Alcotest.fail "ZUNIONSTORE: dest at index 1, write"
+
+let test_cluster_info_keyless_read () =
+  match CS.target_and_rf RF.Primary [| "CLUSTER"; "INFO" |] with
+  | Some (T.Random, _) -> ()
+  | _ -> Alcotest.fail "CLUSTER INFO: keyless readonly"
+
+let test_flushdb_fan_primaries () =
+  match CS.lookup [| "FLUSHDB" |] with
+  | CS.Fan_primaries -> ()
+  | _ -> Alcotest.fail "FLUSHDB: Fan_primaries"
+
+let test_client_list_fan_all_nodes () =
+  match CS.lookup [| "CLIENT"; "LIST" |] with
+  | CS.Fan_all_nodes -> ()
+  | _ -> Alcotest.fail "CLIENT LIST: Fan_all_nodes"
+
+let test_watch_multi_key () =
+  let args = args_of_list [ "WATCH"; "a"; "b" ] in
+  match CS.target_and_rf RF.Primary args with
+  | Some (T.By_slot s, _) when s = slot_of "a" -> ()
+  | _ -> Alcotest.fail "WATCH: multi-key, slot of first"
+
+let test_command_count_nonempty () =
+  let n = CS.command_count () in
+  if n < 150 then
+    Alcotest.failf "expected command table >= 150 entries, got %d" n
+
 let tests =
   [ Alcotest.test_case "GET: readonly, By_slot, rf preserved" `Quick
       test_get_readonly_by_slot;
@@ -88,4 +150,24 @@ let tests =
       test_lowercase_command_still_matches;
     Alcotest.test_case "EVAL: first key at index 3" `Quick
       test_eval_key_index_3;
+    Alcotest.test_case "BITOP: destination at index 2" `Quick
+      test_bitop_key_index_2;
+    Alcotest.test_case "OBJECT ENCODING: readonly key at 2" `Quick
+      test_object_encoding_key_index_2;
+    Alcotest.test_case "MEMORY USAGE: readonly key at 2" `Quick
+      test_memory_usage_key_index_2;
+    Alcotest.test_case "PFCOUNT: multi-key readonly" `Quick
+      test_pfcount_multi_key;
+    Alcotest.test_case "ZUNIONSTORE: dest at 1, write" `Quick
+      test_zunionstore_dest_is_key;
+    Alcotest.test_case "CLUSTER INFO: keyless readonly" `Quick
+      test_cluster_info_keyless_read;
+    Alcotest.test_case "FLUSHDB: Fan_primaries" `Quick
+      test_flushdb_fan_primaries;
+    Alcotest.test_case "CLIENT LIST: Fan_all_nodes" `Quick
+      test_client_list_fan_all_nodes;
+    Alcotest.test_case "WATCH: multi-key first slot" `Quick
+      test_watch_multi_key;
+    Alcotest.test_case "command table is populated" `Quick
+      test_command_count_nonempty;
   ]

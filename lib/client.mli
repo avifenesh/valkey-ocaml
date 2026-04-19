@@ -59,6 +59,34 @@ val exec_multi :
     aggregation commands (CLIENT LIST, CLUSTER NODES), [All_primaries]
     for write-style fan-outs (FLUSHALL, SCRIPT LOAD, WAIT). *)
 
+val custom :
+  ?timeout:float ->
+  ?target:Target.t ->
+  ?read_from:Read_from.t ->
+  t ->
+  string array ->
+  (Resp3.t, Connection.Error.t) result
+(** Dispatch a command this library does not expose as a typed helper
+    — e.g. [BITCOUNT], [PFADD], [GEORADIUS], an ACL command, a module
+    command.
+
+    Routing follows [Command_spec]: single-key commands go
+    [By_slot (slot_of key)]; writes are forced to [Primary]; readonly
+    commands respect [read_from]; keyless / unknown commands go to a
+    random node. Pass an explicit [target] to override.
+
+    [custom] is an alias for [exec] with a name that documents
+    intent at call sites. Behavior is identical. *)
+
+val custom_multi :
+  ?timeout:float ->
+  ?fan:Router.Fan_target.t ->
+  t ->
+  string array ->
+  (string * (Resp3.t, Connection.Error.t) result) list
+(** Fan a custom command to every node in the target set. Alias for
+    [exec_multi]. *)
+
 (** {1 Strings, counters, TTL} *)
 
 val get :

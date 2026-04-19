@@ -54,3 +54,7 @@ val target_and_rf :
     - Single-key commands map to [By_slot (slot_of key)].
     - Unknown / keyless commands map to [Random] with the caller's
       [Read_from] preserved. *)
+
+val command_count : unit -> int
+(** Number of commands + sub-commands in the routing table. Useful
+    for debug / sanity logs. *)

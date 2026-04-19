@@ -87,6 +87,14 @@ let exec_multi ?timeout ?fan t args =
   in
   Router.exec_multi ?timeout t.router fan args
 
+(* custom / custom_multi are named aliases for exec / exec_multi. Use
+   them at call sites to make the intent clear: "I am calling a
+   command this library has not wrapped with a typed helper, but I
+   still want cluster-correct routing." Pure naming; no behavior
+   change. *)
+let custom = exec
+let custom_multi = exec_multi
+
 let protocol_violation cmd v =
   Connection.Error.Protocol_violation
     (Format.asprintf "%s: unexpected reply %a" cmd Resp3.pp v)
