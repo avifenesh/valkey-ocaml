@@ -10,6 +10,7 @@ module Node_pool = Node_pool
 module Discovery = Discovery
 module Redirect = Redirect
 module Router = Router
+module Command_spec = Command_spec
 module Connection = Connection
 module Client = Client
 module Cluster_router = Cluster_router

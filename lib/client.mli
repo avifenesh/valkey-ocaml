@@ -42,6 +42,22 @@ val exec :
   t ->
   string array ->
   (Resp3.t, Connection.Error.t) result
+(** Raw command dispatch. If [target] is omitted, [Command_spec] picks
+    the default route from the command name: single-key commands go
+    [By_slot (slot_of key)]; writes force the [Read_from] to [Primary];
+    fan-out commands (FLUSHALL, CLIENT LIST, …) fall back to a single
+    random node — use {!exec_multi} for true fan-out. *)
+
+val exec_multi :
+  ?timeout:float ->
+  ?fan:Router.Fan_target.t ->
+  t ->
+  string array ->
+  (string * (Resp3.t, Connection.Error.t) result) list
+(** Fan a command out to every node in the selected set. If [fan] is
+    omitted, [Command_spec] picks the default: [All_nodes] for
+    aggregation commands (CLIENT LIST, CLUSTER NODES), [All_primaries]
+    for write-style fan-outs (FLUSHALL, SCRIPT LOAD, WAIT). *)
 
 (** {1 Strings, counters, TTL} *)
 

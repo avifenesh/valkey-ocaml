@@ -59,11 +59,33 @@ let raw_connection t =
          (multi-node router)"
 
 let exec ?timeout ?target ?read_from t args =
-  let target = Option.value target ~default:Target.Random in
-  let read_from =
-    Option.value read_from ~default:t.config.read_from
+  let user_rf = Option.value read_from ~default:t.config.read_from in
+  match target with
+  | Some target ->
+      (* Explicit override — trust the caller; do not second-guess their
+         target or their Read_from. *)
+      Router.exec ?timeout t.router target user_rf args
+  | None ->
+      (match Command_spec.target_and_rf user_rf args with
+       | Some (target, effective_rf) ->
+           Router.exec ?timeout t.router target effective_rf args
+       | None ->
+           (* Fan-out command routed through single-reply exec: send to
+              a random node. This preserves pre-spec behavior; callers
+              who want true fan-out should use [exec_multi]. *)
+           Router.exec ?timeout t.router Target.Random user_rf args)
+
+let exec_multi ?timeout ?fan t args =
+  let fan =
+    match fan with
+    | Some f -> f
+    | None ->
+        (match Command_spec.lookup args with
+         | Fan_all_nodes -> Router.Fan_target.All_nodes
+         | Fan_primaries -> Router.Fan_target.All_primaries
+         | _ -> Router.Fan_target.All_primaries)
   in
-  Router.exec ?timeout t.router target read_from args
+  Router.exec_multi ?timeout t.router fan args
 
 let protocol_violation cmd v =
   Connection.Error.Protocol_violation
