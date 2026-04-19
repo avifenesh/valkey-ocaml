@@ -411,12 +411,19 @@ val evalsha :
 val script_load :
   ?timeout:float ->
   t -> string -> (string, Connection.Error.t) result
-(** Returns the SHA1 of the loaded script. *)
+(** Returns the SHA1 of the loaded script.
+
+    In cluster mode this fans the LOAD to every primary so any future
+    [EVALSHA] — whichever shard its key routes to — finds the SHA.
+    All primaries must return the same SHA (deterministic digest); a
+    divergence is surfaced as [Terminal]. In standalone, this is a
+    single-node LOAD. *)
 
 val script_exists :
   ?timeout:float ->
-  ?read_from:Read_from.t ->
   t -> string list -> (bool list, Connection.Error.t) result
+(** A SHA is reported present only if {i every} primary has it. Fans
+    to [All_primaries] and AND-reduces the per-shard rows. *)
 
 type script_flush_mode = Flush_sync | Flush_async
 
@@ -424,6 +431,9 @@ val script_flush :
   ?timeout:float ->
   ?mode:script_flush_mode ->
   t -> (unit, Connection.Error.t) result
+(** Fans to every primary. Clears the client's local
+    known-loaded-SHA cache on success so [eval_script] falls back to
+    [EVAL] as expected. *)
 
 module Script : sig
   type t
@@ -471,10 +481,12 @@ val scan :
 
 val keys :
   ?timeout:float ->
-  ?read_from:Read_from.t ->
   t -> string -> (string list, Connection.Error.t) result
-(** [KEYS pattern]. Use [scan] in production; [KEYS] is O(N) and blocks
-    the server. *)
+(** [KEYS pattern]. Fans to every primary in cluster mode (each shard
+    only knows its own slots) and flattens the per-shard lists.
+
+    [KEYS] is O(N) on each node it visits and blocks that node's
+    command loop for the duration; in production, use [scan] instead. *)
 
 (** {1 Streams (non-blocking)}
 

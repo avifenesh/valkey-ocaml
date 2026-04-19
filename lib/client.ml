@@ -664,26 +664,94 @@ let eval ?timeout t ~script ~keys ~args =
 let evalsha ?timeout t ~sha ~keys ~args =
   eval_like "EVALSHA" ?timeout t ~code:sha ~keys ~args
 
-let script_load ?timeout t script =
-  match exec ?timeout t [| "SCRIPT"; "LOAD"; script |] with
-  | Error e -> Error e
-  | Ok (Resp3.Bulk_string s) -> Ok s
-  | Ok (Resp3.Simple_string s) -> Ok s
-  | Ok v -> Error (protocol_violation "SCRIPT LOAD" v)
+(* Aggregate a fan_primaries result: return Ok if every shard succeeded
+   with the same payload; surface the first server error otherwise.
+   Used by SCRIPT LOAD / SCRIPT FLUSH / SCRIPT EXISTS so a cluster
+   behaves like a standalone from the caller's perspective. *)
+let fan_primaries_unanimous cmd ?timeout ~decode t args =
+  let per_node =
+    exec_multi ?timeout ~fan:Router.Fan_target.All_primaries t args
+  in
+  let rec loop first = function
+    | [] ->
+        (match first with
+         | Some v -> Ok v
+         | None ->
+             Error (Connection.Error.Terminal
+                      (Printf.sprintf "%s: no primaries to dispatch to" cmd)))
+    | (_, Error e) :: _ -> Error e
+    | (_, Ok reply) :: rest ->
+        (match decode reply with
+         | Error e -> Error e
+         | Ok v ->
+             (match first with
+              | None -> loop (Some v) rest
+              | Some v0 when v0 = v -> loop first rest
+              | Some _ ->
+                  Error (Connection.Error.Terminal
+                           (Printf.sprintf
+                              "%s: shards disagreed on reply" cmd))))
+  in
+  loop None per_node
 
-let script_exists ?timeout ?read_from t shas =
+let script_load ?timeout t script =
+  (* Load on every primary so any subsequent EVALSHA finds the SHA
+     regardless of which shard the key routes to. All primaries
+     must produce the same SHA (it is a deterministic digest). *)
+  let decode = function
+    | Resp3.Bulk_string s -> Ok s
+    | Resp3.Simple_string s -> Ok s
+    | v -> Error (protocol_violation "SCRIPT LOAD" v)
+  in
+  fan_primaries_unanimous "SCRIPT LOAD" ?timeout ~decode t
+    [| "SCRIPT"; "LOAD"; script |]
+
+let script_exists ?timeout t shas =
+  (* A SHA is "present" only if every primary has it — otherwise an
+     EVALSHA routing through an unloaded primary will NOSCRIPT. *)
   let args = Array.of_list ("SCRIPT" :: "EXISTS" :: shas) in
-  match exec ?timeout ?read_from t args with
-  | Error e -> Error e
-  | Ok (Resp3.Array items) ->
-      let rec loop acc = function
-        | [] -> Ok (List.rev acc)
-        | Resp3.Integer 0L :: rest -> loop (false :: acc) rest
-        | Resp3.Integer 1L :: rest -> loop (true :: acc) rest
-        | other :: _ -> Error (protocol_violation "SCRIPT EXISTS" other)
-      in
-      loop [] items
-  | Ok v -> Error (protocol_violation "SCRIPT EXISTS" v)
+  let decode = function
+    | Resp3.Array items ->
+        let rec loop acc = function
+          | [] -> Ok (List.rev acc)
+          | Resp3.Integer 0L :: rest -> loop (false :: acc) rest
+          | Resp3.Integer 1L :: rest -> loop (true :: acc) rest
+          | other :: _ ->
+              Error (protocol_violation "SCRIPT EXISTS" other)
+        in
+        loop [] items
+    | v -> Error (protocol_violation "SCRIPT EXISTS" v)
+  in
+  let per_node =
+    exec_multi ?timeout ~fan:Router.Fan_target.All_primaries t args
+  in
+  (* AND-reduce bit-by-bit across primaries. *)
+  let combine a b =
+    try Ok (List.map2 ( && ) a b)
+    with Invalid_argument _ ->
+      Error (Connection.Error.Terminal
+               "SCRIPT EXISTS: shards returned different row counts")
+  in
+  let rec loop acc = function
+    | [] ->
+        (match acc with
+         | Some v -> Ok v
+         | None ->
+             Error (Connection.Error.Terminal
+                      "SCRIPT EXISTS: no primaries to dispatch to"))
+    | (_, Error e) :: _ -> Error e
+    | (_, Ok reply) :: rest ->
+        (match decode reply with
+         | Error e -> Error e
+         | Ok row ->
+             (match acc with
+              | None -> loop (Some row) rest
+              | Some prev ->
+                  (match combine prev row with
+                   | Ok merged -> loop (Some merged) rest
+                   | Error e -> Error e)))
+  in
+  loop None per_node
 
 type script_flush_mode = Flush_sync | Flush_async
 
@@ -694,11 +762,12 @@ let script_flush ?timeout ?mode t =
     | Some Flush_async -> [ "ASYNC" ]
   in
   let args = Array.of_list ([ "SCRIPT"; "FLUSH" ] @ tail) in
+  let decode = function
+    | Resp3.Simple_string "OK" -> Ok ()
+    | v -> Error (protocol_violation "SCRIPT FLUSH" v)
+  in
   let result =
-    match exec ?timeout t args with
-    | Error e -> Error e
-    | Ok (Resp3.Simple_string "OK") -> Ok ()
-    | Ok v -> Error (protocol_violation "SCRIPT FLUSH" v)
+    fan_primaries_unanimous "SCRIPT FLUSH" ?timeout ~decode t args
   in
   (* SCRIPT FLUSH invalidates everything the server has loaded. Clear our
      view so future eval_script calls fall back to EVAL correctly. *)
@@ -737,9 +806,16 @@ let eval_script ?timeout t s ~keys ~args =
         Hashtbl.remove t.loaded_shas sha)
   in
   let do_eval () =
+    (* EVAL loads the script on whichever shard the key routes to.
+       Remember the SHA only if it is now on every primary — fall
+       through to a full SCRIPT LOAD fan-out so subsequent EVALSHA
+       calls on any shard succeed. *)
     match eval ?timeout t ~script:(Script.source s) ~keys ~args with
-    | Ok v -> remember (); Ok v
     | Error e -> Error e
+    | Ok v ->
+        (match script_load ?timeout t (Script.source s) with
+         | Ok _ -> remember (); Ok v
+         | Error _ -> Ok v)
   in
   if not known_loaded then do_eval ()
   else
@@ -785,11 +861,25 @@ let scan ?timeout ?read_from ?match_ ?count ?type_ t ~cursor =
             | Ok keys -> Ok { cursor; keys }))
   | Ok v -> Error (protocol_violation "SCAN" v)
 
-let keys ?timeout ?read_from t pattern =
-  match exec ?timeout ?read_from t [| "KEYS"; pattern |] with
-  | Error e -> Error e
-  | Ok (Resp3.Array items) -> strings_of_resp3_collection "KEYS" items
-  | Ok v -> Error (protocol_violation "KEYS" v)
+let keys ?timeout t pattern =
+  (* KEYS on a cluster is per-node: each primary (and replica, if you
+     ask one) only knows its own slots. Fan to every node and flatten.
+     Large keyspaces: this is a heavy command — it scans every node's
+     whole keyspace. SCAN iteration is usually the right choice. *)
+  let per_node =
+    exec_multi ?timeout ~fan:Router.Fan_target.All_primaries t
+      [| "KEYS"; pattern |]
+  in
+  let rec loop acc = function
+    | [] -> Ok (List.rev acc)
+    | (_, Error e) :: _ -> Error e
+    | (_, Ok (Resp3.Array items)) :: rest ->
+        (match strings_of_resp3_collection "KEYS" items with
+         | Error e -> Error e
+         | Ok ks -> loop (List.rev_append ks acc) rest)
+    | (_, Ok v) :: _ -> Error (protocol_violation "KEYS" v)
+  in
+  loop [] per_node
 
 (* ---------- streams ---------- *)
 
