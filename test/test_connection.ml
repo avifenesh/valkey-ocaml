@@ -176,6 +176,30 @@ let test_tls_ca_verify () =
   expect_simple_eq ~ctx:"PING over TLS (CA-verified)" ~expected:"PONG"
     (C.request conn [| "PING" |])
 
+(* System CA bundle should REJECT our self-signed cert — proves the
+   authenticator is actually verifying. *)
+let test_tls_system_cas_rejects_self_signed () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let tls =
+    match Valkey.Tls_config.with_system_cas ~server_name:"localhost" () with
+    | Ok t -> t
+    | Error m -> Alcotest.failf "system cas not available: %s" m
+  in
+  let config = { C.Config.default with tls = Some tls } in
+  try
+    let conn =
+      C.connect ~sw ~net ~clock ~config ~host:"localhost" ~port:tls_port ()
+    in
+    C.close conn;
+    Alcotest.fail "expected handshake to fail against self-signed cert"
+  with
+  | C.Handshake_failed (C.Error.Tls_failed _) -> ()
+  | C.Handshake_failed e ->
+      Alcotest.failf "expected Tls_failed, got %a" C.Error.pp e
+
 (* Second connection kills first's socket; first should recover + serve. *)
 let test_recovery_client_kill () =
   Eio_main.run @@ fun env ->
@@ -270,4 +294,6 @@ let tests =
     Alcotest.test_case "budget_exhaustion" `Quick test_budget_exhaustion;
     Alcotest.test_case "tls_insecure" `Quick test_tls_insecure;
     Alcotest.test_case "tls_ca_verify" `Quick test_tls_ca_verify;
+    Alcotest.test_case "tls_system_cas_rejects_self_signed" `Quick
+      test_tls_system_cas_rejects_self_signed;
   ]

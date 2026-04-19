@@ -25,6 +25,13 @@ let with_ca_cert ?server_name ~ca_pem () =
   let sn = Option.bind server_name parse_host in
   { authenticator = auth; server_name = sn }
 
+let with_system_cas ?server_name () =
+  match Ca_certs.authenticator () with
+  | Error (`Msg m) -> Error m
+  | Ok auth ->
+      let sn = Option.bind server_name parse_host in
+      Ok { authenticator = auth; server_name = sn }
+
 let authenticator t = t.authenticator
 
 let server_name t = t.server_name
