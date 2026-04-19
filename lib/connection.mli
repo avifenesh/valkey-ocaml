@@ -45,6 +45,7 @@ module Config : sig
     handshake : Handshake.t;
     reconnect : Reconnect.t;
     command_timeout : float option;
+    keepalive_interval : float option;
     push_buffer_size : int;
     max_queued_bytes : int;
     tls : Tls_config.t option;
@@ -85,5 +86,9 @@ val availability_zone : t -> string option
 val server_info : t -> Resp3.t option
 
 val state : t -> state
+
+val keepalive_count : t -> int
+(** Number of successful keepalive PINGs since [connect]. For observability
+    and tests; zero if [keepalive_interval] is None. *)
 
 val close : t -> unit

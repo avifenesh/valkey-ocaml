@@ -176,6 +176,23 @@ let test_tls_ca_verify () =
   expect_simple_eq ~ctx:"PING over TLS (CA-verified)" ~expected:"PONG"
     (C.request conn [| "PING" |])
 
+let test_keepalive () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { C.Config.default with keepalive_interval = Some 0.05 }
+  in
+  let conn =
+    C.connect ~sw ~net ~clock ~config ~host:"localhost" ~port:6379 ()
+  in
+  Eio.Time.sleep clock 0.25;
+  let n = C.keepalive_count conn in
+  if n < 2 then
+    Alcotest.failf "expected >=2 keepalive PINGs in 250ms at 50ms interval, got %d" n;
+  C.close conn
+
 (* System CA bundle should REJECT our self-signed cert — proves the
    authenticator is actually verifying. *)
 let test_tls_system_cas_rejects_self_signed () =
@@ -296,4 +313,5 @@ let tests =
     Alcotest.test_case "tls_ca_verify" `Quick test_tls_ca_verify;
     Alcotest.test_case "tls_system_cas_rejects_self_signed" `Quick
       test_tls_system_cas_rejects_self_signed;
+    Alcotest.test_case "keepalive fires" `Quick test_keepalive;
   ]

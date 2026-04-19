@@ -147,6 +147,7 @@ module Config = struct
     handshake : Handshake.t;
     reconnect : Reconnect.t;
     command_timeout : float option;
+    keepalive_interval : float option;
     push_buffer_size : int;
     max_queued_bytes : int;
     tls : Tls_config.t option;
@@ -155,6 +156,11 @@ module Config = struct
     handshake = Handshake.default;
     reconnect = Reconnect.default;
     command_timeout = None;
+    (* Some 30s by default: well under typical NAT / LB idle timeouts (60-300s),
+       low enough overhead that it's noise on any real workload. Set to None
+       to opt out when the application has constant traffic and keepalive is
+       pure burden. *)
+    keepalive_interval = Some 30.0;
     push_buffer_size = 1024;
     max_queued_bytes = 10 * 1024 * 1024;
     tls = None;
@@ -202,6 +208,7 @@ type t = {
   mutable server_info : Resp3.t option;
   mutable availability_zone : string option;
   mutable closing : bool;
+  mutable keepalive_count : int;
   cancel_signal : unit Eio.Promise.t;
   cancel_resolver : unit Eio.Promise.u;
 }
@@ -501,6 +508,72 @@ let recovery_loop (t : t) : unit =
   in
   attempt 0
 
+let try_enqueue t q : [ `Dead of Error.t | `In_queue ] =
+  match
+    Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
+        match t.state with
+        | Dead e -> `Dead e
+        | _ -> `Ok)
+  with
+  | `Dead e -> `Dead e
+  | `Ok ->
+      (try
+         Chan.push t.cmd_queue q;
+         `In_queue
+       with Chan.Closed -> `Dead Error.Closed)
+
+let request ?timeout t args =
+  let timeout =
+    match timeout with
+    | Some _ as v -> v
+    | None -> t.config.command_timeout
+  in
+  let bytes = Resp3_writer.command_to_string args in
+  let size = String.length bytes in
+  if size > t.config.max_queued_bytes then Error Error.Queue_full
+  else
+    let run () =
+      Byte_sem.acquire t.budget size;
+      let promise, resolver = Eio.Promise.create () in
+      let entry = { resolver; size; abandoned = false } in
+      match try_enqueue t { entry; bytes } with
+      | `Dead e ->
+          Byte_sem.release t.budget size;
+          Error e
+      | `In_queue ->
+          (try Eio.Promise.await promise
+           with exn ->
+             entry.abandoned <- true;
+             raise exn)
+    in
+    match timeout with
+    | None -> run ()
+    | Some secs ->
+        (match t.with_timeout secs run with
+         | Ok v -> v
+         | Error `Timeout -> Error Error.Timeout)
+
+let keepalive_loop t interval =
+  let rec loop () =
+    if t.closing then ()
+    else
+      let cancelled =
+        Eio.Fiber.first
+          (fun () -> t.sleep interval; false)
+          (fun () -> Eio.Promise.await t.cancel_signal; true)
+      in
+      if cancelled || t.closing then ()
+      else (
+        (match t.state with
+         | Alive ->
+             (match request t [| "PING" |] with
+              | Ok _ -> t.keepalive_count <- t.keepalive_count + 1
+              | Error _ -> ())
+         | _ -> ());
+        loop ())
+  in
+  try loop () with _ -> ()
+
 let rec supervisor_run t =
   if t.closing then ()
   else
@@ -551,6 +624,7 @@ let connect ~sw ~net ~clock ?(config = Config.default) ~host ~port () =
     server_info = None;
     availability_zone = None;
     closing = false;
+    keepalive_count = 0;
     cancel_signal;
     cancel_resolver;
   }
@@ -568,54 +642,17 @@ let connect ~sw ~net ~clock ?(config = Config.default) ~host ~port () =
        t.availability_zone <- az;
        t.state <- Alive);
   Eio.Fiber.fork ~sw (fun () -> supervisor_run t);
+  (match config.keepalive_interval with
+   | None -> ()
+   | Some interval ->
+       Eio.Fiber.fork ~sw (fun () -> keepalive_loop t interval));
   t
-
-let request ?timeout t args =
-  let timeout =
-    match timeout with
-    | Some _ as v -> v
-    | None -> t.config.command_timeout
-  in
-  let bytes = Resp3_writer.command_to_string args in
-  let size = String.length bytes in
-  if size > t.config.max_queued_bytes then Error Error.Queue_full
-  else
-    let run () =
-      Byte_sem.acquire t.budget size;
-      let promise, resolver = Eio.Promise.create () in
-      let entry = { resolver; size; abandoned = false } in
-      let dead_check =
-        Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
-            match t.state with
-            | Dead e -> Some e
-            | _ -> None)
-      in
-      match dead_check with
-      | Some e ->
-          Byte_sem.release t.budget size;
-          Error e
-      | None ->
-          (try
-             Chan.push t.cmd_queue { entry; bytes };
-             (try Eio.Promise.await promise
-              with exn ->
-                entry.abandoned <- true;
-                raise exn)
-           with Chan.Closed ->
-             Byte_sem.release t.budget size;
-             Error Error.Closed)
-    in
-    match timeout with
-    | None -> run ()
-    | Some secs ->
-        (match t.with_timeout secs run with
-         | Ok v -> v
-         | Error `Timeout -> Error Error.Timeout)
 
 let pushes t = t.pushes
 let availability_zone t = t.availability_zone
 let server_info t = t.server_info
 let state t = t.state
+let keepalive_count t = t.keepalive_count
 
 let close t =
   t.closing <- true;
