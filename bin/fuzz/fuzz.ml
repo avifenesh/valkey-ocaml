@@ -36,6 +36,10 @@ type args = {
   report_every : int;
   chaos_node_restart : string list;
   chaos_interval : int;
+  (* If [Some n], exit 1 when the total error count exceeds n. Used
+     by the pre-push hook to gate on zero errors in no-chaos mode. *)
+  max_errors : int option;
+  quiet : bool;  (* suppress per-command + outcome tables *)
 }
 
 let default_args = {
@@ -48,6 +52,8 @@ let default_args = {
   report_every = 10;
   chaos_node_restart = [];
   chaos_interval = 30;
+  max_errors = None;
+  quiet = false;
 }
 
 let parse_seeds s =
@@ -102,6 +108,10 @@ let parse_args () =
       "name1,name2 docker container names to restart mid-run";
       "--chaos-interval", Arg.Int (fun n -> a := { !a with chaos_interval = n }),
       "N seconds between chaos actions (default 30)";
+      "--max-errors", Arg.Int (fun n -> a := { !a with max_errors = Some n }),
+      "N exit 1 if total errors exceed N (default: no exit check)";
+      "--quiet", Arg.Unit (fun () -> a := { !a with quiet = true }),
+      " suppress per-command and outcome tables in the final report";
     ]
   in
   Arg.parse specs (fun _ -> ()) usage;
@@ -562,7 +572,7 @@ let chaos ~clock ~containers ~interval ~deadline =
 
 (* ---------- final report ---------- *)
 
-let print_report stats ~elapsed =
+let print_report stats ~elapsed ~quiet =
   let ok, err = totals stats in
   let total = ok + err in
   Printf.printf "\n===== fuzz report =====\n";
@@ -575,34 +585,57 @@ let print_report stats ~elapsed =
      else 0.0);
   Printf.printf "max latency  : %.3fs\n" stats.max_latency;
 
-  (* per-op table, sorted by attempts desc *)
-  Printf.printf "\n-- per command (sorted by attempts) --\n";
-  let rows =
-    Hashtbl.fold (fun k v acc -> (k, v) :: acc) stats.per_op []
-    |> List.sort (fun (_, a) (_, b) -> compare b.attempted a.attempted)
-  in
-  List.iter
-    (fun (name, po) ->
-      Printf.printf
-        "%-17s  att=%-7d ok=%-7d err=%-5d  latency:"
-        name po.attempted po.ok_count po.error_count;
-      for i = 0 to num_buckets - 1 do
-        if po.latencies.(i) > 0 then
-          Printf.printf " %s=%d" (bucket_label i) po.latencies.(i)
-      done;
-      print_newline ())
-    rows;
+  if quiet then begin
+    (* Quiet mode: always show which outcome categories fired so
+       failures are still diagnosable, but skip the full per-command
+       table. *)
+    if err > 0 then begin
+      Printf.printf "\n-- error outcomes --\n";
+      let err_outcomes =
+        Hashtbl.fold
+          (fun k v acc ->
+            if String.length k >= 4 && String.sub k 0 4 = "err/"
+            then (k, !v) :: acc
+            else acc)
+          stats.outcomes []
+        |> List.sort (fun (_, a) (_, b) -> compare b a)
+      in
+      List.iter
+        (fun (name, count) ->
+          Printf.printf "  %-30s %d\n" name count)
+        err_outcomes
+    end;
+    print_newline ()
+  end else begin
+    (* per-op table, sorted by attempts desc *)
+    Printf.printf "\n-- per command (sorted by attempts) --\n";
+    let rows =
+      Hashtbl.fold (fun k v acc -> (k, v) :: acc) stats.per_op []
+      |> List.sort (fun (_, a) (_, b) -> compare b.attempted a.attempted)
+    in
+    List.iter
+      (fun (name, po) ->
+        Printf.printf
+          "%-17s  att=%-7d ok=%-7d err=%-5d  latency:"
+          name po.attempted po.ok_count po.error_count;
+        for i = 0 to num_buckets - 1 do
+          if po.latencies.(i) > 0 then
+            Printf.printf " %s=%d" (bucket_label i) po.latencies.(i)
+        done;
+        print_newline ())
+      rows;
 
-  (* outcomes, sorted by count desc *)
-  Printf.printf "\n-- outcomes --\n";
-  let outcomes =
-    Hashtbl.fold (fun k v acc -> (k, !v) :: acc) stats.outcomes []
-    |> List.sort (fun (_, a) (_, b) -> compare b a)
-  in
-  List.iter
-    (fun (name, count) -> Printf.printf "  %-30s %d\n" name count)
-    outcomes;
-  print_newline ()
+    (* outcomes, sorted by count desc *)
+    Printf.printf "\n-- outcomes --\n";
+    let outcomes =
+      Hashtbl.fold (fun k v acc -> (k, !v) :: acc) stats.outcomes []
+      |> List.sort (fun (_, a) (_, b) -> compare b a)
+    in
+    List.iter
+      (fun (name, count) -> Printf.printf "  %-30s %d\n" name count)
+      outcomes;
+    print_newline ()
+  end
 
 (* ---------- main ---------- *)
 
@@ -662,4 +695,11 @@ let () =
        ]);
   let elapsed = Unix.gettimeofday () -. t_start in
   VC.close client;
-  print_report stats ~elapsed
+  print_report stats ~elapsed ~quiet:args.quiet;
+  let _, err = totals stats in
+  match args.max_errors with
+  | Some n when err > n ->
+      Printf.eprintf
+        "\nFAIL: %d errors observed, threshold was %d\n%!" err n;
+      exit 1
+  | _ -> ()

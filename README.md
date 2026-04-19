@@ -185,6 +185,19 @@ This client is **multiplexed**. Sending a blocking command (BLPOP, BRPOP, BLMOVE
 
 `Client.connect ~host ~port` builds a synthetic single-shard topology, puts the one connection in a `Node_pool`, and wraps it with the same `Cluster_router` used for real clusters. The only code path that differs is the absence of a refresh fiber — there is nothing to refresh against a single seed. Everything else (slot dispatch, MOVED handling, `Read_from`, typed commands) runs identically.
 
+## Pre-push gate
+
+The repo ships a tracked pre-push hook (`scripts/git-hooks/pre-push`) that runs `dune build`, the full test suite, and a 30-second stability fuzz against a standalone Valkey (and the docker-compose cluster if it is up) with a **zero-error threshold**. Set it up once:
+
+```sh
+bash scripts/install-git-hooks.sh
+```
+
+Override knobs:
+- `SKIP_FUZZ=1 git push` — skip the fuzz step (still runs build + tests).
+- `SKIP_PRE_PUSH=1 git push` — emergency escape; skips everything.
+- `FUZZ_SECONDS=60 git push` — longer fuzz window.
+
 ## Roadmap
 
 Next major pieces, roughly in order:

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Pre-push gate for ocaml-valkey.
+#
+# Runs: build -> full test suite -> short stability fuzz.
+# The fuzz is strict: any error fails the push. A standalone Valkey
+# on :6379 is required; a cluster (docker-compose.cluster.yml) is
+# used additionally if it is already up.
+#
+# Override knobs (env):
+#   SKIP_FUZZ=1           skip the fuzz step
+#   FUZZ_SECONDS=30       override fuzz duration
+#   FUZZ_WORKERS=16       override worker count
+#   SKIP_PRE_PUSH=1       skip the whole hook (emergency escape)
+
+set -euo pipefail
+
+if [ "${SKIP_PRE_PUSH:-}" = "1" ]; then
+  echo "pre-push: SKIP_PRE_PUSH=1, skipping all checks" >&2
+  exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+section() {
+  printf '\n\033[1;34m== %s ==\033[0m\n' "$1"
+}
+fail() {
+  printf '\n\033[1;31mFAIL: %s\033[0m\n' "$1" >&2
+  exit 1
+}
+
+section "build"
+dune build || fail "build failed"
+
+section "test suite"
+dune runtest --force || fail "tests failed"
+
+if [ "${SKIP_FUZZ:-}" = "1" ]; then
+  echo "pre-push: SKIP_FUZZ=1, skipping fuzz" >&2
+  exit 0
+fi
+
+FUZZ_SECONDS="${FUZZ_SECONDS:-30}"
+FUZZ_WORKERS="${FUZZ_WORKERS:-16}"
+
+# Standalone reachability check (timeout fast on failure).
+if ! valkey-cli -h localhost -p 6379 PING >/dev/null 2>&1 \
+     && ! redis-cli -h localhost -p 6379 PING >/dev/null 2>&1; then
+  echo "pre-push: standalone Valkey not reachable on :6379, skipping fuzz" >&2
+  exit 0
+fi
+
+section "fuzz: standalone (${FUZZ_SECONDS}s, ${FUZZ_WORKERS} workers, max-errors=0)"
+# Clear the fuzz keyspace first so prior runs do not confuse us.
+valkey-cli -p 6379 --scan --pattern 'fuzz:*' 2>/dev/null \
+  | xargs -r valkey-cli -p 6379 DEL >/dev/null 2>&1 || true
+dune exec bin/fuzz/fuzz.exe -- \
+  --seconds "$FUZZ_SECONDS" \
+  --workers "$FUZZ_WORKERS" \
+  --keys 512 \
+  --report-every 10 \
+  --max-errors 0 \
+  --quiet \
+  || fail "standalone fuzz reported errors"
+
+# Cluster run (only if already up — do not auto-start).
+if valkey-cli -h valkey-c1 -p 7000 CLUSTER INFO 2>/dev/null \
+     | grep -q 'cluster_state:ok'; then
+  section "fuzz: cluster (${FUZZ_SECONDS}s, max-errors=0, no chaos)"
+  dune exec bin/fuzz/fuzz.exe -- \
+    --seeds valkey-c1:7000,valkey-c2:7001,valkey-c3:7002 \
+    --seconds "$FUZZ_SECONDS" \
+    --workers "$FUZZ_WORKERS" \
+    --keys 512 \
+    --report-every 10 \
+    --max-errors 0 \
+  --quiet \
+    || fail "cluster fuzz reported errors"
+else
+  echo "pre-push: cluster not reachable on valkey-c1:7000, skipping cluster fuzz" >&2
+fi
+
+section "pre-push OK"
