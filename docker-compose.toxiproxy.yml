@@ -1,0 +1,40 @@
+# toxiproxy sidecar for TCP-chaos soak / fuzz runs.
+#
+# Starts a toxiproxy daemon that proxies:
+#   localhost:26379  -> valkey-dev:6379       (standalone)
+#   localhost:27000  -> valkey-c1:6379
+#   localhost:27001  -> valkey-c2:6379
+#   localhost:27002  -> valkey-c3:6379
+#
+# Proxies are created on demand via the HTTP API at :8474.
+# See scripts/chaos/chaos.sh for the knobs (latency, loss,
+# bandwidth, close, reset_peer).
+#
+# Run together with the standalone or cluster compose:
+#
+#   docker compose up -d
+#   docker compose -f docker-compose.toxiproxy.yml up -d
+#   bash scripts/chaos/chaos.sh setup
+#   bash scripts/chaos/chaos.sh latency 200   # 200ms
+#   dune exec bin/fuzz/fuzz.exe -- --port 26379 ...
+#   bash scripts/chaos/chaos.sh clear
+#
+# Uses host networking so the proxy's listen ports are reachable
+# from the OCaml client (which also runs on the host) under the
+# same localhost they'd use for a bare valkey instance.
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: ocaml-valkey-toxiproxy
+    # Bridged network so ports are published to the docker host.
+    # `host.docker.internal` is used to reach back to the Valkey
+    # services (which bind their ports on the host).
+    ports:
+      - "8474:8474"       # API
+      - "26379:26379"     # standalone passthrough
+      - "27000-27005:27000-27005"  # cluster passthroughs
+    command: [ "-host", "0.0.0.0" ]
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
