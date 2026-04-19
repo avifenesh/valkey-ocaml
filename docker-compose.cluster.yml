@@ -1,0 +1,214 @@
+# Valkey 9 cluster for integration tests.
+# 3 primaries + 3 replicas. Each node has a unique port so host
+# port-forwarding is one-to-one.
+#
+# Networking model (Docker Desktop + WSL):
+#   - Bridge network [valkey-cluster]. Each node is reachable on the
+#     bridge by its service name (valkey-c1 .. valkey-c6).
+#   - Each node publishes its client + bus port to the host.
+#   - Each node announces [valkey-cN] as its hostname so the cluster
+#     advertises names that both container peers (bridge DNS) and the
+#     host (via /etc/hosts -> 127.0.0.1 + docker port-forward) can
+#     reach. Set up once on the host with:
+#       bash scripts/cluster-hosts-setup.sh
+#
+# Usage:
+#   bash scripts/cluster-hosts-setup.sh          # once
+#   docker compose -f docker-compose.cluster.yml up -d
+#   docker compose -f docker-compose.cluster.yml logs -f cluster-init
+#   dune runtest --force
+#   docker compose -f docker-compose.cluster.yml down -v
+
+networks:
+  valkey-cluster:
+    driver: bridge
+
+x-valkey-node: &valkey-node
+  image: valkey/valkey:9
+  restart: unless-stopped
+
+services:
+  valkey-c1:
+    <<: *valkey-node
+    container_name: ocaml-valkey-c1
+    networks: [ valkey-cluster ]
+    ports: [ "7000:7000", "17000:17000" ]
+    command: >-
+      valkey-server
+      --port 7000
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-port 17000
+      --cluster-announce-hostname valkey-c1
+      --cluster-announce-human-nodename valkey-c1
+      --cluster-preferred-endpoint-type hostname
+      --cluster-announce-port 7000
+      --cluster-announce-bus-port 17000
+      --appendonly no
+      --save ""
+      --protected-mode no
+    healthcheck:
+      test: [ "CMD", "valkey-cli", "-p", "7000", "PING" ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  valkey-c2:
+    <<: *valkey-node
+    container_name: ocaml-valkey-c2
+    networks: [ valkey-cluster ]
+    ports: [ "7001:7001", "17001:17001" ]
+    command: >-
+      valkey-server
+      --port 7001
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-port 17001
+      --cluster-announce-hostname valkey-c2
+      --cluster-announce-human-nodename valkey-c2
+      --cluster-preferred-endpoint-type hostname
+      --cluster-announce-port 7001
+      --cluster-announce-bus-port 17001
+      --appendonly no
+      --save ""
+      --protected-mode no
+    healthcheck:
+      test: [ "CMD", "valkey-cli", "-p", "7001", "PING" ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  valkey-c3:
+    <<: *valkey-node
+    container_name: ocaml-valkey-c3
+    networks: [ valkey-cluster ]
+    ports: [ "7002:7002", "17002:17002" ]
+    command: >-
+      valkey-server
+      --port 7002
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-port 17002
+      --cluster-announce-hostname valkey-c3
+      --cluster-announce-human-nodename valkey-c3
+      --cluster-preferred-endpoint-type hostname
+      --cluster-announce-port 7002
+      --cluster-announce-bus-port 17002
+      --appendonly no
+      --save ""
+      --protected-mode no
+    healthcheck:
+      test: [ "CMD", "valkey-cli", "-p", "7002", "PING" ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  valkey-c4:
+    <<: *valkey-node
+    container_name: ocaml-valkey-c4
+    networks: [ valkey-cluster ]
+    ports: [ "7003:7003", "17003:17003" ]
+    command: >-
+      valkey-server
+      --port 7003
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-port 17003
+      --cluster-announce-hostname valkey-c4
+      --cluster-announce-human-nodename valkey-c4
+      --cluster-preferred-endpoint-type hostname
+      --cluster-announce-port 7003
+      --cluster-announce-bus-port 17003
+      --appendonly no
+      --save ""
+      --protected-mode no
+    healthcheck:
+      test: [ "CMD", "valkey-cli", "-p", "7003", "PING" ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  valkey-c5:
+    <<: *valkey-node
+    container_name: ocaml-valkey-c5
+    networks: [ valkey-cluster ]
+    ports: [ "7004:7004", "17004:17004" ]
+    command: >-
+      valkey-server
+      --port 7004
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-port 17004
+      --cluster-announce-hostname valkey-c5
+      --cluster-announce-human-nodename valkey-c5
+      --cluster-preferred-endpoint-type hostname
+      --cluster-announce-port 7004
+      --cluster-announce-bus-port 17004
+      --appendonly no
+      --save ""
+      --protected-mode no
+    healthcheck:
+      test: [ "CMD", "valkey-cli", "-p", "7004", "PING" ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  valkey-c6:
+    <<: *valkey-node
+    container_name: ocaml-valkey-c6
+    networks: [ valkey-cluster ]
+    ports: [ "7005:7005", "17005:17005" ]
+    command: >-
+      valkey-server
+      --port 7005
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-port 17005
+      --cluster-announce-hostname valkey-c6
+      --cluster-announce-human-nodename valkey-c6
+      --cluster-preferred-endpoint-type hostname
+      --cluster-announce-port 7005
+      --cluster-announce-bus-port 17005
+      --appendonly no
+      --save ""
+      --protected-mode no
+    healthcheck:
+      test: [ "CMD", "valkey-cli", "-p", "7005", "PING" ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  # One-shot bootstrap. Idempotent on an already-formed cluster.
+  cluster-init:
+    image: valkey/valkey:9
+    container_name: ocaml-valkey-cluster-init
+    networks: [ valkey-cluster ]
+    depends_on:
+      valkey-c1: { condition: service_healthy }
+      valkey-c2: { condition: service_healthy }
+      valkey-c3: { condition: service_healthy }
+      valkey-c4: { condition: service_healthy }
+      valkey-c5: { condition: service_healthy }
+      valkey-c6: { condition: service_healthy }
+    entrypoint: [ "sh", "-c" ]
+    command:
+      - |
+        set -e
+        if valkey-cli -h valkey-c1 -p 7000 CLUSTER INFO \
+             | grep -q 'cluster_state:ok'; then
+          echo "cluster already formed"; exit 0
+        fi
+        echo "bootstrapping cluster"
+        yes yes | valkey-cli --cluster create \
+          valkey-c1:7000 valkey-c2:7001 valkey-c3:7002 \
+          valkey-c4:7003 valkey-c5:7004 valkey-c6:7005 \
+          --cluster-replicas 1
+        for _ in $$(seq 1 30); do
+          if valkey-cli -h valkey-c1 -p 7000 CLUSTER INFO \
+               | grep -q 'cluster_state:ok'; then
+            echo "cluster is ok"; exit 0
+          fi
+          sleep 1
+        done
+        echo "cluster did not reach ok"; exit 1
+    restart: "no"

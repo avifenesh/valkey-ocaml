@@ -10,4 +10,6 @@ let () =
       "command_spec", Test_command_spec.tests;
       "connection (needs docker valkey :6379)", Test_connection.tests;
       "client (needs docker valkey :6379)", Test_client.tests;
+      "cluster (needs docker compose -f docker-compose.cluster.yml)",
+        Test_cluster.tests;
     ]
