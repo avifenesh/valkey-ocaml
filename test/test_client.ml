@@ -61,13 +61,13 @@ let test_set_nx_conflict () =
   with_client @@ fun c ->
   let key = "ocaml:client:nx" in
   let _ = C.del c [ key ] in
-  (match C.set c key "a" ~nx:true with
+  (match C.set c key "a" ~cond:Set_nx with
    | Ok true -> ()
    | other -> Alcotest.failf "first NX should succeed: %s"
        (match other with
         | Ok b -> Printf.sprintf "Ok %b" b
         | Error e -> Format.asprintf "Error %a" E.pp e));
-  (match C.set c key "b" ~nx:true with
+  (match C.set c key "b" ~cond:Set_nx with
    | Ok false -> ()
    | other -> Alcotest.failf "second NX should return false: %s"
        (match other with
@@ -79,7 +79,7 @@ let test_set_nx_conflict () =
 let test_set_with_expiry () =
   with_client @@ fun c ->
   let key = "ocaml:client:ex" in
-  (match C.set c key "tmp" ~ex_seconds:5.0 with
+  (match C.set c key "tmp" ~ttl:(Set_ex_seconds 5) with
    | Ok true -> ()
    | other -> Alcotest.failf "SET EX: %s"
        (match other with
@@ -419,7 +419,7 @@ let tests =
       with_client @@ fun c ->
       let key = "ocaml:c:hsetex" in
       let _ = C.del c [ key ] in
-      (match C.hsetex c key ~ex_seconds:60 [ "a", "1"; "b", "2" ] with
+      (match C.hsetex c key ~ttl:(Hse_ex_seconds 60) [ "a", "1"; "b", "2" ] with
        | Ok true -> ()
        | Ok false -> Alcotest.fail "HSETEX: returned false unexpectedly"
        | Error e -> Alcotest.failf "HSETEX: %a" E.pp e);
@@ -452,6 +452,33 @@ let tests =
        | Ok None -> ()
        | Ok (Some s) -> Alcotest.failf "expected None, got Some %S" s
        | Error e -> Alcotest.failf "HGET: %a" E.pp e);
+      let _ = C.del c [ key ] in
+      ());
+    Alcotest.test_case "SADD / SCARD / SMEMBERS / SISMEMBER" `Quick (fun () ->
+      with_client @@ fun c ->
+      let key = "ocaml:c:set" in
+      let _ = C.del c [ key ] in
+      Alcotest.(check int) "SADD 3 new" 3
+        (match C.sadd c key [ "a"; "b"; "c" ] with
+         | Ok n -> n | Error e -> Alcotest.failf "SADD: %a" E.pp e);
+      Alcotest.(check int) "SADD dup returns 1" 1
+        (match C.sadd c key [ "a"; "d" ] with
+         | Ok n -> n | Error e -> Alcotest.failf "SADD: %a" E.pp e);
+      Alcotest.(check int) "SCARD" 4
+        (match C.scard c key with
+         | Ok n -> n | Error e -> Alcotest.failf "SCARD: %a" E.pp e);
+      (match C.sismember c key "a" with
+       | Ok true -> () | Ok false -> Alcotest.fail "SISMEMBER a false"
+       | Error e -> Alcotest.failf "SISMEMBER: %a" E.pp e);
+      (match C.sismember c key "zzz" with
+       | Ok false -> () | Ok true -> Alcotest.fail "SISMEMBER zzz true"
+       | Error e -> Alcotest.failf "SISMEMBER: %a" E.pp e);
+      (match C.smembers c key with
+       | Ok members ->
+           let sorted = List.sort compare members in
+           Alcotest.(check (list string)) "members sorted"
+             [ "a"; "b"; "c"; "d" ] sorted
+       | Error e -> Alcotest.failf "SMEMBERS: %a" E.pp e);
       let _ = C.del c [ key ] in
       ());
     Alcotest.test_case "HINCRBY" `Quick (fun () ->

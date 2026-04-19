@@ -57,22 +57,35 @@ let protocol_violation cmd v =
 
 (* ---------- helpers ---------- *)
 
-let build_set_args ?ex_seconds ?nx ?xx ?ifeq ~get key value =
-  let args = ref [ "SET"; key; value ] in
-  (match ex_seconds with
-   | None -> ()
-   | Some secs ->
-       let ms = int_of_float (secs *. 1000.0) in
-       args := !args @ [ "PX"; string_of_int ms ]);
-  (match nx, xx with
-   | Some true, _ -> args := !args @ [ "NX" ]
-   | _, Some true -> args := !args @ [ "XX" ]
-   | _ -> ());
-  (match ifeq with
-   | None -> ()
-   | Some v -> args := !args @ [ "IFEQ"; v ]);
-  if get then args := !args @ [ "GET" ];
-  Array.of_list !args
+type set_cond = Set_nx | Set_xx
+
+type set_ttl =
+  | Set_ex_seconds of int
+  | Set_px_millis of int
+  | Set_exat_unix_seconds of int
+  | Set_pxat_unix_millis of int
+  | Set_keepttl
+
+let set_cond_args = function
+  | Some Set_nx -> [ "NX" ]
+  | Some Set_xx -> [ "XX" ]
+  | None -> []
+
+let set_ttl_args = function
+  | None -> []
+  | Some (Set_ex_seconds n) -> [ "EX"; string_of_int n ]
+  | Some (Set_px_millis n) -> [ "PX"; string_of_int n ]
+  | Some (Set_exat_unix_seconds n) -> [ "EXAT"; string_of_int n ]
+  | Some (Set_pxat_unix_millis n) -> [ "PXAT"; string_of_int n ]
+  | Some Set_keepttl -> [ "KEEPTTL" ]
+
+let build_set_args ?cond ?ttl ?ifeq ~get key value =
+  let base = [ "SET"; key; value ] in
+  let cond_a = set_cond_args cond in
+  let ttl_a = set_ttl_args ttl in
+  let ifeq_a = match ifeq with None -> [] | Some v -> [ "IFEQ"; v ] in
+  let get_a = if get then [ "GET" ] else [] in
+  Array.of_list (base @ cond_a @ ttl_a @ ifeq_a @ get_a)
 
 let bool_from_integer cmd = function
   | Ok (Resp3.Integer 0L) -> Ok false
@@ -93,16 +106,16 @@ let get ?timeout ?read_from t key =
   | Error e -> Error e
   | Ok v -> string_option_of_reply "GET" v
 
-let set ?timeout ?ex_seconds ?nx ?xx ?ifeq t key value =
-  let args = build_set_args ?ex_seconds ?nx ?xx ?ifeq ~get:false key value in
+let set ?timeout ?cond ?ttl ?ifeq t key value =
+  let args = build_set_args ?cond ?ttl ?ifeq ~get:false key value in
   match exec ?timeout t args with
   | Error e -> Error e
   | Ok (Resp3.Simple_string "OK") -> Ok true
   | Ok Resp3.Null -> Ok false
   | Ok v -> Error (protocol_violation "SET" v)
 
-let set_and_get ?timeout ?ex_seconds ?nx ?xx ?ifeq t key value =
-  let args = build_set_args ?ex_seconds ?nx ?xx ?ifeq ~get:true key value in
+let set_and_get ?timeout ?cond ?ttl ?ifeq t key value =
+  let args = build_set_args ?cond ?ttl ?ifeq ~get:true key value in
   match exec ?timeout t args with
   | Error e -> Error e
   | Ok v -> string_option_of_reply "SET ... GET" v
@@ -434,15 +447,62 @@ let hgetex ?timeout t key ~ttl fields =
       loop [] items
   | Ok v -> Error (protocol_violation "HGETEX" v)
 
-let hsetex ?timeout ?ex_seconds t key fvs =
-  let ex_args = match ex_seconds with
-    | None -> []
-    | Some n -> [ "EX"; string_of_int n ]
-  in
+type hsetex_ttl =
+  | Hse_ex_seconds of int
+  | Hse_px_millis of int
+  | Hse_exat_unix_seconds of int
+  | Hse_pxat_unix_millis of int
+  | Hse_keepttl
+
+let hsetex_ttl_args = function
+  | None -> []
+  | Some (Hse_ex_seconds n) -> [ "EX"; string_of_int n ]
+  | Some (Hse_px_millis n) -> [ "PX"; string_of_int n ]
+  | Some (Hse_exat_unix_seconds n) -> [ "EXAT"; string_of_int n ]
+  | Some (Hse_pxat_unix_millis n) -> [ "PXAT"; string_of_int n ]
+  | Some Hse_keepttl -> [ "KEEPTTL" ]
+
+let hsetex ?timeout ?ttl t key fvs =
+  let ttl_a = hsetex_ttl_args ttl in
   let nfields = string_of_int (List.length fvs) in
   let pairs = List.concat_map (fun (f, v) -> [ f; v ]) fvs in
   let args =
     Array.of_list
-      ([ "HSETEX"; key ] @ ex_args @ [ "FIELDS"; nfields ] @ pairs)
+      ([ "HSETEX"; key ] @ ttl_a @ [ "FIELDS"; nfields ] @ pairs)
   in
   bool_from_integer "HSETEX" (exec ?timeout t args)
+
+(* ---------- sets ---------- *)
+
+let sadd ?timeout t key members =
+  let args = Array.of_list ("SADD" :: key :: members) in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "SADD" v)
+
+let scard ?timeout ?read_from t key =
+  match exec ?timeout ?read_from t [| "SCARD"; key |] with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "SCARD" v)
+
+let strings_of_resp3_collection cmd items =
+  let rec loop acc = function
+    | [] -> Ok (List.rev acc)
+    | Resp3.Bulk_string s :: rest -> loop (s :: acc) rest
+    | Resp3.Simple_string s :: rest -> loop (s :: acc) rest
+    | other :: _ -> Error (protocol_violation cmd other)
+  in
+  loop [] items
+
+let smembers ?timeout ?read_from t key =
+  match exec ?timeout ?read_from t [| "SMEMBERS"; key |] with
+  | Error e -> Error e
+  | Ok (Resp3.Set xs) -> strings_of_resp3_collection "SMEMBERS" xs
+  | Ok (Resp3.Array xs) -> strings_of_resp3_collection "SMEMBERS" xs
+  | Ok v -> Error (protocol_violation "SMEMBERS" v)
+
+let sismember ?timeout ?read_from t key member =
+  bool_from_integer "SISMEMBER"
+    (exec ?timeout ?read_from t [| "SISMEMBER"; key; member |])

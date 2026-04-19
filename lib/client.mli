@@ -63,20 +63,29 @@ val get :
   ?read_from:Read_from.t ->
   t -> string -> (string option, Connection.Error.t) result
 
+type set_cond = Set_nx | Set_xx
+(** Mutually exclusive existence conditions on SET. *)
+
+type set_ttl =
+  | Set_ex_seconds of int
+  | Set_px_millis of int
+  | Set_exat_unix_seconds of int
+  | Set_pxat_unix_millis of int
+  | Set_keepttl
+(** Mutually exclusive TTL modifiers on SET. *)
+
 val set :
   ?timeout:float ->
-  ?ex_seconds:float ->
-  ?nx:bool ->
-  ?xx:bool ->
+  ?cond:set_cond ->
+  ?ttl:set_ttl ->
   ?ifeq:string ->
   t -> string -> string -> (bool, Connection.Error.t) result
 (** [true] on success; [false] when NX/XX/IFEQ prevented the write. *)
 
 val set_and_get :
   ?timeout:float ->
-  ?ex_seconds:float ->
-  ?nx:bool ->
-  ?xx:bool ->
+  ?cond:set_cond ->
+  ?ttl:set_ttl ->
   ?ifeq:string ->
   t -> string -> string -> (string option, Connection.Error.t) result
 (** SET ... GET variant. Returns the old value (None if key didn't exist). *)
@@ -273,10 +282,40 @@ val hgetex :
   t -> string -> ttl:hgetex_ttl -> string list ->
   (string option list, Connection.Error.t) result
 
+type hsetex_ttl =
+  | Hse_ex_seconds of int
+  | Hse_px_millis of int
+  | Hse_exat_unix_seconds of int
+  | Hse_pxat_unix_millis of int
+  | Hse_keepttl
+
 val hsetex :
   ?timeout:float ->
-  ?ex_seconds:int ->
+  ?ttl:hsetex_ttl ->
   t -> string -> (string * string) list ->
   (bool, Connection.Error.t) result
 (** Returns [true] on success, [false] if an [FNX]/[FXX] condition blocked
-    the write. Omitting [ex_seconds] writes without TTL. *)
+    the write. Omitting [ttl] writes without TTL. *)
+
+(** {1 Sets} *)
+
+val sadd :
+  ?timeout:float ->
+  t -> string -> string list -> (int, Connection.Error.t) result
+(** Returns the number of elements newly added (not counting those that
+    already existed). *)
+
+val scard :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> (int, Connection.Error.t) result
+
+val smembers :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> (string list, Connection.Error.t) result
+
+val sismember :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> string -> (bool, Connection.Error.t) result
