@@ -862,7 +862,8 @@ let state t = t.state
 let keepalive_count t = t.keepalive_count
 
 let close t =
-  Atomic.set t.closing true;
+  if Atomic.exchange t.closing true then ()
+  else begin
   (if not (Eio.Promise.is_resolved t.cancel_signal) then
      Eio.Promise.resolve t.cancel_resolver ());
   Chan.close t.cmd_queue;
@@ -881,3 +882,4 @@ let close t =
   match sock_to_close with
   | Some sock -> (try sock.close () with _ -> ())
   | None -> ()
+  end

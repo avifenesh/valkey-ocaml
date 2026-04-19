@@ -29,7 +29,32 @@
 
    The switch passed to [create] owns all the fibers. [close] also
    closes every connection and flips [closing], which tears the
-   pumps and watchdog down. *)
+   pumps and watchdog down.
+
+   Locking discipline:
+
+     shards_mutex   — guards structural changes to [t.shards] and
+                      to each [shard_entry]'s [conn] / [primary_id]
+                      (re-pin path). Held across the lifetime of
+                      any re-pin to prevent the watchdog and a
+                      concurrent [ssubscribe] from racing on the
+                      same slot.
+
+     subs_mutex     — guards the [channels] / [patterns] / shard
+                      [channels] lists. Fine-grained: held just
+                      across the list mutation, never across I/O.
+
+   Lock ordering: code that needs both acquires [shards_mutex] first,
+   then [subs_mutex]. The reverse order never occurs.
+
+   The [conn] field of [shard_entry] and [global_entry] is read
+   without a lock on the send path (see [send_prefixed]). That is
+   safe because every write to [conn] happens under [shards_mutex]
+   whose unlock is a release barrier in OCaml 5; any subsequent
+   `Mutex.lock` on a different thread observes the write. Readers
+   that don't synchronise may briefly see an older conn, which is
+   acceptable — they'll either succeed on the old conn or fail with
+   `Closed`, at which point the caller retries. *)
 
 type shard_entry = {
   mutable conn : Connection.t;
@@ -207,46 +232,10 @@ let repin_shard t (entry : shard_entry) ~new_id ~new_host ~new_port =
   start_pump t conn
     ~assign_cancel:(fun u -> entry.pump_cancel <- Some u)
 
-(* Watchdog: every [watchdog_interval] seconds, walk every live
-   shard_entry and check whether the router still says its
-   primary_id is current. Re-pin any that have moved. *)
-let watchdog t () =
-  let rec loop () =
-    if Atomic.get t.closing then ()
-    else begin
-      let _ =
-        try
-          Eio.Fiber.first
-            (fun () ->
-              Eio.Time.sleep
-                (Obj.magic ())   (* placeholder — we use t.with_timeout *)
-                t.watchdog_interval;
-              `Tick)
-            (fun () -> Eio.Promise.await t.close_signal; `Cancel)
-        with _ -> `Cancel
-      in
-      if Atomic.get t.closing then ()
-      else begin
-        let entries =
-          with_mutex t.shards_mutex (fun () ->
-              Hashtbl.fold (fun _ e acc -> e :: acc) t.shards [])
-        in
-        List.iter
-          (fun entry ->
-            match Router.endpoint_for_slot t.router entry.slot with
-            | Some (id, host, port) when id <> entry.primary_id ->
-                (try
-                   with_mutex t.shards_mutex (fun () ->
-                       repin_shard t entry
-                         ~new_id:id ~new_host:host ~new_port:port)
-                 with _ -> ())
-            | _ -> ())
-          entries;
-        loop ()
-      end
-    end
-  in
-  try loop () with _ -> ()
+(* The watchdog fiber is defined inline in [create] below so it can
+   close over the `clock` and `sw` that `create` receives as
+   arguments. See the loop starting at "Eio.Fiber.fork ~sw:t.sw" in
+   [create]. *)
 
 (* ---------- public API ---------- *)
 
@@ -356,9 +345,6 @@ let create ~sw ~net ~clock ?domain_mgr
       try loop () with _ -> ());
   t
 
-(* The standalone [watchdog] helper referenced [Obj.magic ()] for
-   the clock; we inlined the correct version above. *)
-let _ = watchdog
 
 let close t =
   if not (Atomic.exchange t.closing true) then begin

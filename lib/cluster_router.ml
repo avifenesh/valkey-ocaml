@@ -470,9 +470,11 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
         make_exec_multi ~pool ~topology_ref ?timeout fan args
       in
       let close () =
-        Atomic.set closing true;
-        Eio.Condition.broadcast refresh_signal;
-        Node_pool.close_all pool
+        if Atomic.exchange closing true then ()
+        else begin
+          Eio.Condition.broadcast refresh_signal;
+          Node_pool.close_all pool
+        end
       in
       let primary () =
         match Node_pool.connections pool with
