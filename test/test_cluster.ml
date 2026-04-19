@@ -288,6 +288,70 @@ let test_cluster_pubsub_multi_slot () =
       Alcotest.(check (list (pair string string)))
         "multi-slot deliveries" expected actual
 
+(* CLUSTER KEYSLOT from the server must match our client-side
+   CRC16. Catches any drift in Slot.of_key. *)
+let test_cluster_keyslot_matches_client () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match CR.create ~sw ~net ~clock ~config () with
+  | Error m -> Alcotest.failf "cluster router: %s" m
+  | Ok router ->
+      let client =
+        C.from_router ~config:C.Config.default router
+      in
+      Fun.protect ~finally:(fun () -> C.close client) @@ fun () ->
+      List.iter
+        (fun key ->
+          match C.cluster_keyslot client ~key with
+          | Error e ->
+              Alcotest.failf "CLUSTER KEYSLOT %S: %a" key err_pp e
+          | Ok server_slot ->
+              let local = Valkey.Slot.of_key key in
+              Alcotest.(check int)
+                (Printf.sprintf "slot of %S" key)
+                server_slot local)
+        [ "foo"; "bar"; "{user}:1"; "{user}:2";
+          "long-key-with-lots-of-bytes-for-crc16" ]
+
+let test_cluster_info_contains_state () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match CR.create ~sw ~net ~clock ~config () with
+  | Error m -> Alcotest.failf "cluster router: %s" m
+  | Ok router ->
+      let client =
+        C.from_router ~config:C.Config.default router
+      in
+      Fun.protect ~finally:(fun () -> C.close client) @@ fun () ->
+      let info =
+        match C.cluster_info client with
+        | Ok s -> s
+        | Error e -> Alcotest.failf "CLUSTER INFO: %a" err_pp e
+      in
+      let contains s n =
+        let ls = String.length s and ln = String.length n in
+        if ln = 0 then true
+        else
+          let rec loop i =
+            if i + ln > ls then false
+            else if String.sub s i ln = n then true
+            else loop (i + 1)
+          in
+          loop 0
+      in
+      if not (contains info "cluster_state") then
+        Alcotest.failf "cluster_state missing in:\n%s" info
+
 (* Restart the primary that currently owns [slot] and confirm the
    sharded subscriber's watchdog re-pins on the (possibly new)
    primary once the topology settles, replays SSUBSCRIBE, and
@@ -392,4 +456,8 @@ let tests =
       test_cluster_pubsub_multi_slot;
     tc "cluster_pubsub: sharded replay after primary restarts"
       test_cluster_pubsub_failover_replay;
+    tc "CLUSTER KEYSLOT matches client-side CRC16"
+      test_cluster_keyslot_matches_client;
+    tc "CLUSTER INFO contains cluster_state"
+      test_cluster_info_contains_state;
   ]

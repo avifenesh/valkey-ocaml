@@ -1288,3 +1288,115 @@ val client_tracking_on :
 val client_tracking_off :
   ?timeout:float -> t -> (unit, Connection.Error.t) result
 (** [CLIENT TRACKING OFF]. *)
+
+(** {1 Functions (Valkey 7+)}
+
+    Functions are server-side Lua libraries. Load once with
+    [function_load], call repeatedly with [fcall] / [fcall_ro].
+    Unlike scripts, functions persist across restarts and
+    replicate to replicas.
+
+    All function-lifecycle commands ({!function_load},
+    {!function_delete}, {!function_flush}) fan to every primary
+    so the library is present on every shard — required for
+    [FCALL] to succeed regardless of which slot's primary the
+    call routes to. *)
+
+val function_load :
+  ?timeout:float ->
+  ?replace:bool ->
+  t -> source:string ->
+  (string, Connection.Error.t) result
+(** [FUNCTION LOAD [REPLACE] source]. The [source] must start
+    with a shebang line [#!<engine> name=<library>]. Returns the
+    loaded library's name. Fans to every primary. *)
+
+val function_delete :
+  ?timeout:float ->
+  t -> library_name:string ->
+  (unit, Connection.Error.t) result
+(** [FUNCTION DELETE library]. Fans to every primary; server
+    errors if the library is unknown on any of them. *)
+
+val function_flush :
+  ?timeout:float ->
+  ?mode:script_flush_mode ->
+  t -> (unit, Connection.Error.t) result
+(** [FUNCTION FLUSH [ASYNC | SYNC]]. Fans to every primary.
+    Removes every loaded library. *)
+
+val function_list :
+  ?timeout:float ->
+  ?library_name_pattern:string ->
+  ?with_code:bool ->
+  t -> (Resp3.t list, Connection.Error.t) result
+(** [FUNCTION LIST [LIBRARYNAME pattern] [WITHCODE]]. Returns
+    one [Resp3.t] per library — each is typically a map with
+    [library_name], [engine], [functions], and (if
+    [with_code:true]) [library_code] fields. Decoding is left to
+    the caller because the field set is version-dependent. *)
+
+val fcall :
+  ?timeout:float ->
+  t -> function_:string -> keys:string list -> args:string list ->
+  (Resp3.t, Connection.Error.t) result
+(** [FCALL function numkeys key... arg...]. Routed by the first
+    key's slot. In cluster mode all keys must hash to the same
+    slot. *)
+
+val fcall_ro :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> function_:string -> keys:string list -> args:string list ->
+  (Resp3.t, Connection.Error.t) result
+(** [FCALL_RO function numkeys key... arg...]. Read-only variant;
+    honours [?read_from] so it can land on a replica. *)
+
+(** {1 CLUSTER introspection} *)
+
+val cluster_keyslot :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> key:string ->
+  (int, Connection.Error.t) result
+(** [CLUSTER KEYSLOT key]. Useful to cross-check {!Valkey.Slot.of_key}
+    against the server's own CRC16 implementation. *)
+
+val cluster_info :
+  ?timeout:float ->
+  t -> (string, Connection.Error.t) result
+(** [CLUSTER INFO]. Returns a CRLF-separated [key:value] string
+    covering cluster_state, cluster_slots_ok, cluster_known_nodes,
+    cluster_size, and friends. *)
+
+(** {1 LATENCY} *)
+
+val latency_doctor :
+  ?timeout:float -> t -> (string, Connection.Error.t) result
+(** [LATENCY DOCTOR]. Server-generated human-readable latency
+    analysis report. *)
+
+val latency_reset :
+  ?timeout:float ->
+  ?events:string list ->
+  t -> (int, Connection.Error.t) result
+(** [LATENCY RESET [event ...]]. Without [events], resets every
+    tracked event. Returns the number of event series cleared. *)
+
+(** {1 MEMORY} *)
+
+val memory_usage :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  ?samples:int ->
+  t -> string ->
+  (int option, Connection.Error.t) result
+(** [MEMORY USAGE key [SAMPLES count]]. Bytes the key + value
+    occupy in RAM, or [None] if the key does not exist. [samples]
+    controls nested-container sampling (default 5 on the server;
+    pass 0 to sample all children). *)
+
+val memory_purge :
+  ?timeout:float -> t -> (unit, Connection.Error.t) result
+(** [MEMORY PURGE]. Asks the allocator to release dirty pages.
+    No-op on non-jemalloc builds. *)

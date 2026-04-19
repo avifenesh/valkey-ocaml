@@ -2266,3 +2266,120 @@ let client_tracking_on
 let client_tracking_off ?timeout t =
   expect_ok "CLIENT TRACKING OFF"
     (exec ?timeout t [| "CLIENT"; "TRACKING"; "OFF" |])
+
+(* ---------- Functions ---------- *)
+
+let function_load ?timeout ?(replace = false) t ~source =
+  let replace_args = if replace then [ "REPLACE" ] else [] in
+  let args =
+    Array.of_list
+      ("FUNCTION" :: "LOAD" :: replace_args @ [ source ])
+  in
+  let decode = function
+    | Resp3.Bulk_string s | Resp3.Simple_string s -> Ok s
+    | v -> Error (protocol_violation "FUNCTION LOAD" v)
+  in
+  fan_primaries_unanimous "FUNCTION LOAD" ?timeout ~decode t args
+
+let function_delete ?timeout t ~library_name =
+  let args = [| "FUNCTION"; "DELETE"; library_name |] in
+  let decode = function
+    | Resp3.Simple_string "OK" -> Ok ()
+    | v -> Error (protocol_violation "FUNCTION DELETE" v)
+  in
+  fan_primaries_unanimous "FUNCTION DELETE" ?timeout ~decode t args
+
+let function_flush ?timeout ?mode t =
+  let tail = match mode with
+    | None -> []
+    | Some Flush_sync -> [ "SYNC" ]
+    | Some Flush_async -> [ "ASYNC" ]
+  in
+  let args = Array.of_list ("FUNCTION" :: "FLUSH" :: tail) in
+  let decode = function
+    | Resp3.Simple_string "OK" -> Ok ()
+    | v -> Error (protocol_violation "FUNCTION FLUSH" v)
+  in
+  fan_primaries_unanimous "FUNCTION FLUSH" ?timeout ~decode t args
+
+let function_list ?timeout ?library_name_pattern ?(with_code = false) t =
+  let lib_args = match library_name_pattern with
+    | None -> []
+    | Some p -> [ "LIBRARYNAME"; p ]
+  in
+  let code_args = if with_code then [ "WITHCODE" ] else [] in
+  let args =
+    Array.of_list
+      ("FUNCTION" :: "LIST" :: lib_args @ code_args)
+  in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Array xs) -> Ok xs
+  | Ok v -> Error (protocol_violation "FUNCTION LIST" v)
+
+let fcall ?timeout t ~function_ ~keys ~args =
+  let cmd =
+    Array.of_list
+      ("FCALL" :: function_
+       :: string_of_int (List.length keys)
+       :: keys @ args)
+  in
+  exec ?timeout t cmd
+
+let fcall_ro ?timeout ?read_from t ~function_ ~keys ~args =
+  let cmd =
+    Array.of_list
+      ("FCALL_RO" :: function_
+       :: string_of_int (List.length keys)
+       :: keys @ args)
+  in
+  exec ?timeout ?read_from t cmd
+
+(* ---------- CLUSTER introspection ---------- *)
+
+let cluster_keyslot ?timeout ?read_from t ~key =
+  match exec ?timeout ?read_from t [| "CLUSTER"; "KEYSLOT"; key |] with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "CLUSTER KEYSLOT" v)
+
+let cluster_info ?timeout t =
+  string_of_reply "CLUSTER INFO"
+    (exec ?timeout t [| "CLUSTER"; "INFO" |])
+
+(* ---------- LATENCY ---------- *)
+
+let latency_doctor ?timeout t =
+  string_of_reply "LATENCY DOCTOR"
+    (exec ?timeout t [| "LATENCY"; "DOCTOR" |])
+
+let latency_reset ?timeout ?events t =
+  let ev_args = match events with
+    | None | Some [] -> []
+    | Some xs -> xs
+  in
+  let args = Array.of_list ("LATENCY" :: "RESET" :: ev_args) in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "LATENCY RESET" v)
+
+(* ---------- MEMORY ---------- *)
+
+let memory_usage ?timeout ?read_from ?samples t key =
+  let sample_args = match samples with
+    | None -> []
+    | Some n -> [ "SAMPLES"; string_of_int n ]
+  in
+  let args =
+    Array.of_list ("MEMORY" :: "USAGE" :: key :: sample_args)
+  in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok Resp3.Null -> Ok None
+  | Ok (Resp3.Integer n) -> Ok (Some (Int64.to_int n))
+  | Ok v -> Error (protocol_violation "MEMORY USAGE" v)
+
+let memory_purge ?timeout t =
+  expect_ok "MEMORY PURGE"
+    (exec ?timeout t [| "MEMORY"; "PURGE" |])
