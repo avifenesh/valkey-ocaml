@@ -25,46 +25,65 @@ All three drive the same scenario matrix (same payload sizes, same
 concurrency levels, same ops counts) so latency + throughput numbers
 can be compared directly.
 
-## Results — localhost Valkey 9, 30k ops per scenario
+## Results — localhost Valkey 9, 50k ops per scenario
 
-| Scenario                      |       Ours |  ocaml-redis |        C ref | Ours/C | Ours/ocaml-redis |
-|-------------------------------|-----------:|-------------:|-------------:|-------:|-----------------:|
-| SET 100B   conc=1             |  7,408 r/s |    8,884 r/s |    9,091 r/s |   81 % |            0.83x |
-| GET 100B   conc=1             |  7,622 r/s |    9,518 r/s |    8,633 r/s |   88 % |            0.80x |
-| SET 100B   conc=10            | 55,351 r/s |   28,679 r/s |   60,484 r/s |   92 % |          **1.93x** |
-| GET 100B   conc=10            | 45,443 r/s |   27,872 r/s |   61,224 r/s |   74 % |          **1.63x** |
-| MIX 100B   conc=10            | 50,452 r/s |   27,012 r/s |            — |      — |          **1.87x** |
-| SET 100B   conc=100           |172,475 r/s |   57,817 r/s |  215,827 r/s |   80 % |          **2.98x** |
-| GET 100B   conc=100           |206,344 r/s |   59,121 r/s |  225,564 r/s |   91 % |          **3.49x** |
-| MIX 100B   conc=100           |200,615 r/s |   54,371 r/s |            — |      — |          **3.69x** |
-| SET 16KiB  conc=10            | 27,679 r/s |   26,557 r/s |   59,406 r/s |   47 % |            1.04x |
-| GET 16KiB  conc=10            | 41,470 r/s |   24,565 r/s |   58,708 r/s |   71 % |          **1.69x** |
-| MIX 1KiB   conc=100           |105,447 r/s |   45,675 r/s |            — |      — |          **2.31x** |
+| Scenario                      |       Ours |  ocaml-redis |    C (ref) | Ours / C | Ours / ocaml-redis |
+|-------------------------------|-----------:|-------------:|-----------:|---------:|-------------------:|
+| SET 100B   conc=1             |  6,821 r/s |    8,468 r/s |  8,775 r/s |     78 % |              0.81x |
+| GET 100B   conc=1             |  7,245 r/s |    8,786 r/s |  8,627 r/s |     84 % |              0.82x |
+| SET 100B   conc=10            | 51,440 r/s |   28,657 r/s | 62,735 r/s |     82 % |           **1.80x** |
+| GET 100B   conc=10            | 60,010 r/s |   27,706 r/s | 59,382 r/s |   **101 %** |         **2.17x** |
+| MIX 100B   conc=10            | 55,784 r/s |   29,834 r/s |          — |        — |           **1.87x** |
+| SET 100B   conc=100           |189,942 r/s |   45,116 r/s |223,214 r/s |     85 % |           **4.21x** |
+| GET 100B   conc=100           |195,039 r/s |   41,133 r/s |202,429 r/s |     96 % |           **4.74x** |
+| MIX 100B   conc=100           |188,494 r/s |   32,699 r/s |          — |        — |           **5.76x** |
+| SET 16KiB  conc=10            | 49,851 r/s |   26,325 r/s | 55,005 r/s |   **91 %** |         **1.89x** |
+| GET 16KiB  conc=10            | 43,996 r/s |   24,060 r/s | 56,883 r/s |     77 % |           **1.83x** |
+| MIX 1KiB   conc=100           |109,869 r/s |   46,808 r/s |          — |        — |           **2.35x** |
 
 p50 latency stays under 1 ms for 100B payloads at every concurrency
-tier. p99 is 0.9 ms at conc=100 vs ocaml-redis's 7.3 ms (the head-of-
-line cost of blocking sockets + OS-thread scheduling). See
-`scripts/run-bench.sh` output for the full percentile table.
+tier. At conc=100 our p99 is ~1.1 ms vs ocaml-redis's 6-9 ms (the
+head-of-line cost of blocking sockets + OS-thread scheduling).
 
 ## What the numbers say
 
-**Single-fiber (conc=1):** parity with ocaml-redis. Both clients are
-RTT-bound; a typed API and Eio's fiber scheduler cost a small number
-of percent against the blocking client.
+**Single-fiber (conc=1):** ~80 % of ocaml-redis, ~80 % of C. Both
+clients are RTT-bound and a typed API + Eio scheduler cost a small
+constant per op.
 
-**Medium concurrency (conc=10):** we pull 1.6x–1.9x ahead by
+**Medium concurrency (conc=10):** we pull 1.8-2.2x ahead by
 multiplexing commands onto one TCP connection, where ocaml-redis
-needs 10 threads and 10 connections to approach the same throughput.
+needs 10 threads and 10 connections to approach the same
+throughput. GET conc=10 at 101 % of C is real: the C benchmark
+opens 10 separate connections + handshakes, which we skip.
 
-**High concurrency (conc=100):** the gap widens to ~3–3.5x. On
-100 concurrent fibers we come within 80–90 % of the pipelined
-C-client ceiling; ocaml-redis tops out at ~60 k ops/s on reads and
-~58 k ops/s on writes.
+**High concurrency (conc=100):** the gap widens to **4-5x**.
+At 100 concurrent fibers we come within 85-96 % of the pipelined
+C-client ceiling; ocaml-redis tops out at ~40-45 k ops/s, bottle-
+necked by OS-thread scheduling.
 
-**Large payloads:** on GET 16 KiB we're at 71 % of C, which is
-reasonable. SET 16 KiB at 47 % of C is the one clear outlier —
-points to an extra buffer copy on the send path that is worth
-chasing next.
+**Large payloads:** SET 16 KiB at **91 %** of C — within the typed-
+OCaml-client noise band. This used to be 47 %; see the writer
+commit below.
+
+## Send-path optimization (commit history)
+
+The first benchmark pass showed SET 16 KiB at only 47 % of C. The
+culprit was the wire-encoder allocating through `Buffer.t`
+[`Buffer.add_string` + `Buffer.contents`] before the Cstruct copy
+that `Eio.Flow.copy_string` does internally — three touches of the
+16 KiB payload per request.
+
+The fix (`Resp3_writer.command_to_cstruct`):
+
+1. Compute the exact encoded size from the args array in O(args).
+2. Allocate one `Cstruct.t` at that size via `Cstruct.create_unsafe`.
+3. `Cstruct.blit_from_string` each argument in once.
+4. `Eio.Flow.write sink [cs]` — single writev on the socket.
+
+One copy of the payload per request instead of two, and no wasted
+intermediate string. SET 16 KiB rose from ~28 k r/s to ~50 k r/s,
+bringing the ratio to C from 47 % to 91 %.
 
 ## Methodology notes
 

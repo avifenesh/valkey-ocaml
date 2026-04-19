@@ -253,7 +253,11 @@ module Config = struct
 end
 
 type socket = {
-  write : string -> unit;
+  write : Cstruct.t -> unit;
+  (* One allocation + blit per command; [Eio.Flow.write] uses
+     scatter-gather when the transport supports it. Replaces the
+     previous [string -> unit] which forced a Buffer.contents copy
+     of the whole command. *)
   reader : Eio.Buf_read.t;              (* only used during handshake *)
   read_into : Cstruct.t -> int;         (* used by in_pump post-handshake *)
   close : unit -> unit;
@@ -267,7 +271,7 @@ type entry = {
 
 type queued = {
   entry : entry;
-  bytes : string;
+  wire : Cstruct.t;   (* serialised command, ready for the socket *)
 }
 
 type state =
@@ -336,7 +340,7 @@ let extract_string_field key = function
   | _ -> None
 
 let run_hello (sock : socket) (hs : Handshake.t) : (Resp3.t, Error.t) result =
-  sock.write (Resp3_writer.command_to_string (hello_args hs));
+  sock.write (Resp3_writer.command_to_cstruct (hello_args hs));
   match Resp3_parser.read (Resp3_parser.of_buf_read sock.reader) with
   | Map _ as m -> Ok m
   | Simple_error s | Bulk_error s ->
@@ -350,7 +354,7 @@ let run_hello (sock : socket) (hs : Handshake.t) : (Resp3.t, Error.t) result =
 
 let run_select (sock : socket) db : (unit, Error.t) result =
   sock.write
-    (Resp3_writer.command_to_string [| "SELECT"; string_of_int db |]);
+    (Resp3_writer.command_to_cstruct [| "SELECT"; string_of_int db |]);
   match Resp3_parser.read (Resp3_parser.of_buf_read sock.reader) with
   | Simple_string "OK" -> Ok ()
   | Simple_error s | Bulk_error s ->
@@ -407,7 +411,7 @@ let make_tcp_connector ~sw ~net ~host ~port ~tls =
                let reader =
                  Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) tcp
                in
-               let write bytes = Eio.Flow.copy_string bytes tcp in
+               let write cs = Eio.Flow.write tcp [ cs ] in
                let read_into buf = Eio.Flow.single_read tcp buf in
                let close () = try Eio.Resource.close tcp with _ -> () in
                Ok { write; reader; read_into; close }
@@ -420,7 +424,7 @@ let make_tcp_connector ~sw ~net ~host ~port ~tls =
                     let reader =
                       Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) flow
                     in
-                    let write bytes = Eio.Flow.copy_string bytes flow in
+                    let write cs = Eio.Flow.write flow [ cs ] in
                     let read_into buf = Eio.Flow.single_read flow buf in
                     let close () =
                       try Eio.Resource.close flow with _ -> ()
@@ -483,7 +487,7 @@ let out_pump (t : t) (sock : socket) : unit =
              with Chan.Closed -> raise Exit)
       in
       let write_result =
-        try Ok (sock.write q.bytes)
+        try Ok (sock.write q.wire)
         with exn -> Error exn
       in
       match write_result with
@@ -650,8 +654,8 @@ let request ?timeout t args =
     | Some _ as v -> v
     | None -> t.config.command_timeout
   in
-  let bytes = Resp3_writer.command_to_string args in
-  let size = String.length bytes in
+  let wire = Resp3_writer.command_to_cstruct args in
+  let size = Cstruct.length wire in
   if size > t.config.max_queued_bytes then Error Error.Queue_full
   else
     let cb_decision =
@@ -667,7 +671,7 @@ let request ?timeout t args =
           Byte_sem.acquire t.budget size;
           let promise, resolver = Eio.Promise.create () in
           let entry = { resolver; size; abandoned = false } in
-          match try_enqueue t { entry; bytes } with
+          match try_enqueue t { entry; wire } with
           | `Dead e ->
               Byte_sem.release t.budget size;
               Error e
