@@ -193,7 +193,7 @@ let rec gen_value rng ~depth ~max_depth ~max_payload =
                    ~max_payload )))
     | _ -> pick_leaf ()
 
-(* ---------- corruption ---------- *)
+(* ---------- corruption (byte level) ---------- *)
 
 let corrupt rng s =
   let n = String.length s in
@@ -230,6 +230,137 @@ let corrupt rng s =
           Bytes.fill b i len '\x00'
     done;
     Bytes.to_string b
+
+(* ---------- corruption (length fields) ----------
+
+   RESP3 length-prefixed types ($N, *N, %N, ~N, >N, !N, =N) are the
+   most interesting attack surface: if the parser trusts the
+   declared length without bounds-checking, a malicious peer can
+   force huge allocations or reads past the buffer. Byte-level
+   random corruption hits length fields only by accident.
+
+   This mutator walks the encoded bytes, finds each length header
+   ($/*/%/~/>/!/= followed by a number and CRLF), and replaces the
+   number with a pathological value. *)
+
+let is_length_tag = function
+  | '$' | '*' | '%' | '~' | '>' | '!' | '=' -> true
+  | _ -> false
+
+let poison_lengths rng s =
+  (* Rewrite at most one length header with a tricky value. Return
+     s unchanged if no header found in the first 256 bytes. *)
+  let n = String.length s in
+  let b = Buffer.create n in
+  let rewritten = ref false in
+  let i = ref 0 in
+  while !i < n do
+    let budget = n - !i in
+    if not !rewritten
+       && budget >= 4
+       && is_length_tag s.[!i]
+       && (* find CRLF within next 32 bytes *)
+          (let rec find j =
+             if j + 1 >= n || j - !i > 32 then None
+             else if s.[j] = '\r' && s.[j + 1] = '\n' then Some j
+             else find (j + 1)
+           in
+           find (!i + 1))
+          <> None
+    then begin
+      Buffer.add_char b s.[!i];
+      let crlf_at =
+        let rec find j =
+          if s.[j] = '\r' && s.[j + 1] = '\n' then j
+          else find (j + 1)
+        in
+        find (!i + 1)
+      in
+      let poison =
+        match Random.State.int rng 8 with
+        | 0 -> "-1"                        (* RESP2 null form *)
+        | 1 -> "-2"                        (* negative, invalid *)
+        | 2 -> "999999999999999999"        (* overflow *)
+        | 3 -> "0"                         (* empty *)
+        | 4 -> "1073741824"                (* 1 GiB *)
+        | 5 -> ""                          (* empty string *)
+        | 6 -> "+1"                        (* leading plus *)
+        | _ -> "abc"                       (* non-numeric *)
+      in
+      Buffer.add_string b poison;
+      Buffer.add_string b "\r\n";
+      i := crlf_at + 2;
+      rewritten := true
+    end
+    else begin
+      Buffer.add_char b s.[!i];
+      incr i
+    end
+  done;
+  Buffer.contents b
+
+(* Structural mutation on a tree: swap array elements, duplicate a
+   subtree, or replace a subtree with a sibling. Keeps the result
+   well-formed at the RESP3 level but shuffles structure — catches
+   decoder bugs that depend on ordering or uniqueness assumptions. *)
+let rec mutate_tree rng (v : R.t) =
+  match v with
+  | R.Array xs ->
+      R.Array (mutate_list rng xs (fun l -> R.Array l))
+  | R.Set xs ->
+      R.Set (mutate_list rng xs (fun l -> R.Set l))
+  | R.Push xs ->
+      R.Push (mutate_list rng xs (fun l -> R.Push l))
+  | R.Map kvs when kvs <> [] ->
+      (* Swap a random key with its value. RESP3 allows any type as
+         key; this frequently shakes out decoders that assume keys
+         are strings. *)
+      let i = Random.State.int rng (List.length kvs) in
+      let kvs' =
+        List.mapi
+          (fun j ((k, v) as p) -> if j = i then (v, k) else p)
+          kvs
+      in
+      R.Map kvs'
+  | _ -> v
+
+and mutate_list rng xs recon =
+  ignore recon;
+  let n = List.length xs in
+  if n = 0 then xs
+  else
+    match Random.State.int rng 4 with
+    | 0 when n >= 2 ->
+        (* Swap two random elements. *)
+        let i = Random.State.int rng n in
+        let j = Random.State.int rng n in
+        List.mapi
+          (fun k x ->
+            if k = i then List.nth xs j
+            else if k = j then List.nth xs i
+            else x)
+          xs
+    | 1 ->
+        (* Duplicate a random element. *)
+        let i = Random.State.int rng n in
+        let dup = List.nth xs i in
+        xs @ [ dup ]
+    | 2 when n >= 3 ->
+        (* Reverse a sublist (tests parsers that rely on append-only). *)
+        let start = Random.State.int rng (n - 1) in
+        let count = 2 + Random.State.int rng (n - start - 1) in
+        let prefix = List.filteri (fun k _ -> k < start) xs in
+        let mid =
+          List.filteri (fun k _ -> k >= start && k < start + count) xs
+          |> List.rev
+        in
+        let suffix = List.filteri (fun k _ -> k >= start + count) xs in
+        prefix @ mid @ suffix
+    | _ ->
+        (* Recursively mutate the first element. *)
+        (match xs with
+         | [] -> xs
+         | x :: rest -> mutate_tree rng x :: rest)
 
 (* Hand-crafted tricky inputs — the cheap-to-write seeds that catch
    the obvious edge cases. *)
@@ -292,6 +423,8 @@ type stats = {
   by_exn : (string, int) Hashtbl.t;
   mutable max_bytes_seen : int;
   mutable worst : (string * string) option;  (* (exn_name, first 80 bytes) *)
+  mutable first_failing_full : (string * string) option;
+    (* (exn_name, full input) — kept for the shrinker *)
 }
 
 let make_stats () = {
@@ -299,6 +432,7 @@ let make_stats () = {
   by_exn = Hashtbl.create 16;
   max_bytes_seen = 0;
   worst = None;
+  first_failing_full = None;
 }
 
 let record stats input outcome =
@@ -317,7 +451,81 @@ let record stats input outcome =
           (if String.length input > 80 then String.sub input 0 80
            else input)
       in
-      if stats.worst = None then stats.worst <- Some (name, snippet)
+      if stats.worst = None then stats.worst <- Some (name, snippet);
+      if stats.first_failing_full = None then
+        stats.first_failing_full <- Some (name, input)
+
+(* ---------- shrinking ----------
+
+   Given a failing input, find a shorter input that still fails
+   with the same exception. Greedy delta-debugging: try halves,
+   then every position drop, until no smaller input fails.
+
+   The total work is O(|input|²) in the worst case, so we cap the
+   loop at a few hundred iterations. For seeds of a few hundred
+   bytes this converges in well under a second. *)
+
+let shrink input target_exn =
+  let still_fails candidate =
+    match run_once candidate with
+    | Unexpected name -> name = target_exn
+    | _ -> false
+  in
+  let current = ref input in
+  let steps = ref 0 in
+  let max_steps = 500 in
+  let changed = ref true in
+  while !changed && !steps < max_steps do
+    changed := false;
+    (* Try halves. *)
+    let n = String.length !current in
+    if n >= 4 then begin
+      let half = n / 2 in
+      let first = String.sub !current 0 half in
+      let second = String.sub !current half (n - half) in
+      (if still_fails first then begin
+        current := first;
+        changed := true
+      end
+      else if still_fails second then begin
+        current := second;
+        changed := true
+      end);
+      incr steps
+    end;
+    (* Drop single bytes from each end. *)
+    if not !changed then begin
+      let n = String.length !current in
+      if n > 1 && still_fails (String.sub !current 1 (n - 1)) then begin
+        current := String.sub !current 1 (n - 1);
+        changed := true
+      end
+      else if n > 1
+              && still_fails (String.sub !current 0 (n - 1)) then begin
+        current := String.sub !current 0 (n - 1);
+        changed := true
+      end;
+      incr steps
+    end;
+    (* Mid-drop: remove a random byte. One pass per outer loop. *)
+    if not !changed then begin
+      let n = String.length !current in
+      let i = ref 1 in
+      while not !changed && !i < n - 1 do
+        let candidate =
+          String.sub !current 0 !i
+          ^ String.sub !current (!i + 1) (n - !i - 1)
+        in
+        if still_fails candidate then begin
+          current := candidate;
+          changed := true
+        end
+        else incr i
+      done;
+      incr steps
+    end
+  done;
+  !current
 
 let ( % ) x y = if y = 0 then 0.0 else 100.0 *. float x /. float y
 
@@ -371,48 +579,66 @@ let () =
     (fun s -> record stats s (run_once s))
     (seed_inputs ());
 
-  (* 2. generated inputs *)
+  (* 2. generated inputs — six strategies, uniform weight.
+     0 random bytes
+     1 valid encoding
+     2 valid encoding with byte-level corruption
+     3 truncated valid encoding
+     4 tree-level structural mutation, then encode
+     5 valid encoding with length-field poisoning *)
   for _ = 1 to args.iterations do
+    let gen_valid () =
+      gen_value rng ~depth:0
+        ~max_depth:args.max_depth
+        ~max_payload:(min 2048 (args.max_input_bytes / 4))
+    in
     let input =
-      match Random.State.int rng 4 with
+      match Random.State.int rng 6 with
       | 0 ->
-          (* Pure random bytes. *)
           let n = Random.State.int rng args.max_input_bytes in
           String.init n (fun _ -> Char.chr (Random.State.int rng 256))
-      | 1 ->
-          (* Valid encoded RESP3 value. *)
-          let v =
-            gen_value rng ~depth:0
-              ~max_depth:args.max_depth
-              ~max_payload:(min 2048 (args.max_input_bytes / 4))
-          in
-          encode v
-      | 2 ->
-          (* Valid encoding with a few random corruptions. *)
-          let v =
-            gen_value rng ~depth:0
-              ~max_depth:args.max_depth
-              ~max_payload:(min 2048 (args.max_input_bytes / 4))
-          in
-          corrupt rng (encode v)
-      | _ ->
-          (* Deliberately-truncated valid encoding: take a random
-             prefix of a valid value's encoding. *)
-          let v =
-            gen_value rng ~depth:0
-              ~max_depth:args.max_depth
-              ~max_payload:(min 2048 (args.max_input_bytes / 4))
-          in
-          let s = encode v in
+      | 1 -> encode (gen_valid ())
+      | 2 -> corrupt rng (encode (gen_valid ()))
+      | 3 ->
+          let s = encode (gen_valid ()) in
           if String.length s = 0 then s
           else
             String.sub s 0 (Random.State.int rng (String.length s))
+      | 4 ->
+          (* Structural mutation: walk tree, apply 1–3 mutations,
+             encode. Output is still RESP3 but structure is shuffled. *)
+          let v = ref (gen_valid ()) in
+          let m = 1 + Random.State.int rng 3 in
+          for _ = 1 to m do v := mutate_tree rng !v done;
+          encode !v
+      | _ ->
+          (* Length-field poisoning. Targets declared lengths
+             specifically — the single most sensitive part of the
+             parser. *)
+          poison_lengths rng (encode (gen_valid ()))
     in
     record stats input (run_once input)
   done;
 
   let elapsed = Unix.gettimeofday () -. t_start in
   print_report stats ~iterations:args.iterations ~elapsed;
+
+  (* If any unexpected exception happened, shrink the first one
+     and print the minimal reproducer so failures aren't just
+     "somewhere in 2 KiB". *)
+  (match stats.first_failing_full with
+   | Some (name, full) ->
+       Printf.printf
+         "\n-- shrinking first failing input (was %d bytes) --\n"
+         (String.length full);
+       let t_shrink = Unix.gettimeofday () in
+       let minimal = shrink full name in
+       Printf.printf
+         "  minimal: %d bytes (%.2fs)\n  escaped: %S\n"
+         (String.length minimal)
+         (Unix.gettimeofday () -. t_shrink)
+         minimal
+   | None -> ());
 
   if args.strict && stats.unexpected_total > 0 then begin
     Printf.eprintf
