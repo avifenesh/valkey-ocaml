@@ -2,7 +2,7 @@
 
 A modern Valkey client for OCaml 5 + [Eio](https://github.com/ocaml-multicore/eio).
 
-**Status: early development.** Foundations and core typed command surface are in; transactions, pub/sub, and cluster are still to come.
+**Status: early development.** Foundations, core typed command surface, and the cluster router are in; transactions and pub/sub are still to come.
 
 ## Why
 
@@ -27,17 +27,25 @@ No Lwt compat layer. No legacy Redis support.
 - Contracts: user command timeouts honored; commands never silently dropped
 
 **Typed commands (~71):**
-Strings, counters, TTL, hashes, hash field TTL (Valkey 9), sets, lists, sorted sets, scripting (including `Script.t` with automatic `EVALSHA` fallback on `NOSCRIPT`), iteration (`SCAN`, `KEYS`), streams (non-blocking + consumer groups), blocking commands (BLPOP / BRPOP / BLMOVE / XREAD BLOCK / WAIT).
+Strings, counters, TTL, hashes, hash field TTL (Valkey 9), sets, lists, sorted sets, scripting (including `Script.t` with automatic `EVALSHA` fallback on `NOSCRIPT`), iteration (`SCAN`, `KEYS`), streams (non-blocking + consumer groups + admin: XPENDING / XCLAIM / XAUTOCLAIM / XINFO), blocking commands (BLPOP / BRPOP / BLMOVE / XREAD BLOCK / WAIT).
 
-**Routing interface:**
-- Typed `Read_from` strategies (Primary, Prefer_replica, AZ-affinity variants)
-- Routing `Target` types
-- Standalone Client ships today; the same API will back the cluster router when it lands
+**Cluster router:**
+- CRC16-XMODEM slot hashing with hashtag support
+- `CLUSTER SHARDS` parser (Valkey 9 rich format: hostname, TLS port, availability zone, replication offset)
+- Quorum-based topology discovery from seed addresses (parallel, configurable agreement ratio)
+- Canonical-SHA change detection — diffs the pool on every refresh
+- MOVED / ASK redirect retry (bounded, `ASKING` sent before the retried command on `ASK`)
+- Periodic background refresh fiber (15 s base + jitter, wakes early when a redirect points at an unknown address)
+- Seed fallback when the live pool can no longer reach quorum
+- Typed `Read_from` strategies: `Primary`, `Prefer_replica`, AZ-affinity, AZ-affinity-with-primary
+- Routing `Target` types for `by_slot` / `by_node` / `random`
+- **Standalone = one-shard cluster** — single-node connections go through the same router behind a synthetic topology, so the dispatch path is unified
 
 **Not yet shipped:**
 - Transactions (MULTI / EXEC / WATCH / DISCARD)
 - Pub/sub (SUBSCRIBE / SSUBSCRIBE family)
-- Cluster router (slot map, MOVED / ASK retry, topology refresh)
+- Cluster fan-out targets (`All_nodes`, `All_primaries`)
+- CLUSTERDOWN / TRYAGAIN retry policy
 - Benchmarks, fuzzer
 
 See [ROADMAP](#roadmap) below.
@@ -90,6 +98,28 @@ in
 ...
 ```
 
+### Connecting to a cluster
+
+```ocaml
+let config =
+  Valkey.Cluster_router.Config.default
+    ~seeds:[ "node-a.example.com", 6379;
+             "node-b.example.com", 6379;
+             "node-c.example.com", 6379 ]
+in
+match Valkey.Cluster_router.create ~sw ~net ~clock ~config () with
+| Error m -> failwith m
+| Ok router ->
+    let client =
+      Valkey.Client.from_router
+        ~config:Valkey.Client.Config.default router
+    in
+    let _ = Valkey.Client.set client "user:42" "ada" in
+    ...
+```
+
+The router discovers topology from the seeds via quorum, opens a connection per node, handles `MOVED` / `ASK` redirects, and refreshes periodically in the background. If every pool node becomes unreachable it falls back to re-resolving from the seed list.
+
 ### With TLS against a managed service
 
 ```ocaml
@@ -125,7 +155,7 @@ dune runtest
 
 ## Architecture
 
-The Connection layer owns the socket and protocol state machine; the Client layer typed commands and routing.
+Three layers: `Connection` owns the socket + protocol state machine, `Cluster_router` owns the fleet (topology, pool, slot dispatch, redirect retry, refresh), `Client` is typed commands sitting on top of any router.
 
 ### Connection states
 
@@ -147,16 +177,21 @@ This client is **multiplexed**. Sending a blocking command (BLPOP, BRPOP, BLMOVE
 
 **Open a dedicated `Client.t` for blocking commands.** The typed blocking API does not auto-switch to an exclusive connection. This is deliberate; matches GLIDE and StackExchange.Redis conventions.
 
+### Standalone is cluster-of-one
+
+`Client.connect ~host ~port` builds a synthetic single-shard topology, puts the one connection in a `Node_pool`, and wraps it with the same `Cluster_router` used for real clusters. The only code path that differs is the absence of a refresh fiber — there is nothing to refresh against a single seed. Everything else (slot dispatch, MOVED handling, `Read_from`, typed commands) runs identically.
+
 ## Roadmap
 
 Next major pieces, roughly in order:
 
-1. **Transactions** — MULTI/EXEC/WATCH/DISCARD with connection pinning under multiplex
-2. **Pub/sub** — SUBSCRIBE lifecycle, sharded variants, push dispatch
-3. **Cluster router** — slot map, CRC16, MOVED/ASK retry, topology refresh, AZ-aware routing
-4. **Benchmarks** — 80/20 GET/SET across 100 B / 1 KiB / 16 KiB at 1 / 10 / 100 concurrency
-5. **Fuzzer** — RESP3 parser against arbitrary bytes
-6. **Advanced stream admin** — XPENDING, XAUTOCLAIM, XCLAIM, XINFO
+1. **Live cluster integration tests** — docker compose cluster, exercise MOVED / ASK / refresh / seed-fallback paths
+2. **CLUSTERDOWN / TRYAGAIN** retry policy with short back-off
+3. **Transactions** — MULTI / EXEC / WATCH / DISCARD with connection pinning under multiplex
+4. **Pub/sub** — SUBSCRIBE lifecycle, sharded variants, push dispatch
+5. **Fan-out routing** — `All_nodes` / `All_primaries` targets
+6. **Benchmarks** — 80/20 GET/SET across 100 B / 1 KiB / 16 KiB at 1 / 10 / 100 concurrency
+7. **Fuzzer** — RESP3 parser against arbitrary bytes
 
 ## License
 
