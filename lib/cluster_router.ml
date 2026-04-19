@@ -105,14 +105,21 @@ let err_terminal fmt =
    and retries after a redirect. *)
 let send_once ?timeout conn args = Connection.request ?timeout conn args
 
-let handle_redirect ~pool ~topology_ref ~max_redirects ~trigger_refresh
-    ?timeout first_result args =
+(* CLUSTERDOWN: slots are unassigned cluster-wide — operator action or
+   failover in progress. Short back-off and trigger refresh.
+   TRYAGAIN: the keys span a slot currently being migrated. Short
+   back-off and re-dispatch to the same target. *)
+let clusterdown_backoff = 0.1
+let tryagain_backoff = 0.05
+
+let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
+    ?timeout ~dispatch args =
   let rec loop attempt result =
     match result with
     | Ok _ -> result
-    | Error (Connection.Error.Server_error ve) when attempt < max_redirects ->
+    | Error (Connection.Error.Server_error ve)
+      when attempt < max_redirects ->
         (match Redirect.of_valkey_error ve with
-         | None -> result
          | Some { kind; host; port; _ } ->
              (match
                 Topology.find_node_by_address !topology_ref ~host ~port
@@ -136,16 +143,26 @@ let handle_redirect ~pool ~topology_ref ~max_redirects ~trigger_refresh
                              | Error _ -> ());
                         | Redirect.Moved -> ());
                        let next = send_once ?timeout conn args in
-                       loop (attempt + 1) next)))
+                       loop (attempt + 1) next))
+         | None ->
+             (match ve.code with
+              | "CLUSTERDOWN" ->
+                  Eio.Time.sleep clock clusterdown_backoff;
+                  trigger_refresh ();
+                  loop (attempt + 1) (dispatch ())
+              | "TRYAGAIN" ->
+                  Eio.Time.sleep clock tryagain_backoff;
+                  loop (attempt + 1) (dispatch ())
+              | _ -> result))
     | Error _ -> result
   in
-  loop 0 first_result
+  loop 0 (dispatch ())
 
-let make_exec ~pool ~topology_ref ~max_redirects ~trigger_refresh ?timeout
-    (target : Router.Target.t) (rf : Router.Read_from.t)
+let make_exec ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
+    ?timeout (target : Router.Target.t) (rf : Router.Read_from.t)
     (args : string array) =
-  let topology = !topology_ref in
-  let dispatch_initial () =
+  let dispatch () =
+    let topology = !topology_ref in
     match target with
     | Router.Target.By_slot slot ->
         (match Topology.shard_for_slot topology slot with
@@ -169,14 +186,14 @@ let make_exec ~pool ~topology_ref ~max_redirects ~trigger_refresh ?timeout
     | Router.Target.By_channel _ ->
         err_terminal "cluster router: sharded pub/sub not yet implemented"
   in
-  handle_redirect ~pool ~topology_ref ~max_redirects ~trigger_refresh
-    ?timeout (dispatch_initial ()) args
+  handle_retries ~pool ~topology_ref ~clock ~max_redirects
+    ~trigger_refresh ?timeout ~dispatch args
 
-let from_pool_and_topology ?(max_redirects = 5) ~pool ~topology () =
+let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
   let topology_ref = ref topology in
   let trigger_refresh () = () in
   let exec ?timeout target rf args =
-    make_exec ~pool ~topology_ref ~max_redirects ~trigger_refresh
+    make_exec ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
       ?timeout target rf args
   in
   let close () = Node_pool.close_all pool in
@@ -339,8 +356,9 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
         (* Thread the atomic's latest value through the existing ref-based
            dispatch. On refresh the ref is re-synced. *)
         topology_ref := Atomic.get topology_atomic;
-        make_exec ~pool ~topology_ref ~max_redirects:cfg.max_redirects
-          ~trigger_refresh ?timeout target rf args
+        make_exec ~pool ~topology_ref ~clock
+          ~max_redirects:cfg.max_redirects ~trigger_refresh
+          ?timeout target rf args
       in
       let close () =
         Atomic.set closing true;

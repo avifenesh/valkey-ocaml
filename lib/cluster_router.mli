@@ -31,6 +31,7 @@ val create :
 
 val from_pool_and_topology :
   ?max_redirects:int ->
+  clock:_ Eio.Time.clock ->
   pool:Node_pool.t ->
   topology:Topology.t ->
   unit ->

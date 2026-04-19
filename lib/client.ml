@@ -36,7 +36,9 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
   let topology = Topology.single_primary ~host ~port ?tls_port () in
   let pool = Node_pool.create () in
   Node_pool.add pool Topology.standalone_node_id connection;
-  let router = Cluster_router.from_pool_and_topology ~pool ~topology () in
+  let router =
+    Cluster_router.from_pool_and_topology ~clock ~pool ~topology ()
+  in
   { router; config;
     loaded_shas = Hashtbl.create 16;
     loaded_shas_mutex = Eio.Mutex.create () }
