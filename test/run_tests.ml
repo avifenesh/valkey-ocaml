@@ -11,6 +11,7 @@ let () =
       "connection (needs docker valkey :6379)", Test_connection.tests;
       "client (needs docker valkey :6379)", Test_client.tests;
       "transaction (needs docker valkey :6379)", Test_transaction.tests;
+      "pubsub (needs docker valkey :6379)", Test_pubsub.tests;
       "cluster (needs docker compose -f docker-compose.cluster.yml)",
         Test_cluster.tests;
     ]

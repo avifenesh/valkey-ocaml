@@ -785,6 +785,26 @@ val wait_replicas_sum :
     Rarely what you want — replicas of different primaries are not
     interchangeable. Provided for completeness. *)
 
+(** {1 Pub/sub (publish side)} *)
+
+val publish :
+  ?timeout:float ->
+  t -> channel:string -> message:string ->
+  (int, Connection.Error.t) result
+(** [PUBLISH channel message]. Returns the number of subscribers the
+    message was delivered to. Any node accepts PUBLISH; in cluster
+    mode the message is propagated across shards by the server. *)
+
+val spublish :
+  ?timeout:float ->
+  t -> channel:string -> message:string ->
+  (int, Connection.Error.t) result
+(** Sharded [SPUBLISH channel message]. Routed to the primary that
+    owns [slot(channel)]; the message is only delivered to
+    [SSUBSCRIBE]rs on that slot's primary and replicas — no
+    cluster-wide propagation. Subscribers must connect to the same
+    primary (see {!Pubsub} and {!Cluster_pubsub}). *)
+
 val xread_block :
   ?timeout:float ->
   ?read_from:Read_from.t ->

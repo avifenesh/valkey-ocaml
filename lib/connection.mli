@@ -83,6 +83,7 @@ val connect :
   clock:_ Eio.Time.clock ->
   ?domain_mgr:_ Eio.Domain_manager.t ->
   ?config:Config.t ->
+  ?on_connected:(unit -> unit) ->
   host:string ->
   port:int ->
   unit ->
@@ -91,13 +92,31 @@ val connect :
     fibers run on a dedicated OS thread (Domain). Parser CPU cost no longer
     competes with user-fiber scheduling on the main domain.
 
-    If omitted, they run on the caller's domain (current behaviour). *)
+    [on_connected] is invoked after every successful handshake —
+    both the initial connect and every reconnect after a recovery
+    loop. Used by [Pubsub] to replay the subscription set. Runs
+    synchronously on the state-machine thread; keep it cheap
+    (bounded number of [send_fire_and_forget] calls). *)
 
 val request :
   ?timeout:float ->
   t ->
   string array ->
   (Resp3.t, Error.t) result
+
+val send_fire_and_forget :
+  t ->
+  string array ->
+  (unit, Error.t) result
+(** Write a command to the socket without waiting for a reply. For
+    commands that have no synchronous reply — notably [SUBSCRIBE] /
+    [UNSUBSCRIBE] / [PSUBSCRIBE] / [SSUBSCRIBE] and friends — whose
+    acknowledgements arrive as Push frames on {!pushes}.
+
+    Do NOT mix [send_fire_and_forget] with [request] on the same
+    connection: a subsequent non-push reply would match no pending
+    request and corrupt the matching queue. Use a dedicated
+    connection (via [Pubsub]) for subscribe-mode traffic. *)
 
 val pushes : t -> Resp3.t Eio.Stream.t
 

@@ -1474,6 +1474,25 @@ let wait_replicas_sum ?timeout t ~num_replicas ~block_ms =
   | Error e -> Error e
   | Ok xs -> Ok (List.fold_left (fun acc (_, n) -> acc + n) 0 xs)
 
+(* ---------- pub/sub produce side ---------- *)
+
+let publish ?timeout t ~channel ~message =
+  match exec ?timeout t [| "PUBLISH"; channel; message |] with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "PUBLISH" v)
+
+let spublish ?timeout t ~channel ~message =
+  (* SPUBLISH is sharded: route by slot of [channel] so the primary
+     that owns the channel's slot publishes it. Override the default
+     (Command_spec marks SPUBLISH as rand_w for lack of a better
+     By_channel dispatcher) with an explicit By_slot target. *)
+  let target = Target.By_slot (Slot.of_key channel) in
+  match exec ?timeout ~target t [| "SPUBLISH"; channel; message |] with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "SPUBLISH" v)
+
 let xread_block ?timeout ?read_from ?count t ~block_ms ~streams =
   let count_a = match count with
     | None -> []

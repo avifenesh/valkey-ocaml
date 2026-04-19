@@ -270,8 +270,12 @@ type entry = {
 }
 
 type queued = {
-  entry : entry;
-  wire : Cstruct.t;   (* serialised command, ready for the socket *)
+  entry : entry option;
+  (* [None] = fire-and-forget (no reply expected). Used by
+     [send_fire_and_forget] for subscribe-mode commands; the
+     entry is skipped at both out_pump push-to-sent time and
+     drain time. *)
+  wire : Cstruct.t;
 }
 
 type state =
@@ -297,6 +301,8 @@ type t = {
   now : unit -> float;
   with_timeout : 'a. float -> (unit -> 'a) -> ('a, [ `Timeout ]) result;
   dispatch_io : 'a. (unit -> 'a) -> 'a;     (* runs on IO domain if configured *)
+  on_connected : unit -> unit;              (* hook fired after every
+                                               successful handshake *)
   mutable server_info : Resp3.t option;
   mutable availability_zone : string option;
   closing : bool Atomic.t;
@@ -460,11 +466,18 @@ let drain_unsent t (result : (Resp3.t, Error.t) result) =
   | None -> ()
   | Some q ->
       t.unsent <- None;
-      resolve_entry t q.entry result
+      (match q.entry with
+       | Some e -> resolve_entry t e result
+       | None -> ())
 
 let drain_cmd_queue t (result : (Resp3.t, Error.t) result) =
   let leftovers = Chan.drain t.cmd_queue in
-  Queue.iter (fun q -> resolve_entry t q.entry result) leftovers
+  Queue.iter
+    (fun q ->
+      match q.entry with
+      | Some e -> resolve_entry t e result
+      | None -> ())
+    leftovers
 
 let jittered_backoff (policy : Reconnect.t) attempts =
   let base =
@@ -495,8 +508,11 @@ let out_pump (t : t) (sock : socket) : unit =
           t.unsent <- Some q
           (* leave loop; raise disconnect by returning *)
       | Ok () ->
-          Eio.Mutex.use_rw ~protect:true t.sent_mutex (fun () ->
-              Queue.push q.entry t.sent);
+          (match q.entry with
+           | Some e ->
+               Eio.Mutex.use_rw ~protect:true t.sent_mutex (fun () ->
+                   Queue.push e t.sent)
+           | None -> ());
           loop ()
     end
   in
@@ -631,7 +647,11 @@ let recovery_loop (t : t) : unit =
               t.current <- Some sock;
               t.server_info <- Some info;
               t.availability_zone <- az;
-              set_state t Alive)
+              set_state t Alive);
+          (* Fire the reconnect hook outside the state mutex — the
+             hook typically calls [send_fire_and_forget], which takes
+             its own locks and must not deadlock here. *)
+          (try t.on_connected () with _ -> ())
   in
   attempt 0
 
@@ -672,7 +692,7 @@ let request ?timeout t args =
           Byte_sem.acquire t.budget size;
           let promise, resolver = Eio.Promise.create () in
           let entry = { resolver; size; abandoned = false } in
-          match try_enqueue t { entry; wire } with
+          match try_enqueue t { entry = Some entry; wire } with
           | `Dead e ->
               Byte_sem.release t.budget size;
               Error e
@@ -694,6 +714,33 @@ let request ?timeout t args =
          | None -> ()
          | Some cb -> Circuit_breaker.on_result cb ~was_probe (t.now ()) result);
         result
+
+let send_fire_and_forget t args =
+  (* Same front-end checks as [request] — circuit breaker, byte
+     budget, Closed state — but we enqueue with entry = None so the
+     writer does not push onto [t.sent] and no promise is created. *)
+  let wire = Resp3_writer.command_to_cstruct args in
+  let size = Cstruct.length wire in
+  if size > t.config.max_queued_bytes then Error Error.Queue_full
+  else
+    let cb_decision =
+      match t.cb with
+      | None -> `Allow
+      | Some cb -> Circuit_breaker.on_entry cb (t.now ())
+    in
+    match cb_decision with
+    | `Reject -> Error Error.Circuit_open
+    | `Allow | `Allow_probe ->
+        Byte_sem.acquire t.budget size;
+        match try_enqueue t { entry = None; wire } with
+        | `Dead e ->
+            Byte_sem.release t.budget size;
+            Error e
+        | `In_queue ->
+            (* Release the budget eagerly — we're not waiting for a
+               reply that would free it via resolve_entry. *)
+            Byte_sem.release t.budget size;
+            Ok ()
 
 let keepalive_loop t interval =
   let rec loop () =
@@ -737,7 +784,8 @@ let rec supervisor_run t =
           supervisor_run t)
     | _ -> ()
 
-let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port () =
+let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default)
+    ?(on_connected = fun () -> ()) ~host ~port () =
   let connect_once = make_tcp_connector ~sw ~net ~host ~port ~tls:config.tls in
   let sleep d = Eio.Time.sleep clock d in
   let now () = Eio.Time.now clock in
@@ -770,6 +818,7 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
     now;
     with_timeout;
     dispatch_io;
+    on_connected;
     server_info = None;
     availability_zone = None;
     closing = Atomic.make false;
@@ -790,7 +839,11 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
        t.current <- Some sock;
        t.server_info <- Some info;
        t.availability_zone <- az;
-       t.state <- Alive);
+       t.state <- Alive;
+       (* Same hook as recovery: fires after the initial handshake
+          too, so callers can register their "send on every
+          connection" logic once. *)
+       (try t.on_connected () with _ -> ()));
   (* Supervisor + keepalive run on the user's domain. run_connection uses
      t.dispatch_io internally so that in_pump + out_pump go to the IO domain
      (if domain_mgr was supplied), while parse_worker stays here. This is

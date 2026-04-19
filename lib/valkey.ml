@@ -15,3 +15,4 @@ module Connection = Connection
 module Client = Client
 module Cluster_router = Cluster_router
 module Transaction = Transaction
+module Pubsub = Pubsub
