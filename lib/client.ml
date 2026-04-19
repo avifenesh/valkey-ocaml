@@ -1707,3 +1707,111 @@ let bitfield_ro ?timeout ?read_from t key ~gets =
       in
       loop [] items
   | Ok v -> Error (protocol_violation "BITFIELD_RO" v)
+
+(* ---------- HyperLogLog ---------- *)
+
+let pfadd ?timeout t key ~elements =
+  let args = Array.of_list ("PFADD" :: key :: elements) in
+  bool_from_integer "PFADD" (exec ?timeout t args)
+
+let pfcount ?timeout ?read_from t keys =
+  let args = Array.of_list ("PFCOUNT" :: keys) in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "PFCOUNT" v)
+
+let pfmerge ?timeout t ~destination ~sources =
+  let args =
+    Array.of_list ("PFMERGE" :: destination :: sources)
+  in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Simple_string "OK") -> Ok ()
+  | Ok v -> Error (protocol_violation "PFMERGE" v)
+
+(* ---------- generic keyspace ---------- *)
+
+let copy ?timeout ?db ?(replace = false) t ~source ~destination =
+  let db_args = match db with
+    | None -> []
+    | Some n -> [ "DB"; string_of_int n ]
+  in
+  let replace_args = if replace then [ "REPLACE" ] else [] in
+  let args =
+    Array.of_list
+      ("COPY" :: source :: destination :: db_args @ replace_args)
+  in
+  bool_from_integer "COPY" (exec ?timeout t args)
+
+let dump ?timeout ?read_from t key =
+  match exec ?timeout ?read_from t [| "DUMP"; key |] with
+  | Error e -> Error e
+  | Ok Resp3.Null -> Ok None
+  | Ok (Resp3.Bulk_string s) -> Ok (Some s)
+  | Ok v -> Error (protocol_violation "DUMP" v)
+
+let restore
+    ?timeout ?(replace = false) ?(abs_ttl = false)
+    ?idle_time_seconds ?freq t key ~ttl_ms ~serialized =
+  let replace_args = if replace then [ "REPLACE" ] else [] in
+  let absttl_args = if abs_ttl then [ "ABSTTL" ] else [] in
+  let idle_args = match idle_time_seconds with
+    | None -> []
+    | Some n -> [ "IDLETIME"; string_of_int n ]
+  in
+  let freq_args = match freq with
+    | None -> []
+    | Some n -> [ "FREQ"; string_of_int n ]
+  in
+  let args =
+    Array.of_list
+      ([ "RESTORE"; key; string_of_int ttl_ms; serialized ]
+       @ replace_args @ absttl_args @ idle_args @ freq_args)
+  in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Simple_string "OK") -> Ok ()
+  | Ok v -> Error (protocol_violation "RESTORE" v)
+
+let touch ?timeout t keys =
+  let args = Array.of_list ("TOUCH" :: keys) in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "TOUCH" v)
+
+let randomkey ?timeout ?read_from t =
+  match exec ?timeout ?read_from t [| "RANDOMKEY" |] with
+  | Error e -> Error e
+  | Ok Resp3.Null -> Ok None
+  | Ok (Resp3.Bulk_string s) -> Ok (Some s)
+  | Ok v -> Error (protocol_violation "RANDOMKEY" v)
+
+(* OBJECT sub-commands: identical decode shape — Null for missing
+   key, Integer for *count/time/freq*, Bulk_string for *encoding*. *)
+let object_encoding ?timeout ?read_from t key =
+  match exec ?timeout ?read_from t [| "OBJECT"; "ENCODING"; key |] with
+  | Error e -> Error e
+  | Ok Resp3.Null -> Ok None
+  | Ok (Resp3.Bulk_string s) | Ok (Resp3.Simple_string s) ->
+      Ok (Some s)
+  | Ok v -> Error (protocol_violation "OBJECT ENCODING" v)
+
+let object_int_subcommand cmd sub ?timeout ?read_from t key =
+  match exec ?timeout ?read_from t [| cmd; sub; key |] with
+  | Error e -> Error e
+  | Ok Resp3.Null -> Ok None
+  | Ok (Resp3.Integer n) -> Ok (Some (Int64.to_int n))
+  | Ok v ->
+      Error
+        (protocol_violation (Printf.sprintf "%s %s" cmd sub) v)
+
+let object_refcount ?timeout ?read_from t key =
+  object_int_subcommand "OBJECT" "REFCOUNT" ?timeout ?read_from t key
+
+let object_idletime ?timeout ?read_from t key =
+  object_int_subcommand "OBJECT" "IDLETIME" ?timeout ?read_from t key
+
+let object_freq ?timeout ?read_from t key =
+  object_int_subcommand "OBJECT" "FREQ" ?timeout ?read_from t key

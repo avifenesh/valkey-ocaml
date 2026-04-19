@@ -938,3 +938,119 @@ val bitfield_ro :
   (int64 list, Connection.Error.t) result
 (** [BITFIELD_RO key GET ...]. Read-only subset of [BITFIELD];
     only [GET] operations are accepted. *)
+
+(** {1 HyperLogLog} *)
+
+val pfadd :
+  ?timeout:float ->
+  t -> string -> elements:string list ->
+  (bool, Connection.Error.t) result
+(** [PFADD key [element ...]]. Returns [true] when at least one
+    internal register was altered, [false] otherwise. An empty
+    [elements] list is valid — it just materialises the key as an
+    empty HLL if it did not already exist. *)
+
+val pfcount :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string list ->
+  (int, Connection.Error.t) result
+(** [PFCOUNT key [key ...]]. Approximate cardinality for a single
+    HLL, or the approximate cardinality of the union when multiple
+    keys are given. Multi-key form in cluster mode requires all
+    keys hash to the same slot. *)
+
+val pfmerge :
+  ?timeout:float ->
+  t -> destination:string -> sources:string list ->
+  (unit, Connection.Error.t) result
+(** [PFMERGE destkey sourcekey ...]. Empty [sources] is a valid
+    no-op that materialises [destination] as an empty HLL. *)
+
+(** {1 Generic keyspace} *)
+
+val copy :
+  ?timeout:float ->
+  ?db:int ->
+  ?replace:bool ->
+  t -> source:string -> destination:string ->
+  (bool, Connection.Error.t) result
+(** [COPY source destination [DB db] [REPLACE]]. Returns [true]
+    when the copy happened, [false] when [destination] already
+    existed without [replace:true] or [source] was missing.
+    Available since Valkey 6.2. In cluster mode, [source] and
+    [destination] must hash to the same slot. *)
+
+val dump :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string ->
+  (string option, Connection.Error.t) result
+(** [DUMP key]. Returns the RDB-encoded serialized value (valid
+    input for {!restore}) or [None] if [key] does not exist. The
+    serialized bytes include an RDB version and a 64-bit checksum;
+    TTL is NOT included — use [PTTL] separately. *)
+
+val restore :
+  ?timeout:float ->
+  ?replace:bool ->
+  ?abs_ttl:bool ->
+  ?idle_time_seconds:int ->
+  ?freq:int ->
+  t -> string ->
+  ttl_ms:int ->
+  serialized:string ->
+  (unit, Connection.Error.t) result
+(** [RESTORE key ttl serialized [REPLACE] [ABSTTL]
+    [IDLETIME seconds] [FREQ frequency]]. [ttl_ms = 0] means no
+    expiration. With [abs_ttl:true] the TTL is interpreted as an
+    absolute Unix-milliseconds timestamp. Returns a
+    [Server_error { code = "BUSYKEY" ; _ }] if the key already
+    exists and [replace:true] was not passed. *)
+
+val touch :
+  ?timeout:float ->
+  t -> string list ->
+  (int, Connection.Error.t) result
+(** [TOUCH key ...]. Updates last-access time. Returns the number
+    of keys that existed. Missing keys are silently ignored. *)
+
+val randomkey :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> (string option, Connection.Error.t) result
+(** [RANDOMKEY]. Returns a random existing key, or [None] when the
+    keyspace is empty. In cluster mode, hits a random primary and
+    samples from that node's slots — not a uniform cluster-wide
+    sample. *)
+
+(** {2 OBJECT sub-commands}
+
+    All four return [None] when the key does not exist. [idletime]
+    requires the server's [maxmemory-policy] to {i not} be an LFU
+    variant; [freq] requires it {i to be} an LFU variant. Using
+    the wrong one surfaces as a [Server_error]. *)
+
+val object_encoding :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string ->
+  (string option, Connection.Error.t) result
+
+val object_refcount :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string ->
+  (int option, Connection.Error.t) result
+
+val object_idletime :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string ->
+  (int option, Connection.Error.t) result
+
+val object_freq :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string ->
+  (int option, Connection.Error.t) result

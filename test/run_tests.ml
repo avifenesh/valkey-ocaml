@@ -14,6 +14,8 @@ let () =
       "pubsub (needs docker valkey :6379)", Test_pubsub.tests;
       "named_commands (needs docker valkey :6379)", Test_named_commands.tests;
       "bitmap (needs docker valkey :6379)", Test_bitmap.tests;
+      "hll + generic (needs docker valkey :6379)",
+        Test_generic_hll.tests;
       "cluster (needs docker compose -f docker-compose.cluster.yml)",
         Test_cluster.tests;
     ]
