@@ -6,4 +6,5 @@
   cstruct
   tls tls-eio x509 ca-certs domain-name
   mirage-crypto-rng.unix
-  digestif.c))
+  digestif.c)
+ (instrumentation (backend bisect_ppx)))

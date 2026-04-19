@@ -1,0 +1,125 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Only the most recent run per ref is interesting; cancel older ones
+# so the GH Pages deploy doesn't lag behind.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+
+    # Coverage report shape: lib/ is what matters. bin/ and test/
+    # drive coverage but aren't part of the public surface we want
+    # to gate on.
+    env:
+      COVERAGE_FLOOR: "60"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.3.0"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libssl-dev libgmp-dev curl
+
+      - name: Install opam deps (+ bisect_ppx)
+        run: |
+          opam install . --deps-only --with-test --with-dev-setup --yes
+          opam install bisect_ppx --yes
+
+      - name: Generate TLS dev certs
+        run: bash scripts/gen-tls-certs.sh
+
+      - name: Start standalone Valkey
+        run: |
+          docker compose up -d
+          for i in $(seq 1 30); do
+            if docker compose exec -T valkey-dev valkey-cli -p 6379 PING 2>/dev/null | grep -q PONG; then
+              echo "standalone up"; break
+            fi
+            sleep 1
+          done
+
+      - name: Start cluster
+        run: |
+          sudo bash scripts/cluster-hosts-setup.sh
+          docker compose -f docker-compose.cluster.yml up -d
+          for i in $(seq 1 60); do
+            status=$(docker inspect -f '{{.State.Status}}' ocaml-valkey-cluster-init 2>/dev/null || echo missing)
+            if [ "$status" = "exited" ]; then
+              code=$(docker inspect -f '{{.State.ExitCode}}' ocaml-valkey-cluster-init)
+              if [ "$code" = "0" ]; then echo "cluster up"; break; fi
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Build + test with coverage instrumentation
+        run: |
+          # Wipe any stale bisect files from previous runs.
+          find . -name '*.coverage' -delete || true
+          opam exec -- dune runtest --instrument-with bisect_ppx --force
+
+      - name: Generate HTML coverage report
+        run: |
+          opam exec -- bisect-ppx-report html \
+            --coverage-path . \
+            --source-path lib \
+            -o coverage-html
+
+      - name: Compute coverage percentage
+        id: cov
+        run: |
+          pct_line=$(opam exec -- bisect-ppx-report summary --coverage-path .)
+          echo "$pct_line"
+          # Line looks like: "Coverage: 2286/3635 (62.89%)"
+          pct=$(echo "$pct_line" | sed -E 's/.*\(([0-9.]+)%\).*/\1/')
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+          echo "Measured coverage: $pct%"
+
+      - name: Enforce coverage floor
+        run: |
+          pct="${{ steps.cov.outputs.pct }}"
+          floor="${{ env.COVERAGE_FLOOR }}"
+          awk -v p="$pct" -v f="$floor" 'BEGIN { exit (p + 0 < f + 0) ? 1 : 0 }' || {
+            echo "::error::coverage $pct% below floor $floor%"
+            exit 1
+          }
+          echo "coverage $pct% >= floor $floor% — ok"
+
+      - name: Upload HTML report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage-html
+          retention-days: 14
+
+      # Only deploy the report to GH Pages from pushes to main. PRs
+      # just compute the number and print it in the job summary.
+      - name: Deploy to GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./coverage-html
+          publish_branch: gh-pages
+          destination_dir: coverage
+
+      - name: Stop containers
+        if: always()
+        run: |
+          docker compose -f docker-compose.cluster.yml down -v || true
+          docker compose down -v || true

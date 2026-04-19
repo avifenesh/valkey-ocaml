@@ -33,4 +33,5 @@
   domain-name
   mirage-crypto-rng
   digestif
-  (alcotest :with-test)))
+  (alcotest :with-test)
+  (bisect_ppx (and :with-dev-setup (>= 2.8.0)))))
