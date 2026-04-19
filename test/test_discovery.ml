@@ -35,7 +35,7 @@ let test_all_agree_wins () =
     D.select ~agreement_ratio:0.2 ~min_nodes_for_quorum:3
       ~queried:3 ~views:[ Some a; Some a; Some a ]
   with
-  | Agreed t -> Alcotest.(check string) "sha" (T.sha a) (T.sha t)
+  | D.Agreed t -> Alcotest.(check string) "sha" (T.sha a) (T.sha t)
   | _ -> Alcotest.fail "expected Agreed"
 
 let test_majority_wins () =
@@ -43,7 +43,7 @@ let test_majority_wins () =
     D.select ~agreement_ratio:0.2 ~min_nodes_for_quorum:3
       ~queried:3 ~views:[ Some a; Some a; Some b ]
   with
-  | Agreed t -> Alcotest.(check string) "winner" (T.sha a) (T.sha t)
+  | D.Agreed t -> Alcotest.(check string) "winner" (T.sha a) (T.sha t)
   | _ -> Alcotest.fail "expected Agreed"
 
 let test_tie_rejected () =
@@ -51,7 +51,7 @@ let test_tie_rejected () =
     D.select ~agreement_ratio:0.2 ~min_nodes_for_quorum:3
       ~queried:4 ~views:[ Some a; Some a; Some b; Some b ]
   with
-  | No_agreement -> ()
+  | D.No_agreement -> ()
   | _ -> Alcotest.fail "expected No_agreement on tie"
 
 let test_below_ratio_fallback () =
@@ -64,7 +64,7 @@ let test_below_ratio_fallback () =
     D.select ~agreement_ratio:0.2 ~min_nodes_for_quorum:3
       ~queried:10 ~views
   with
-  | Agreed_fallback t -> Alcotest.(check string) "fb" (T.sha a) (T.sha t)
+  | D.Agreed_fallback t -> Alcotest.(check string) "fb" (T.sha a) (T.sha t)
   | _ -> Alcotest.fail "expected Agreed_fallback"
 
 let test_all_failed_is_no_agreement () =
@@ -72,7 +72,7 @@ let test_all_failed_is_no_agreement () =
     D.select ~agreement_ratio:0.2 ~min_nodes_for_quorum:3
       ~queried:3 ~views:[ None; None; None ]
   with
-  | No_agreement -> ()
+  | D.No_agreement -> ()
   | _ -> Alcotest.fail "expected No_agreement"
 
 let test_small_cluster_skips_quorum () =
@@ -81,7 +81,7 @@ let test_small_cluster_skips_quorum () =
     D.select ~agreement_ratio:0.2 ~min_nodes_for_quorum:3
       ~queried:2 ~views:[ Some a; Some b ]
   with
-  | Agreed _ -> ()
+  | D.Agreed _ -> ()
   | _ -> Alcotest.fail "expected Agreed when below min"
 
 let test_three_way_split_winner () =
@@ -93,7 +93,7 @@ let test_three_way_split_winner () =
           Some b; Some b;
           Some c; Some c ]
   with
-  | Agreed t -> Alcotest.(check string) "a wins" (T.sha a) (T.sha t)
+  | D.Agreed t -> Alcotest.(check string) "a wins" (T.sha a) (T.sha t)
   | _ -> Alcotest.fail "expected Agreed"
 
 let tests =
