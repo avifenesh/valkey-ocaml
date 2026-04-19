@@ -36,20 +36,19 @@ end
    implementation without changing the Client surface. *)
 module Router = struct
   type t = {
-    exec : 'a. ?timeout:float -> Target.t -> Read_from.t -> string array ->
-           (Resp3.t, Connection.Error.t) result;
+    exec :
+      ?timeout:float -> Target.t -> Read_from.t -> string array ->
+      (Resp3.t, Connection.Error.t) result;
     close : unit -> unit;
     primary : unit -> Connection.t option;
   }
   [@@warning "-69"]
 
+  let make ~exec ~close ~primary = { exec; close; primary }
+
   let standalone (conn : Connection.t) : t =
-    let exec : 'a. ?timeout:float -> Target.t -> Read_from.t ->
-               string array -> (Resp3.t, Connection.Error.t) result =
-      fun ?timeout _target _read_from args ->
-        Connection.request ?timeout conn args
-    in
-    { exec;
+    { exec = (fun ?timeout _target _read_from args ->
+        Connection.request ?timeout conn args);
       close = (fun () -> Connection.close conn);
       primary = (fun () -> Some conn);
     }
@@ -73,6 +72,11 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
       ~config:config.connection ~host ~port ()
   in
   let router = Router.standalone connection in
+  { router; config;
+    loaded_shas = Hashtbl.create 16;
+    loaded_shas_mutex = Eio.Mutex.create () }
+
+let from_router ~config router =
   { router; config;
     loaded_shas = Hashtbl.create 16;
     loaded_shas_mutex = Eio.Mutex.create () }

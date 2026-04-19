@@ -22,6 +22,27 @@ module Target : sig
     | By_channel of string
 end
 
+module Router : sig
+  type t
+
+  val make :
+    exec:(?timeout:float -> Target.t -> Read_from.t -> string array ->
+          (Resp3.t, Connection.Error.t) result) ->
+    close:(unit -> unit) ->
+    primary:(unit -> Connection.t option) ->
+    t
+
+  val standalone : Connection.t -> t
+
+  val exec :
+    ?timeout:float -> t -> Target.t -> Read_from.t -> string array ->
+    (Resp3.t, Connection.Error.t) result
+
+  val close : t -> unit
+
+  val primary_connection : t -> Connection.t option
+end
+
 module Config : sig
   type t = {
     connection : Connection.Config.t;
@@ -43,6 +64,10 @@ val connect :
   port:int ->
   unit ->
   t
+
+val from_router : config:Config.t -> Router.t -> t
+(** Wrap an arbitrary [Router.t] (e.g. a cluster router) as a [Client.t].
+    Used by [Cluster_router] and other custom routers. *)
 
 val close : t -> unit
 

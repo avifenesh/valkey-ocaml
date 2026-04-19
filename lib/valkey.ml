@@ -10,3 +10,4 @@ module Node_pool = Node_pool
 module Discovery = Discovery
 module Connection = Connection
 module Client = Client
+module Cluster_router = Cluster_router
