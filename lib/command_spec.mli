@@ -58,3 +58,8 @@ val target_and_rf :
 val command_count : unit -> int
 (** Number of commands + sub-commands in the routing table. Useful
     for debug / sanity logs. *)
+
+val one_word_commands : unit -> string list
+(** All single-word (no sub-command) entries in the routing
+    table. Used by spec-validation tests that walk the table and
+    cross-check against the live server's [COMMAND INFO]. *)

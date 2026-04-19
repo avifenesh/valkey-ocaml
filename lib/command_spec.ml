@@ -505,3 +505,7 @@ let target_and_rf rf args =
 (* Table size exposed for visibility/debug. *)
 let command_count () =
   Hashtbl.length one_word_tbl + Hashtbl.length two_word_tbl
+
+let one_word_commands () =
+  Hashtbl.fold (fun name _ acc -> name :: acc) one_word_tbl []
+  |> List.sort compare

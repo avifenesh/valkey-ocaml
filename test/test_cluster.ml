@@ -318,6 +318,111 @@ let test_cluster_keyslot_matches_client () =
         [ "foo"; "bar"; "{user}:1"; "{user}:2";
           "long-key-with-lots-of-bytes-for-crc16" ]
 
+(* Commands whose first-key position is dynamic on the wire (the
+   server reports firstkey=0 as a sentinel because the real
+   position depends on a numeric argument like [numkeys] or a
+   sub-command keyword). Our [Command_spec] pins them to the
+   conventional position — good enough for routing the usual
+   call shape — but they can't be cross-checked via COMMAND
+   INFO's simple firstkey field. *)
+let dynamic_firstkey_commands =
+  [ "EVAL"; "EVALSHA"; "EVAL_RO"; "EVALSHA_RO";
+    "FCALL"; "FCALL_RO";
+    "XGROUP" ]
+
+(* Spec validation: for every single-word entry in Command_spec
+   that we classify as Single_key or Multi_key, call COMMAND INFO
+   on the live server and compare the server-reported first-key
+   position against our stored key index. Catches drift when
+   Valkey changes its metadata (or when we get one wrong).
+
+   Commands that Valkey does not know about on this version
+   (rare, long-tail) are skipped with a note — they show up as
+   empty arrays from COMMAND INFO. Commands with dynamic key
+   positions (EVAL / FCALL / XGROUP etc) are also skipped. *)
+let test_command_spec_matches_server_metadata () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match CR.create ~sw ~net ~clock ~config () with
+  | Error m -> Alcotest.failf "cluster router: %s" m
+  | Ok router ->
+      let client =
+        C.from_router ~config:C.Config.default router
+      in
+      Fun.protect ~finally:(fun () -> C.close client) @@ fun () ->
+      let names = Valkey.Command_spec.one_word_commands () in
+      let first_key_from_reply = function
+        | Valkey.Resp3.Array (_ :: _ :: _ :: firstkey :: _) ->
+            (match firstkey with
+             | Valkey.Resp3.Integer n -> Some (Int64.to_int n)
+             | _ -> None)
+        | _ -> None
+      in
+      let mismatches = ref [] in
+      let unknown = ref [] in
+      let dynamic = ref 0 in
+      List.iter
+        (fun name ->
+          let spec = Valkey.Command_spec.lookup [| name |] in
+          let expected_first =
+            match spec with
+            | Valkey.Command_spec.Single_key { key_index; _ } ->
+                Some key_index
+            | Valkey.Command_spec.Multi_key { first_key_index; _ } ->
+                Some first_key_index
+            | _ -> None
+          in
+          match expected_first with
+          | None -> ()
+          | Some _
+            when List.mem name dynamic_firstkey_commands ->
+              incr dynamic
+          | Some exp ->
+              (match
+                 C.custom client [| "COMMAND"; "INFO"; name |]
+               with
+               | Error _ -> unknown := name :: !unknown
+               | Ok (Valkey.Resp3.Array [ info ]) ->
+                   (match first_key_from_reply info with
+                    | Some srv when srv = exp -> ()
+                    | Some 0 ->
+                        (* Server says variable-position and we
+                           did not list this command as dynamic.
+                           Flag - either add it to the list or
+                           the spec is wrong. *)
+                        mismatches :=
+                          (name, exp, 0) :: !mismatches
+                    | Some srv ->
+                        mismatches :=
+                          (name, exp, srv) :: !mismatches
+                    | None ->
+                        unknown := name :: !unknown)
+               | Ok (Valkey.Resp3.Array []) ->
+                   unknown := name :: !unknown
+               | Ok _ -> unknown := name :: !unknown))
+        names;
+      if !mismatches <> [] then begin
+        let pp_one (n, e, s) =
+          Printf.sprintf "  %-16s spec=%d server=%d" n e s
+        in
+        Alcotest.failf
+          "Command_spec drift:\n%s\n(unknown to this server: %d)"
+          (String.concat "\n" (List.map pp_one !mismatches))
+          (List.length !unknown)
+      end;
+      (* unknown list is informational; don't fail on it. *)
+      Printf.printf
+        "[spec-check] %d commands validated, %d dynamic-firstkey \
+         (skipped), %d unknown to server\n%!"
+        (List.length names - List.length !unknown - !dynamic)
+        !dynamic
+        (List.length !unknown)
+
 let test_cluster_info_contains_state () =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -460,4 +565,6 @@ let tests =
       test_cluster_keyslot_matches_client;
     tc "CLUSTER INFO contains cluster_state"
       test_cluster_info_contains_state;
+    tc "Command_spec key indices match server COMMAND INFO"
+      test_command_spec_matches_server_metadata;
   ]
