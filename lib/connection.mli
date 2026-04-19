@@ -9,6 +9,7 @@ module Error : sig
     | Timeout
     | Interrupted
     | Queue_full
+    | Circuit_open
     | Closed
     | Server_error of Valkey_error.t
     | Terminal of string
@@ -16,6 +17,18 @@ module Error : sig
   val equal : t -> t -> bool
   val pp : Format.formatter -> t -> unit
   val is_terminal : t -> bool
+end
+
+module Circuit_breaker : sig
+  module Config : sig
+    type t = {
+      window_size : float;
+      error_threshold : int;
+      open_timeout : float;
+    }
+    val default : t
+    (** Default: 10000 errors in 60s trips; 10s before half-open probe. *)
+  end
 end
 
 module Handshake : sig
@@ -49,6 +62,7 @@ module Config : sig
     push_buffer_size : int;
     max_queued_bytes : int;
     tls : Tls_config.t option;
+    circuit_breaker : Circuit_breaker.Config.t option;
   }
   val default : t
 end

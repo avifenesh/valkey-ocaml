@@ -176,6 +176,51 @@ let test_tls_ca_verify () =
   expect_simple_eq ~ctx:"PING over TLS (CA-verified)" ~expected:"PONG"
     (C.request conn [| "PING" |])
 
+let test_circuit_breaker () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let cb_cfg : Valkey.Connection.Circuit_breaker.Config.t =
+    { window_size = 5.0; error_threshold = 3; open_timeout = 0.25 }
+  in
+  let config =
+    { C.Config.default with
+      circuit_breaker = Some cb_cfg;
+      command_timeout = Some 0.06;
+      keepalive_interval = None;
+    }
+  in
+  let conn =
+    C.connect ~sw ~net ~clock ~config ~host:"localhost" ~port:6379 ()
+  in
+  (* Fire three parallel requests that will all Timeout. *)
+  Eio.Fiber.all
+    (List.init 3 (fun _ () ->
+         match
+           C.request conn [| "BLPOP"; "ocaml:test:cb:nokey"; "0.1" |]
+         with
+         | Error C.Error.Timeout -> ()
+         | other ->
+             Alcotest.failf "setup: expected Timeout, got %s" (result_str other)));
+  (* Next request must be rejected fast with Circuit_open. *)
+  (match C.request conn [| "PING" |] with
+   | Error C.Error.Circuit_open -> ()
+   | other ->
+       Alcotest.failf "expected Circuit_open, got %s" (result_str other));
+  (* Wait past open_timeout AND let the server drain the in-flight BLPOPs so
+     the half-open PING probe is not queued behind them. *)
+  Eio.Time.sleep clock 0.5;
+  (* Next request is allowed as a probe; on success CB closes. *)
+  (match C.request conn [| "PING" |] with
+   | Ok (R.Simple_string "PONG") -> ()
+   | other ->
+       Alcotest.failf "probe PING: expected PONG, got %s" (result_str other));
+  (* And subsequent requests flow normally. *)
+  expect_simple_eq ~ctx:"post-probe PING" ~expected:"PONG"
+    (C.request conn [| "PING" |]);
+  C.close conn
+
 let test_keepalive () =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -314,4 +359,6 @@ let tests =
     Alcotest.test_case "tls_system_cas_rejects_self_signed" `Quick
       test_tls_system_cas_rejects_self_signed;
     Alcotest.test_case "keepalive fires" `Quick test_keepalive;
+    Alcotest.test_case "circuit breaker opens and recovers" `Quick
+      test_circuit_breaker;
   ]

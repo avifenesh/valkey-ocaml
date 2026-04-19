@@ -80,6 +80,7 @@ module Error = struct
     | Timeout
     | Interrupted
     | Queue_full
+    | Circuit_open
     | Closed
     | Server_error of Valkey_error.t
     | Terminal of string
@@ -97,6 +98,7 @@ module Error = struct
     | Timeout -> Format.pp_print_string ppf "Timeout"
     | Interrupted -> Format.pp_print_string ppf "Interrupted"
     | Queue_full -> Format.pp_print_string ppf "Queue_full"
+    | Circuit_open -> Format.pp_print_string ppf "Circuit_open"
     | Closed -> Format.pp_print_string ppf "Closed"
     | Server_error e -> Format.fprintf ppf "Server_error(%a)" Valkey_error.pp e
     | Terminal s -> Format.fprintf ppf "Terminal(%s)" s
@@ -105,7 +107,88 @@ module Error = struct
     | Auth_failed _ | Protocol_violation _ | Closed | Terminal _ -> true
     | Handshake_rejected _ | Tls_failed _ -> true
     | Tcp_refused _ | Dns_failed _ | Timeout | Interrupted | Queue_full
-    | Server_error _ -> false
+    | Circuit_open | Server_error _ -> false
+end
+
+module Circuit_breaker = struct
+  module Config = struct
+    type t = {
+      window_size : float;
+      error_threshold : int;
+      open_timeout : float;
+    }
+    let default = {
+      window_size = 60.0;
+      error_threshold = 10_000;
+      open_timeout = 10.0;
+    }
+  end
+
+  type state = {
+    cfg : Config.t;
+    mutable phase : [ `Closed | `Open of float | `Half_open of bool ];
+    errors : float Queue.t;
+    mutable error_count : int;
+    mutex : Eio.Mutex.t;
+  }
+
+  let make cfg = {
+    cfg;
+    phase = `Closed;
+    errors = Queue.create ();
+    error_count = 0;
+    mutex = Eio.Mutex.create ();
+  }
+
+  let counts_as_error (e : Error.t) =
+    match e with
+    | Timeout | Interrupted | Queue_full
+    | Tcp_refused _ | Dns_failed _ | Tls_failed _ -> true
+    | Handshake_rejected _ | Auth_failed _ | Protocol_violation _
+    | Server_error _ | Circuit_open | Closed | Terminal _ -> false
+
+  let prune cb now =
+    while
+      not (Queue.is_empty cb.errors)
+      && now -. Queue.peek cb.errors > cb.cfg.window_size
+    do
+      let _ = Queue.pop cb.errors in
+      cb.error_count <- cb.error_count - 1
+    done
+
+  let on_entry cb now : [ `Allow | `Allow_probe | `Reject ] =
+    Eio.Mutex.use_rw ~protect:true cb.mutex (fun () ->
+        prune cb now;
+        match cb.phase with
+        | `Closed -> `Allow
+        | `Open since ->
+            if now -. since >= cb.cfg.open_timeout then (
+              cb.phase <- `Half_open true;
+              `Allow_probe)
+            else `Reject
+        | `Half_open false ->
+            cb.phase <- `Half_open true;
+            `Allow_probe
+        | `Half_open true -> `Reject)
+
+  let on_result cb ~was_probe now (result : (Resp3.t, Error.t) result) =
+    Eio.Mutex.use_rw ~protect:true cb.mutex (fun () ->
+        let is_error =
+          match result with Error e -> counts_as_error e | _ -> false
+        in
+        match cb.phase, was_probe with
+        | `Half_open _, true ->
+            if is_error then cb.phase <- `Open now
+            else (
+              cb.phase <- `Closed;
+              Queue.clear cb.errors;
+              cb.error_count <- 0)
+        | `Closed, _ when is_error ->
+            Queue.push now cb.errors;
+            cb.error_count <- cb.error_count + 1;
+            if cb.error_count >= cb.cfg.error_threshold then
+              cb.phase <- `Open now
+        | _ -> ())
 end
 
 module Handshake = struct
@@ -151,19 +234,21 @@ module Config = struct
     push_buffer_size : int;
     max_queued_bytes : int;
     tls : Tls_config.t option;
+    circuit_breaker : Circuit_breaker.Config.t option;
   }
   let default = {
     handshake = Handshake.default;
     reconnect = Reconnect.default;
     command_timeout = None;
-    (* Some 30s by default: well under typical NAT / LB idle timeouts (60-300s),
-       low enough overhead that it's noise on any real workload. Set to None
-       to opt out when the application has constant traffic and keepalive is
-       pure burden. *)
     keepalive_interval = Some 30.0;
     push_buffer_size = 1024;
     max_queued_bytes = 10 * 1024 * 1024;
     tls = None;
+    (* Always on, but defaults tuned so only a genuine catastrophe (>10k
+       counted errors in 60s) trips the breaker. Users who want tighter
+       protection lower [error_threshold] or shrink [window_size]; users
+       who want it off set [circuit_breaker] to None. *)
+    circuit_breaker = Some Circuit_breaker.Config.default;
   }
 end
 
@@ -209,6 +294,7 @@ type t = {
   mutable availability_zone : string option;
   mutable closing : bool;
   mutable keepalive_count : int;
+  cb : Circuit_breaker.state option;
   cancel_signal : unit Eio.Promise.t;
   cancel_resolver : unit Eio.Promise.u;
 }
@@ -532,26 +618,41 @@ let request ?timeout t args =
   let size = String.length bytes in
   if size > t.config.max_queued_bytes then Error Error.Queue_full
   else
-    let run () =
-      Byte_sem.acquire t.budget size;
-      let promise, resolver = Eio.Promise.create () in
-      let entry = { resolver; size; abandoned = false } in
-      match try_enqueue t { entry; bytes } with
-      | `Dead e ->
-          Byte_sem.release t.budget size;
-          Error e
-      | `In_queue ->
-          (try Eio.Promise.await promise
-           with exn ->
-             entry.abandoned <- true;
-             raise exn)
+    let cb_decision =
+      match t.cb with
+      | None -> `Allow
+      | Some cb -> Circuit_breaker.on_entry cb (t.now ())
     in
-    match timeout with
-    | None -> run ()
-    | Some secs ->
-        (match t.with_timeout secs run with
-         | Ok v -> v
-         | Error `Timeout -> Error Error.Timeout)
+    match cb_decision with
+    | `Reject -> Error Error.Circuit_open
+    | (`Allow | `Allow_probe) as decision ->
+        let was_probe = decision = `Allow_probe in
+        let run () =
+          Byte_sem.acquire t.budget size;
+          let promise, resolver = Eio.Promise.create () in
+          let entry = { resolver; size; abandoned = false } in
+          match try_enqueue t { entry; bytes } with
+          | `Dead e ->
+              Byte_sem.release t.budget size;
+              Error e
+          | `In_queue ->
+              (try Eio.Promise.await promise
+               with exn ->
+                 entry.abandoned <- true;
+                 raise exn)
+        in
+        let result =
+          match timeout with
+          | None -> run ()
+          | Some secs ->
+              (match t.with_timeout secs run with
+               | Ok v -> v
+               | Error `Timeout -> Error Error.Timeout)
+        in
+        (match t.cb with
+         | None -> ()
+         | Some cb -> Circuit_breaker.on_result cb ~was_probe (t.now ()) result);
+        result
 
 let keepalive_loop t interval =
   let rec loop () =
@@ -625,6 +726,7 @@ let connect ~sw ~net ~clock ?(config = Config.default) ~host ~port () =
     availability_zone = None;
     closing = false;
     keepalive_count = 0;
+    cb = Option.map Circuit_breaker.make config.circuit_breaker;
     cancel_signal;
     cancel_resolver;
   }
