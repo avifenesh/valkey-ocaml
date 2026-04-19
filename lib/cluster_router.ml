@@ -256,6 +256,27 @@ let connection_for_slot_via ~pool ~topology_ref slot =
   | None -> None
   | Some shard -> Node_pool.get pool shard.primary.id
 
+(* Resolve [slot] to (primary_id, host, port) using the current
+   topology and the provided [prefer_hostname] preference. The
+   address choice mirrors [address_of_node] so every dedicated
+   consumer (Cluster_pubsub today) reaches the same endpoint the
+   pool dials. *)
+let endpoint_for_slot_via ~topology_ref ~prefer_hostname
+    ~connection_config slot =
+  match Topology.shard_for_slot !topology_ref slot with
+  | None -> None
+  | Some shard ->
+      let tls_enabled =
+        connection_config.Connection.Config.tls <> None
+      in
+      match
+        address_of_node ~prefer_hostname shard.primary,
+        port_of_node ~tls:tls_enabled shard.primary
+      with
+      | Some host, Some port ->
+          Some (shard.primary.id, host, port)
+      | _ -> None
+
 let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
   let topology_ref = ref topology in
   let trigger_refresh () = () in
@@ -273,7 +294,17 @@ let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
   let connection_for_slot slot =
     connection_for_slot_via ~pool ~topology_ref slot
   in
+  (* Standalone/synthetic-topology path: without a real connection
+     config here, just use defaults. [Cluster_pubsub] is cluster-only
+     so this branch should never be queried in anger. *)
+  let endpoint_for_slot slot =
+    endpoint_for_slot_via ~topology_ref
+      ~prefer_hostname:false
+      ~connection_config:Connection.Config.default
+      slot
+  in
   Router.make ~exec ~exec_multi ~close ~primary ~connection_for_slot
+    ~endpoint_for_slot
 
 (* ---------- refresh fiber ---------- *)
 
@@ -452,5 +483,12 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
         sync_ref ();
         connection_for_slot_via ~pool ~topology_ref slot
       in
+      let endpoint_for_slot slot =
+        sync_ref ();
+        endpoint_for_slot_via ~topology_ref
+          ~prefer_hostname:cfg.prefer_hostname
+          ~connection_config:cfg.connection
+          slot
+      in
       Ok (Router.make ~exec ~exec_multi ~close ~primary
-            ~connection_for_slot)
+            ~connection_for_slot ~endpoint_for_slot)

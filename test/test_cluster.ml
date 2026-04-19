@@ -157,6 +157,218 @@ let skip_placeholder name () =
      + scripts/cluster-hosts-setup.sh)\n%!"
     name
 
+module CP = Valkey.Cluster_pubsub
+module PS = Valkey.Pubsub
+
+(* Plain SUBSCRIBE in cluster mode: any node accepts, message
+   broadcasts cluster-wide. *)
+let test_cluster_pubsub_regular () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match CR.create ~sw ~net ~clock ~config () with
+  | Error m -> Alcotest.failf "cluster router: %s" m
+  | Ok router ->
+      let pubclient = C.from_router ~config:C.Config.default router in
+      let cp = CP.create ~sw ~net ~clock ~router () in
+      Fun.protect
+        ~finally:(fun () -> CP.close cp; C.close pubclient)
+      @@ fun () ->
+      (match CP.subscribe cp [ "cpc:chan" ] with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "subscribe: %a" err_pp e);
+      Eio.Time.sleep clock 0.2;
+      (* NOTE: PUBLISH in cluster mode returns the *local* match
+         count on the node it lands on, not cluster-wide. If the
+         publisher happens to hit a different node from the
+         subscriber, the count can be 0 even though the message
+         broadcasts to every shard and is delivered. Don't assert
+         on the return; assert on delivery below. *)
+      (match C.publish pubclient ~channel:"cpc:chan" ~message:"hi" with
+       | Ok _ -> ()
+       | Error e -> Alcotest.failf "publish: %a" err_pp e);
+      match CP.next_message ~timeout:2.0 cp with
+      | Ok (PS.Channel { channel; payload }) ->
+          Alcotest.(check string) "channel" "cpc:chan" channel;
+          Alcotest.(check string) "payload" "hi" payload
+      | Ok _ -> Alcotest.fail "expected Channel delivery"
+      | Error _ -> Alcotest.fail "no message within 2s"
+
+(* Sharded SSUBSCRIBE: channel is pinned to its slot's primary.
+   Both subscriber and publisher route by slot, so SPUBLISH must
+   reach the same primary SSUBSCRIBE is listening on. *)
+let test_cluster_pubsub_sharded () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match CR.create ~sw ~net ~clock ~config () with
+  | Error m -> Alcotest.failf "cluster router: %s" m
+  | Ok router ->
+      let pubclient = C.from_router ~config:C.Config.default router in
+      let cp = CP.create ~sw ~net ~clock ~router () in
+      Fun.protect
+        ~finally:(fun () -> CP.close cp; C.close pubclient)
+      @@ fun () ->
+      (match CP.ssubscribe cp [ "cps:alpha" ] with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "ssubscribe: %a" err_pp e);
+      Eio.Time.sleep clock 0.1;
+      (match C.spublish pubclient ~channel:"cps:alpha"
+               ~message:"shard-msg" with
+       | Ok n when n >= 1 -> ()
+       | Ok n -> Alcotest.failf "spublish returned %d" n
+       | Error e -> Alcotest.failf "spublish: %a" err_pp e);
+      match CP.next_message ~timeout:2.0 cp with
+      | Ok (PS.Shard { channel; payload }) ->
+          Alcotest.(check string) "channel" "cps:alpha" channel;
+          Alcotest.(check string) "payload" "shard-msg" payload
+      | Ok _ -> Alcotest.fail "expected Shard delivery"
+      | Error _ -> Alcotest.fail "no sharded message within 2s"
+
+(* Channels in different slots force multiple shard connections. *)
+let test_cluster_pubsub_multi_slot () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match CR.create ~sw ~net ~clock ~config () with
+  | Error m -> Alcotest.failf "cluster router: %s" m
+  | Ok router ->
+      let pubclient = C.from_router ~config:C.Config.default router in
+      let cp = CP.create ~sw ~net ~clock ~router () in
+      Fun.protect
+        ~finally:(fun () -> CP.close cp; C.close pubclient)
+      @@ fun () ->
+      (* Find two channel names that land in different slots. *)
+      let ch1 = "cps:multi:1" in
+      let ch2_candidates =
+        [ "cps:multi:x"; "cps:multi:y"; "cps:multi:other";
+          "cps:multi:far"; "cps:multi:last" ]
+      in
+      let slot1 = Valkey.Slot.of_key ch1 in
+      let ch2 =
+        List.find
+          (fun c -> Valkey.Slot.of_key c <> slot1)
+          ch2_candidates
+      in
+      (match CP.ssubscribe cp [ ch1; ch2 ] with
+       | Ok () -> ()
+       | Error e ->
+           Alcotest.failf "ssubscribe multi: %a" err_pp e);
+      Eio.Time.sleep clock 0.1;
+      ignore
+        (C.spublish pubclient ~channel:ch1 ~message:"m1");
+      ignore
+        (C.spublish pubclient ~channel:ch2 ~message:"m2");
+      let got = ref [] in
+      for _ = 1 to 2 do
+        match CP.next_message ~timeout:2.0 cp with
+        | Ok (PS.Shard { channel; payload }) ->
+            got := (channel, payload) :: !got
+        | Ok _ -> Alcotest.fail "expected Shard delivery"
+        | Error _ ->
+            Alcotest.failf "multi-slot timeout, got %d msgs"
+              (List.length !got)
+      done;
+      let actual = List.sort compare !got in
+      let expected =
+        List.sort compare [ ch1, "m1"; ch2, "m2" ]
+      in
+      Alcotest.(check (list (pair string string)))
+        "multi-slot deliveries" expected actual
+
+(* Restart the primary that currently owns [slot] and confirm the
+   sharded subscriber's watchdog re-pins on the (possibly new)
+   primary once the topology settles, replays SSUBSCRIBE, and
+   delivery resumes. *)
+let test_cluster_pubsub_failover_replay () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with
+      prefer_hostname = true;
+      refresh_interval = 1.5;
+      refresh_jitter = 0.5 }
+  in
+  match CR.create ~sw ~net ~clock ~config () with
+  | Error m -> Alcotest.failf "cluster router: %s" m
+  | Ok router ->
+      let pubclient = C.from_router ~config:C.Config.default router in
+      let cp = CP.create ~sw ~net ~clock ~router () in
+      Fun.protect
+        ~finally:(fun () -> CP.close cp; C.close pubclient)
+      @@ fun () ->
+      let channel = "cps:fail:alpha" in
+      (match CP.ssubscribe cp [ channel ] with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "ssubscribe: %a" err_pp e);
+      Eio.Time.sleep clock 0.1;
+
+      (* Baseline: sharded delivery works. *)
+      ignore (C.spublish pubclient ~channel ~message:"pre-restart");
+      (match CP.next_message ~timeout:2.0 cp with
+       | Ok (PS.Shard { payload = "pre-restart"; _ }) -> ()
+       | Ok _ -> Alcotest.fail "unexpected pre-restart delivery"
+       | Error _ ->
+           Alcotest.fail "baseline sharded delivery timed out");
+
+      (* Restart every primary one by one — whichever one owns the
+         slot, we'll catch it. Gives the router ~2s after each
+         restart to observe and refresh topology. *)
+      let primaries = [
+        "ocaml-valkey-c1";
+        "ocaml-valkey-c2";
+        "ocaml-valkey-c3";
+      ] in
+      List.iter
+        (fun name ->
+          let _ = Sys.command
+                    (Printf.sprintf
+                       "docker restart %s >/dev/null 2>&1" name)
+          in
+          Eio.Time.sleep clock 3.0)
+        primaries;
+
+      (* Now publish again and expect delivery via the re-pinned
+         shard connection. Generous timeout to absorb topology
+         settle + reconnect + replay. *)
+      let deadline = Unix.gettimeofday () +. 15.0 in
+      let rec try_once () =
+        if Unix.gettimeofday () > deadline then
+          Alcotest.fail
+            "no post-failover delivery within 15s; watchdog \
+             didn't replay SSUBSCRIBE on the re-pinned shard"
+        else begin
+          ignore (C.spublish pubclient ~channel ~message:"post-restart");
+          match CP.next_message ~timeout:1.0 cp with
+          | Ok (PS.Shard { payload = "post-restart"; _ }) -> ()
+          | Ok (PS.Shard { payload = "pre-restart"; _ }) ->
+              (* Left over from before; drain and retry. *)
+              try_once ()
+          | Ok _ ->
+              Alcotest.fail "unexpected non-shard delivery"
+          | Error `Timeout ->
+              Eio.Time.sleep clock 0.5;
+              try_once ()
+          | Error `Closed ->
+              Alcotest.fail "handle closed unexpectedly"
+        end
+      in
+      try_once ()
+
 let tests =
   let reachable = cluster_reachable () in
   let tc name f =
@@ -172,4 +384,12 @@ let tests =
       test_custom_command_routes_correctly;
     tc "cross-slot DEL surfaces CROSSSLOT"
       test_cross_slot_surfaces_crossslot;
+    tc "cluster_pubsub: regular SUBSCRIBE"
+      test_cluster_pubsub_regular;
+    tc "cluster_pubsub: sharded SSUBSCRIBE"
+      test_cluster_pubsub_sharded;
+    tc "cluster_pubsub: multi-slot shard subscriptions"
+      test_cluster_pubsub_multi_slot;
+    tc "cluster_pubsub: sharded replay after primary restarts"
+      test_cluster_pubsub_failover_replay;
   ]

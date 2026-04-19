@@ -197,3 +197,7 @@ let rec next_message ?timeout t =
        | `Ack -> next_message ?timeout t
        | `Other -> next_message ?timeout t)
   | Ok _ -> next_message ?timeout t
+
+let classify_push = function
+  | Resp3.Push items -> classify items
+  | _ -> `Other

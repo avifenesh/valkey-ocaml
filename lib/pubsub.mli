@@ -62,3 +62,9 @@ val next_message :
     [Error `Timeout] when nothing arrived in the window. Filters out
     subscription-ack pushes silently so the caller only sees real
     deliveries. *)
+
+(** {1 Low-level helpers — exposed for [Cluster_pubsub]} *)
+
+val classify_push : Resp3.t -> [ `Ack | `Deliver of message | `Other ]
+(** Inspect a RESP3 Push frame and classify it as a subscription
+    acknowledgement, a real delivery, or something unrecognised. *)

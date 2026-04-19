@@ -49,12 +49,22 @@ type connection_for_slot_fn =
     specific node; returns [None] if the slot has no live connection
     in the pool (topology out of date or node unreachable). *)
 
+type endpoint_for_slot_fn =
+  int -> (string * string * int) option
+(** Resolve the {i address} (primary_id, host, port) of the primary
+    that owns the given slot. Used by [Cluster_pubsub] to open a
+    dedicated subscriber socket to the right node — a pool-backed
+    connection is multiplexed and cannot be switched into subscribe
+    mode. Returns [None] if the slot is unowned in the current
+    topology. *)
+
 val make :
   exec:exec_fn ->
   exec_multi:exec_multi_fn ->
   close:(unit -> unit) ->
   primary:(unit -> Connection.t option) ->
   connection_for_slot:connection_for_slot_fn ->
+  endpoint_for_slot:endpoint_for_slot_fn ->
   t
 
 val standalone : Connection.t -> t
@@ -80,3 +90,8 @@ val connection_for_slot : t -> int -> Connection.t option
 (** Returns the live [Connection.t] whose primary owns [slot], or
     [None] if none is in the pool. On standalone this always
     returns the single connection. *)
+
+val endpoint_for_slot : t -> int -> (string * string * int) option
+(** Returns [Some (primary_id, host, port)] of the current primary
+    for [slot], or [None] if the slot is unowned in the router's
+    topology. *)

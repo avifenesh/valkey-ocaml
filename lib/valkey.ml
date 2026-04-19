@@ -16,3 +16,4 @@ module Client = Client
 module Cluster_router = Cluster_router
 module Transaction = Transaction
 module Pubsub = Pubsub
+module Cluster_pubsub = Cluster_pubsub
