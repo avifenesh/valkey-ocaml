@@ -5,3 +5,4 @@ module Byte_reader = Byte_reader
 module Error = Valkey_error
 module Tls_config = Tls_config
 module Connection = Connection
+module Client = Client
