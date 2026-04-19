@@ -2089,3 +2089,180 @@ let geosearchstore
   | Error e -> Error e
   | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
   | Ok v -> Error (protocol_violation "GEOSEARCHSTORE" v)
+
+(* ---------- CLIENT admin ---------- *)
+
+let expect_ok cmd = function
+  | Ok (Resp3.Simple_string "OK") -> Ok ()
+  | Ok v -> Error (protocol_violation cmd v)
+  | Error e -> Error e
+
+let string_of_reply cmd = function
+  | Ok (Resp3.Bulk_string s) | Ok (Resp3.Simple_string s)
+  | Ok (Resp3.Verbatim_string { data = s; _ }) -> Ok s
+  | Ok v -> Error (protocol_violation cmd v)
+  | Error e -> Error e
+
+let client_id ?timeout t =
+  match exec ?timeout t [| "CLIENT"; "ID" |] with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "CLIENT ID" v)
+
+let client_getname ?timeout t =
+  match exec ?timeout t [| "CLIENT"; "GETNAME" |] with
+  | Error e -> Error e
+  | Ok Resp3.Null -> Ok None
+  | Ok (Resp3.Bulk_string "") -> Ok None   (* legacy RESP2 empty-string *)
+  | Ok (Resp3.Bulk_string s)
+  | Ok (Resp3.Simple_string s) -> Ok (Some s)
+  | Ok v -> Error (protocol_violation "CLIENT GETNAME" v)
+
+let client_setname ?timeout t ~name =
+  expect_ok "CLIENT SETNAME"
+    (exec ?timeout t [| "CLIENT"; "SETNAME"; name |])
+
+let client_info ?timeout t =
+  string_of_reply "CLIENT INFO"
+    (exec ?timeout t [| "CLIENT"; "INFO" |])
+
+type client_type = Client_normal | Client_master | Client_replica
+                 | Client_pubsub
+
+let client_type_arg = function
+  | Client_normal -> "normal"
+  | Client_master -> "master"
+  | Client_replica -> "replica"
+  | Client_pubsub -> "pubsub"
+
+let client_list ?timeout ?type_ ?ids t =
+  let type_args = match type_ with
+    | None -> []
+    | Some t -> [ "TYPE"; client_type_arg t ]
+  in
+  let id_args = match ids with
+    | None | Some [] -> []
+    | Some xs -> "ID" :: List.map string_of_int xs
+  in
+  let args = Array.of_list ("CLIENT" :: "LIST" :: type_args @ id_args) in
+  (* Command_spec says CLIENT LIST is Fan_all_nodes, so exec_multi
+     hits every node. Concatenate the per-node replies. *)
+  let per_node = exec_multi ?timeout t args in
+  let rec loop acc = function
+    | [] -> Ok (String.concat "" (List.rev acc))
+    | (_, Error e) :: _ -> Error e
+    | (_, Ok r) :: rest ->
+        (match string_of_reply "CLIENT LIST" (Ok r) with
+         | Error e -> Error e
+         | Ok s -> loop (s :: acc) rest)
+  in
+  loop [] per_node
+
+type client_pause_mode = Pause_all | Pause_write
+
+let client_pause_mode_arg = function
+  | Pause_all -> "ALL"
+  | Pause_write -> "WRITE"
+
+let aggregate_ok_fan cmd per_node =
+  let rec loop = function
+    | [] -> Ok ()
+    | (_, Error e) :: _ -> Error e
+    | (_, Ok (Resp3.Simple_string "OK")) :: rest -> loop rest
+    | (_, Ok v) :: _ -> Error (protocol_violation cmd v)
+  in
+  loop per_node
+
+let client_pause ?timeout ?mode t ~timeout_ms =
+  let mode_args = match mode with
+    | None -> []
+    | Some m -> [ client_pause_mode_arg m ]
+  in
+  let args =
+    Array.of_list
+      ("CLIENT" :: "PAUSE" :: string_of_int timeout_ms :: mode_args)
+  in
+  let per_node =
+    exec_multi ?timeout ~fan:Router.Fan_target.All_primaries t args
+  in
+  aggregate_ok_fan "CLIENT PAUSE" per_node
+
+let client_unpause ?timeout t =
+  let per_node =
+    exec_multi ?timeout ~fan:Router.Fan_target.All_primaries t
+      [| "CLIENT"; "UNPAUSE" |]
+  in
+  aggregate_ok_fan "CLIENT UNPAUSE" per_node
+
+let on_off = function true -> "ON" | false -> "OFF"
+
+let client_no_evict ?timeout t enable =
+  expect_ok "CLIENT NO-EVICT"
+    (exec ?timeout t [| "CLIENT"; "NO-EVICT"; on_off enable |])
+
+let client_no_touch ?timeout t enable =
+  expect_ok "CLIENT NO-TOUCH"
+    (exec ?timeout t [| "CLIENT"; "NO-TOUCH"; on_off enable |])
+
+type client_kill_filter =
+  | Kill_id of int
+  | Kill_not_id of int
+  | Kill_type of client_type
+  | Kill_not_type of client_type
+  | Kill_addr of string
+  | Kill_not_addr of string
+  | Kill_laddr of string
+  | Kill_not_laddr of string
+  | Kill_user of string
+  | Kill_not_user of string
+  | Kill_skipme of bool
+  | Kill_maxage of int
+
+let kill_filter_args = function
+  | Kill_id n -> [ "ID"; string_of_int n ]
+  | Kill_not_id n -> [ "NOT-ID"; string_of_int n ]
+  | Kill_type t -> [ "TYPE"; client_type_arg t ]
+  | Kill_not_type t -> [ "NOT-TYPE"; client_type_arg t ]
+  | Kill_addr s -> [ "ADDR"; s ]
+  | Kill_not_addr s -> [ "NOT-ADDR"; s ]
+  | Kill_laddr s -> [ "LADDR"; s ]
+  | Kill_not_laddr s -> [ "NOT-LADDR"; s ]
+  | Kill_user s -> [ "USER"; s ]
+  | Kill_not_user s -> [ "NOT-USER"; s ]
+  | Kill_skipme b -> [ "SKIPME"; if b then "yes" else "no" ]
+  | Kill_maxage n -> [ "MAXAGE"; string_of_int n ]
+
+let client_kill ?timeout t ~filters =
+  let chunks = List.concat_map kill_filter_args filters in
+  let args = Array.of_list ("CLIENT" :: "KILL" :: chunks) in
+  match exec ?timeout t args with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "CLIENT KILL" v)
+
+let client_tracking_on
+    ?timeout ?redirect ?(prefixes = [])
+    ?(bcast = false) ?(optin = false) ?(optout = false)
+    ?(noloop = false) t () =
+  let redir_args = match redirect with
+    | None -> []
+    | Some id -> [ "REDIRECT"; string_of_int id ]
+  in
+  let prefix_args =
+    List.concat_map (fun p -> [ "PREFIX"; p ]) prefixes
+  in
+  let bcast_args = if bcast then [ "BCAST" ] else [] in
+  let optin_args = if optin then [ "OPTIN" ] else [] in
+  let optout_args = if optout then [ "OPTOUT" ] else [] in
+  let noloop_args = if noloop then [ "NOLOOP" ] else [] in
+  let args =
+    Array.of_list
+      ("CLIENT" :: "TRACKING" :: "ON"
+       :: redir_args @ prefix_args
+          @ bcast_args @ optin_args @ optout_args @ noloop_args)
+  in
+  expect_ok "CLIENT TRACKING ON" (exec ?timeout t args)
+
+let client_tracking_off ?timeout t =
+  expect_ok "CLIENT TRACKING OFF"
+    (exec ?timeout t [| "CLIENT"; "TRACKING"; "OFF" |])

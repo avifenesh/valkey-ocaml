@@ -1172,3 +1172,119 @@ val geosearchstore :
     of elements stored. In cluster mode, [source] and
     [destination] must hash to the same slot. [STOREDIST] stores
     distances instead of the geo positions. *)
+
+(** {1 CLIENT admin}
+
+    Per-connection and fleet-wide admin. Every typed wrapper here
+    goes through [Client.exec] on a single connection — including
+    [client_list], which fans to all nodes internally in cluster
+    mode and concatenates. *)
+
+val client_id :
+  ?timeout:float -> t -> (int, Connection.Error.t) result
+(** [CLIENT ID]. Monotonic unique identifier for this connection
+    on the server it is currently attached to. Resets after a
+    reconnect. *)
+
+val client_getname :
+  ?timeout:float -> t -> (string option, Connection.Error.t) result
+(** [CLIENT GETNAME]. [None] when no name has been set. *)
+
+val client_setname :
+  ?timeout:float -> t -> name:string ->
+  (unit, Connection.Error.t) result
+(** [CLIENT SETNAME name]. [name] must not contain spaces (Valkey
+    would reject). Empty string is also rejected by the server. *)
+
+val client_info :
+  ?timeout:float -> t -> (string, Connection.Error.t) result
+(** [CLIENT INFO]. One-line [key=value ...] dump describing the
+    current connection. Format is documented on the CLIENT LIST
+    page. *)
+
+(** Filter value for [client_list] and [client_kill]. *)
+type client_type = Client_normal | Client_master | Client_replica
+                 | Client_pubsub
+
+val client_list :
+  ?timeout:float ->
+  ?type_:client_type ->
+  ?ids:int list ->
+  t -> (string, Connection.Error.t) result
+(** [CLIENT LIST [TYPE ...] [ID id [id ...]]]. In cluster mode
+    fans to every node (one call per primary + replica) and
+    concatenates the output. Returns a multiline string; each
+    line is one connection in [key=value ...] form. *)
+
+type client_pause_mode = Pause_all | Pause_write
+
+val client_pause :
+  ?timeout:float ->
+  ?mode:client_pause_mode ->
+  t -> timeout_ms:int ->
+  (unit, Connection.Error.t) result
+(** [CLIENT PAUSE timeout [WRITE | ALL]]. Suspends other
+    connections on the same server. Default mode is [Pause_all].
+    Fans to every primary in cluster mode. *)
+
+val client_unpause :
+  ?timeout:float -> t -> (unit, Connection.Error.t) result
+(** [CLIENT UNPAUSE]. Fans to every primary in cluster mode. *)
+
+val client_no_evict :
+  ?timeout:float -> t -> bool -> (unit, Connection.Error.t) result
+(** [CLIENT NO-EVICT ON|OFF]. Pass [true] to protect the current
+    connection from eviction under memory pressure. *)
+
+val client_no_touch :
+  ?timeout:float -> t -> bool -> (unit, Connection.Error.t) result
+(** [CLIENT NO-TOUCH ON|OFF]. Pass [true] to stop tracking
+    last-access time on keys this connection reads. *)
+
+(** Filter for [client_kill]. Filters AND together at the server;
+    the [Not_*] variants negate. Covers the commonly-used filters;
+    uncommon ones (LIB-NAME / DB / CAPA / IP / IDLE variants)
+    can be added by user request. *)
+type client_kill_filter =
+  | Kill_id of int
+  | Kill_not_id of int
+  | Kill_type of client_type
+  | Kill_not_type of client_type
+  | Kill_addr of string
+  | Kill_not_addr of string
+  | Kill_laddr of string
+  | Kill_not_laddr of string
+  | Kill_user of string
+  | Kill_not_user of string
+  | Kill_skipme of bool
+  | Kill_maxage of int
+
+val client_kill :
+  ?timeout:float ->
+  t -> filters:client_kill_filter list ->
+  (int, Connection.Error.t) result
+(** [CLIENT KILL <filter> <value> ...]. Returns the number of
+    connections killed. In cluster mode, dispatched to a single
+    random node — use [exec_multi ~fan:All_nodes] if you want to
+    sweep the whole fleet. *)
+
+val client_tracking_on :
+  ?timeout:float ->
+  ?redirect:int ->
+  ?prefixes:string list ->
+  ?bcast:bool ->
+  ?optin:bool ->
+  ?optout:bool ->
+  ?noloop:bool ->
+  t -> unit -> (unit, Connection.Error.t) result
+(** [CLIENT TRACKING ON [REDIRECT id] [PREFIX p ...] [BCAST]
+       [OPTIN] [OPTOUT] [NOLOOP]].
+
+    [prefixes] require [bcast:true]; [optin] and [optout] are
+    mutually exclusive (the server enforces). When [redirect] is
+    set, invalidations are forwarded to that client-id instead of
+    to the current connection. *)
+
+val client_tracking_off :
+  ?timeout:float -> t -> (unit, Connection.Error.t) result
+(** [CLIENT TRACKING OFF]. *)
