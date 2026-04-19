@@ -31,8 +31,36 @@ module Config = struct
   }
 end
 
+(* Router — dispatcher between typed Client.exec and the per-target
+   Connection(s). Standalone ships today; cluster will add a sibling
+   implementation without changing the Client surface. *)
+module Router = struct
+  type t = {
+    exec : 'a. ?timeout:float -> Target.t -> Read_from.t -> string array ->
+           (Resp3.t, Connection.Error.t) result;
+    close : unit -> unit;
+    primary : unit -> Connection.t option;
+  }
+  [@@warning "-69"]
+
+  let standalone (conn : Connection.t) : t =
+    let exec : 'a. ?timeout:float -> Target.t -> Read_from.t ->
+               string array -> (Resp3.t, Connection.Error.t) result =
+      fun ?timeout _target _read_from args ->
+        Connection.request ?timeout conn args
+    in
+    { exec;
+      close = (fun () -> Connection.close conn);
+      primary = (fun () -> Some conn);
+    }
+
+  let exec ?timeout t target rf args = t.exec ?timeout target rf args
+  let close t = t.close ()
+  let primary_connection t = t.primary ()
+end
+
 type t = {
-  connection : Connection.t;
+  router : Router.t;
   config : Config.t;
   loaded_shas : (string, unit) Hashtbl.t;
   loaded_shas_mutex : Eio.Mutex.t;
@@ -44,16 +72,27 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
     Connection.connect ~sw ~net ~clock ?domain_mgr
       ~config:config.connection ~host ~port ()
   in
-  { connection; config;
+  let router = Router.standalone connection in
+  { router; config;
     loaded_shas = Hashtbl.create 16;
     loaded_shas_mutex = Eio.Mutex.create () }
 
-let close t = Connection.close t.connection
+let close t = Router.close t.router
 
-let raw_connection t = t.connection
+let raw_connection t =
+  match Router.primary_connection t.router with
+  | Some c -> c
+  | None ->
+      invalid_arg
+        "Client.raw_connection: no primary connection available \
+         (multi-node router)"
 
-let exec ?timeout ?target:_ ?read_from:_ t args =
-  Connection.request ?timeout t.connection args
+let exec ?timeout ?target ?read_from t args =
+  let target = Option.value target ~default:Target.Random in
+  let read_from =
+    Option.value read_from ~default:t.config.read_from
+  in
+  Router.exec ?timeout t.router target read_from args
 
 let protocol_violation cmd v =
   Connection.Error.Protocol_violation
