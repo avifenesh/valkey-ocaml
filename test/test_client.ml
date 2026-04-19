@@ -529,6 +529,48 @@ let tests =
             | Error e -> Format.asprintf "Error %a" E.pp e));
       let _ = C.del c [ key ] in
       ());
+    Alcotest.test_case "ZADD (via exec) / ZRANGE / ZRANGEBYSCORE / ZCARD / ZREMRANGEBYSCORE"
+      `Quick (fun () ->
+      with_client @@ fun c ->
+      let key = "ocaml:c:zset" in
+      let _ = C.del c [ key ] in
+      (* Seed via exec since ZADD isn't in the typed API yet. *)
+      let _ = C.exec c [| "ZADD"; key; "1"; "a"; "2"; "b"; "3"; "c"; "10"; "d" |] in
+      Alcotest.(check int) "ZCARD" 4
+        (match C.zcard c key with
+         | Ok n -> n | Error e -> Alcotest.failf "ZCARD: %a" E.pp e);
+      (match C.zrange c key ~start:0 ~stop:(-1) with
+       | Ok xs -> Alcotest.(check (list string))
+           "zrange ascending" [ "a"; "b"; "c"; "d" ] xs
+       | Error e -> Alcotest.failf "ZRANGE: %a" E.pp e);
+      (match C.zrange c key ~rev:true ~start:0 ~stop:(-1) with
+       | Ok xs -> Alcotest.(check (list string))
+           "zrange rev" [ "d"; "c"; "b"; "a" ] xs
+       | Error e -> Alcotest.failf "ZRANGE REV: %a" E.pp e);
+      (match
+         C.zrangebyscore c key ~min:(Score 2.0) ~max:(Score 3.0)
+       with
+       | Ok xs -> Alcotest.(check (list string))
+           "zrangebyscore 2..3" [ "b"; "c" ] xs
+       | Error e -> Alcotest.failf "ZRANGEBYSCORE: %a" E.pp e);
+      (match
+         C.zrangebyscore c key ~min:Score_neg_inf ~max:(Score_excl 3.0)
+       with
+       | Ok xs -> Alcotest.(check (list string))
+           "zrangebyscore -inf..(3" [ "a"; "b" ] xs
+       | Error e -> Alcotest.failf "ZRANGEBYSCORE: %a" E.pp e);
+      (match C.zremrangebyscore c key ~min:(Score 3.0) ~max:Score_pos_inf with
+       | Ok 2 -> ()
+       | other ->
+           Alcotest.failf "ZREMRANGEBYSCORE: %s"
+             (match other with
+              | Ok n -> string_of_int n
+              | Error e -> Format.asprintf "Error %a" E.pp e));
+      Alcotest.(check int) "ZCARD after remove" 2
+        (match C.zcard c key with
+         | Ok n -> n | Error e -> Alcotest.failf "ZCARD: %a" E.pp e);
+      let _ = C.del c [ key ] in
+      ());
     Alcotest.test_case "HINCRBY" `Quick (fun () ->
       with_client @@ fun c ->
       let key = "ocaml:c:h4" in

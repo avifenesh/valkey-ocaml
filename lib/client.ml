@@ -555,3 +555,60 @@ let llen ?timeout ?read_from t key =
   | Error e -> Error e
   | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
   | Ok v -> Error (protocol_violation "LLEN" v)
+
+(* ---------- sorted sets ---------- *)
+
+type score_bound =
+  | Score of float
+  | Score_excl of float
+  | Score_neg_inf
+  | Score_pos_inf
+
+let score_bound_to_string = function
+  | Score f -> Printf.sprintf "%g" f
+  | Score_excl f -> Printf.sprintf "(%g" f
+  | Score_neg_inf -> "-inf"
+  | Score_pos_inf -> "+inf"
+
+let zrange ?timeout ?read_from ?(rev = false) t key ~start ~stop =
+  let base =
+    [ "ZRANGE"; key; string_of_int start; string_of_int stop ]
+  in
+  let args = Array.of_list (if rev then base @ [ "REV" ] else base) in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok (Resp3.Array items) -> strings_of_resp3_collection "ZRANGE" items
+  | Ok v -> Error (protocol_violation "ZRANGE" v)
+
+let zrangebyscore ?timeout ?read_from ?limit t key ~min ~max =
+  let base =
+    [ "ZRANGEBYSCORE"; key;
+      score_bound_to_string min; score_bound_to_string max ]
+  in
+  let limit_a = match limit with
+    | None -> []
+    | Some (off, count) ->
+        [ "LIMIT"; string_of_int off; string_of_int count ]
+  in
+  let args = Array.of_list (base @ limit_a) in
+  match exec ?timeout ?read_from t args with
+  | Error e -> Error e
+  | Ok (Resp3.Array items) ->
+      strings_of_resp3_collection "ZRANGEBYSCORE" items
+  | Ok v -> Error (protocol_violation "ZRANGEBYSCORE" v)
+
+let zremrangebyscore ?timeout t key ~min ~max =
+  match
+    exec ?timeout t
+      [| "ZREMRANGEBYSCORE"; key;
+         score_bound_to_string min; score_bound_to_string max |]
+  with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "ZREMRANGEBYSCORE" v)
+
+let zcard ?timeout ?read_from t key =
+  match exec ?timeout ?read_from t [| "ZCARD"; key |] with
+  | Error e -> Error e
+  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
+  | Ok v -> Error (protocol_violation "ZCARD" v)

@@ -357,3 +357,37 @@ val llen :
   ?timeout:float ->
   ?read_from:Read_from.t ->
   t -> string -> (int, Connection.Error.t) result
+
+(** {1 Sorted sets} *)
+
+type score_bound =
+  | Score of float
+      (** Inclusive. *)
+  | Score_excl of float
+      (** Exclusive ("(5" on the wire). *)
+  | Score_neg_inf
+  | Score_pos_inf
+
+val zrange :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  ?rev:bool ->
+  t -> string -> start:int -> stop:int ->
+  (string list, Connection.Error.t) result
+
+val zrangebyscore :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  ?limit:(int * int) ->
+  t -> string -> min:score_bound -> max:score_bound ->
+  (string list, Connection.Error.t) result
+
+val zremrangebyscore :
+  ?timeout:float ->
+  t -> string -> min:score_bound -> max:score_bound ->
+  (int, Connection.Error.t) result
+
+val zcard :
+  ?timeout:float ->
+  ?read_from:Read_from.t ->
+  t -> string -> (int, Connection.Error.t) result
