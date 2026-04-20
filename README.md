@@ -382,7 +382,8 @@ state:
 - ✅ Phase 3 — CI / CD + coverage + bench + nightly fuzz + docs
 - ✅ Phase 4 — documentation (9 guides + CONTRIBUTING + CHANGELOG)
 - ✅ Phase 5 — initial 9 examples + standing rule "ship features with their example"
-- ⏳ Phase 6 — publishing (0.1.0 to opam)
+- ✅ Phase 7 — Batch primitive + cluster-aware typed helpers (mget/mset/del/unlink/exists/touch cluster)
+- 🔄 Phase 6 — publishing (v0.1.0 tagged, [opam-repository PR #29748](https://github.com/ocaml/opam-repository/pull/29748) open)
 - ⏳ Phases 7–12 — batch commands, client-side caching, connection
   pool, IAM + mTLS, module support, deep audit, 1.0.0 stable
 

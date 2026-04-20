@@ -139,3 +139,34 @@ val del_cluster :
   (int, Connection.Error.t) result
 (** [DEL] that spans cluster slots. Returns the total number of
     keys actually removed (sum of per-slot counts). *)
+
+val unlink_cluster :
+  ?timeout:float ->
+  Client.t -> string list ->
+  (int, Connection.Error.t) result
+(** [UNLINK] that spans cluster slots — same semantics as
+    [del_cluster] but the server reclaims memory in a background
+    thread. Returns the total count of keys actually removed. *)
+
+val exists_cluster :
+  ?timeout:float ->
+  Client.t -> string list ->
+  (int, Connection.Error.t) result
+(** [EXISTS] that spans cluster slots. Returns the total count of
+    the given keys that exist. Matches server-side [EXISTS]
+    semantics where duplicate keys in the input count separately:
+    [exists_cluster c ["a"; "a"]] returns 2 if [a] exists. *)
+
+val touch_cluster :
+  ?timeout:float ->
+  Client.t -> string list ->
+  (int, Connection.Error.t) result
+(** [TOUCH] that spans cluster slots. Bumps each key's
+    last-access time; returns the count of keys that existed. *)
+
+(** Note: [pfcount_cluster] is intentionally not provided.
+    Summing per-slot [PFCOUNT] values over-counts any element
+    that appears in multiple HLLs spread across slots. Correct
+    handling needs a client-side HLL merge or a [PFMERGE]-first
+    workflow; tracked in ROADMAP Phase 7. Use [Client.pfcount]
+    directly with keys that share a slot (via hashtags). *)

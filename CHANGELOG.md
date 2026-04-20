@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Phase 7 (batch + cluster-aware commands)
+
+- `Valkey.Batch` — scatter-gather batch primitive. One module,
+  two modes selected by `~atomic:bool` at `create` time:
+  - **Non-atomic** (default): commands bucketed by slot, each
+    slot's bucket runs as a parallel pipeline on that slot's
+    connection, results merged back into input order. Per-command
+    results; partial success is the norm.
+  - **Atomic** (`~atomic:true`): all keys must hash to one slot
+    (client-side CROSSSLOT validation). Sends a single
+    `WATCH` / `MULTI` / commands / `EXEC` burst on the slot's
+    primary. Returns `Ok (Some results)` on commit, `Ok None` on
+    WATCH abort.
+- Per-entry result variant:
+  - `One of (Resp3.t, Error.t) result` — single-target commands.
+  - `Many of (node_id * result) list` — fan-out commands
+    (SCRIPT LOAD, FLUSHALL, CLUSTER NODES, …), matching
+    `Client.exec_multi`.
+- Fan-out commands are rejected at `Batch.queue` time in atomic
+  mode (`Batch.Fan_out_in_atomic_batch` structured error). They
+  route through `exec_multi` in non-atomic mode.
+- Wall-clock `?timeout` applies to the whole batch; commands that
+  don't complete in the window come back as `One (Error Timeout)`;
+  completed ones keep their real reply. Typed helpers collapse
+  any timeout into a whole-call error.
+- Typed cluster helpers under `Valkey.Batch`:
+  - `mget_cluster` — `(key, value option) list` in input order.
+  - `mset_cluster` — per-slot atomic, cross-slot interleaved.
+  - `del_cluster` / `unlink_cluster` — sum of per-slot removal counts.
+  - `exists_cluster` — sum of existence hits (duplicates count
+    separately, matching server semantics).
+  - `touch_cluster` — sum of keys whose last-access was bumped.
+- `examples/10-batch/` — three runnable programs: `bulk.ml`
+  (1000-key mset/mget/del + perf comparison with per-key loop),
+  `scatter.ml` (heterogeneous non-atomic batch), `atomic_counters.ml`
+  (SET NX + INCR + INCR + GET pinned via hashtag in atomic mode).
+- `docs/batch.md` — concept, atomic vs non-atomic semantics,
+  timeout, ordering, typed helpers, WATCH caveat.
+
+### Known limitations
+
+- `Batch.create ~watch:...` sends `WATCH` at `run` time alongside
+  `MULTI`, not at `create` time. That protects only the
+  submillisecond window between `WATCH` and `EXEC` — useless for
+  the classic "read value, decide, commit-if-unchanged" pattern
+  where `WATCH` needs to fire before the read. Use `Transaction`
+  today for that pattern; a future version of `Batch` will add a
+  separate `Batch.watch` call that sends `WATCH` immediately.
+- `pfcount_cluster` is intentionally not provided — summing
+  per-slot `PFCOUNT` values over-counts union cardinality when
+  the same element appears in HLLs spread across slots.
+- Concurrent atomic batches on the **same** router share per-slot
+  connections and their `MULTI` calls interleave. Workaround
+  today: one atomic batch per router, or wait for the Phase 9
+  connection-pool layer.
+
 ## [0.1.0] — 2026-04-20
 
 First public release. The repo's been incubating for a few weeks

@@ -1,0 +1,3 @@
+(executables
+ (names bulk scatter atomic_counters)
+ (libraries valkey eio_main))

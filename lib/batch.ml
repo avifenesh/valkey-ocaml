@@ -303,14 +303,17 @@ let mset_cluster ?timeout client kvs =
         results;
       (match !err with Some e -> Error e | None -> Ok ())
 
-let del_cluster ?timeout client keys =
+(* Shared shape: issue [CMD k] per key, sum the integer replies,
+   propagate the first error encountered. Used by DEL / UNLINK /
+   EXISTS / TOUCH. *)
+let per_key_sum ?timeout ~cmd client keys =
   let b = create () in
   List.iter
-    (fun k -> let _ = queue b [| "DEL"; k |] in ())
+    (fun k -> let _ = queue b [| cmd; k |] in ())
     keys;
   match run ?timeout client b with
   | Error e -> Error e
-  | Ok None -> Error (protocol_violation "del_cluster" Resp3.Null)
+  | Ok None -> Error (protocol_violation (cmd ^ "_cluster") Resp3.Null)
   | Ok (Some results) ->
       let total = ref 0 in
       let err = ref None in
@@ -319,9 +322,20 @@ let del_cluster ?timeout client keys =
           | One (Ok (Resp3.Integer n)) ->
               total := !total + Int64.to_int n
           | One (Ok v) ->
-              if !err = None then
-                err := Some (protocol_violation "DEL" v)
+              if !err = None then err := Some (protocol_violation cmd v)
           | One (Error e) -> if !err = None then err := Some e
           | Many _ -> ())
         results;
       (match !err with Some e -> Error e | None -> Ok !total)
+
+let del_cluster ?timeout client keys =
+  per_key_sum ?timeout ~cmd:"DEL" client keys
+
+let unlink_cluster ?timeout client keys =
+  per_key_sum ?timeout ~cmd:"UNLINK" client keys
+
+let exists_cluster ?timeout client keys =
+  per_key_sum ?timeout ~cmd:"EXISTS" client keys
+
+let touch_cluster ?timeout client keys =
+  per_key_sum ?timeout ~cmd:"TOUCH" client keys

@@ -427,7 +427,26 @@ be complete enough to use).
 
 ---
 
-## Phase 7 — Batch + cluster-aware commands
+## Phase 7 — Batch + cluster-aware commands ✅ done (0.2)
+
+**Shipped.** `Valkey.Batch` primitive with non-atomic (scatter-
+gather) and atomic (`WATCH`/`MULTI`/`EXEC`) modes selected by a
+flag. Typed cluster helpers (`mget_cluster`, `mset_cluster`,
+`del_cluster`, `unlink_cluster`, `exists_cluster`,
+`touch_cluster`). `examples/10-batch/` plus `docs/batch.md`.
+
+Deferred to 0.3:
+  - `Batch.watch client ~keys` for classic WATCH semantics
+    (today `~watch:` at `create` only covers the WATCH→EXEC
+    microsecond window — use `Transaction` for now).
+  - `pfcount_cluster` — needs HLL merge support, not a simple
+    sum; sum over-counts across slots.
+  - Fold `Transaction` into a facade over `Batch ~atomic:true`.
+  - Concurrent atomic batches on one router — requires a
+    connection-pool layer (Phase 9) to avoid MULTI interleaving
+    on the shared pinned connection.
+
+
 
 **Goal.** `Client.mget client ["a";"b";"c"]` just works in cluster
 mode — the library splits by slot, fans out in parallel, merges
