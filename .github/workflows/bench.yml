@@ -36,6 +36,9 @@ jobs:
       - name: Install opam deps
         run: opam install . --deps-only --with-test --yes
 
+      - name: Generate TLS dev certs
+        run: bash scripts/gen-tls-certs.sh
+
       - name: Start standalone Valkey
         run: |
           docker compose up -d
