@@ -9,6 +9,10 @@ concurrency:
   group: fuzz-nightly
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  issues: write           # auto-file an issue on a fuzz failure
+
 jobs:
   parser-fuzz-deep:
     runs-on: ubuntu-latest

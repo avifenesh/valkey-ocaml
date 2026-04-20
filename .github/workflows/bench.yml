@@ -10,6 +10,10 @@ concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write          # PR comment + bench-history branch push
+  pull-requests: write     # PR comment via actions/github-script
+
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -36,7 +40,7 @@ jobs:
         run: |
           docker compose up -d
           for i in $(seq 1 30); do
-            if docker compose exec -T valkey-dev valkey-cli -p 6379 PING 2>/dev/null | grep -q PONG; then
+            if docker compose exec -T valkey valkey-cli -p 6379 PING 2>/dev/null | grep -q PONG; then
               echo "up"; break
             fi
             sleep 1

@@ -43,7 +43,7 @@ jobs:
         run: |
           docker compose up -d
           for i in $(seq 1 30); do
-            if docker compose exec -T valkey-dev valkey-cli -p 6379 PING 2>/dev/null | grep -q PONG; then
+            if docker compose exec -T valkey valkey-cli -p 6379 PING 2>/dev/null | grep -q PONG; then
               echo "standalone up"
               break
             fi
