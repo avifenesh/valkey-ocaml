@@ -14,7 +14,9 @@ Existing OCaml Redis clients (notably `ocaml-redis`) are Lwt/Async-era, RESP2-on
 We do this for the love of software and fun. All other considerations are secondary, **except** when other people's businesses or feelings are involved — then that becomes the primary value and we re-assess.
 
 ### 2. We own everything — no dismissals
-Never describe an issue as "pre-existing," "out of scope," "minor," or "skippable." Everything in this repo is ours. If we find a bug, dead code, bad doc, flaky test, or sloppy error path — we fix it or clearly track it for fixing. We take responsibility.
+Never describe an issue as "pre-existing," "out of scope," "minor," "unrelated to my changes," or "skippable." There is no upstream to blame and no other team to punt to. Everything in this repo is ours. If we find a bug, dead code, bad doc, flaky test, a suite that hangs when many tests run together, or a sloppy error path — we root-cause it and fix it, or we file it and work it. We take responsibility.
+
+If a symptom surfaces while you're working on something else, that is not a reason to ignore it; it's a reason you noticed it first. Stop, debug, fix — same session if small, tracked explicitly if large. "Appears only in some configurations" is an investigation hook, not a reason to close the ticket.
 
 ### 3. Learning pace, not production pace (early sessions)
 Every new OCaml, Eio, or ecosystem concept is explained before it's used. Pace is deliberately slow so Avi actually learns and enjoys the language. Small working snippets over grand designs. No "just trust me" code.

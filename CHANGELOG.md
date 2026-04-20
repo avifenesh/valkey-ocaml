@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Batch.watch (read-modify-write CAS)
+
+- `Valkey.Batch.with_watch` — scoped WATCH guard for the classic
+  optimistic-concurrency pattern. Sends `WATCH` immediately, holds
+  the watched primary's atomic mutex across the closure, and
+  guarantees `UNWATCH` + mutex release on any exit (commit,
+  abort, or exception).
+- `Valkey.Batch.watch` / `run_with_guard` / `release_guard` —
+  lower-level pieces for callers that need explicit lifetime
+  control. `run_with_guard` issues `MULTI`/queued/`EXEC` on the
+  guard's connection, returning `Ok (Some _)` on commit,
+  `Ok None` if a watched key was modified, `Error _` on
+  transport failure. Empty batch under guard sends `UNWATCH` and
+  returns `Ok (Some [||])` — clean abort path for "no write
+  needed" decisions.
+- Watched keys must hash to one slot (client-side CROSSSLOT
+  validation before any I/O). Pass `~hint_key` to override.
+- Closes the long-standing limitation noted in the previous entry
+  ("`Batch.create ~watch:` is effectively useless"). Legacy
+  `~watch:` on `Batch.create` still exists but is documented as
+  paranoia padding; real CAS goes through the guard API.
+
 ### Added — Phase 7 (batch + cluster-aware commands)
 
 - `Valkey.Batch` — scatter-gather batch primitive. One module,
@@ -66,13 +88,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known limitations
 
-- `Batch.create ~watch:...` sends `WATCH` at `run` time alongside
-  `MULTI`, not at `create` time. That protects only the
-  submillisecond window between `WATCH` and `EXEC` — useless for
-  the classic "read value, decide, commit-if-unchanged" pattern
-  where `WATCH` needs to fire before the read. Use `Transaction`
-  today for that pattern; a future version of `Batch` will add a
-  separate `Batch.watch` call that sends `WATCH` immediately.
 - `pfcount_cluster` is intentionally not provided — summing
   per-slot `PFCOUNT` values over-counts union cardinality when
   the same element appears in HLLs spread across slots.

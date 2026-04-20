@@ -66,23 +66,97 @@ match Valkey.Batch.run client b with
 | Error e -> (* transport / protocol failure *)
 ```
 
-## WATCH caveat
+## WATCH guards (read-modify-write)
 
-`Batch.create` accepts a `~watch` list, but in the current
-buffered model `WATCH` is sent at `run` time alongside `MULTI`,
-so it only protects the submillisecond window between `WATCH`
-and `EXEC`. The classic optimistic-concurrency pattern
-(`WATCH` → read → decide → `EXEC`) needs `WATCH` to fire
-**before** the read, which buffered atomic `Batch` doesn't
-currently support.
+For the classic optimistic-concurrency pattern — *read, decide,
+commit, retry on conflict* — use `Batch.with_watch`:
 
-**Use [`Transaction`](transactions.md) for `WATCH` today.** Its
-eager model issues `WATCH` at `begin_`, giving you a real window
-to read + compute before `exec`.
+```ocaml
+let rec bump_counter client k =
+  let outcome =
+    Valkey.Batch.with_watch client [ k ] (fun guard ->
+      let cur =
+        match Valkey.Client.get client k with
+        | Ok (Some s) -> int_of_string s
+        | _ -> 0
+      in
+      let b =
+        Valkey.Batch.create ~atomic:true ~hint_key:k ()
+      in
+      let _ =
+        Valkey.Batch.queue b
+          [| "SET"; k; string_of_int (cur + 1) |]
+      in
+      Valkey.Batch.run_with_guard b guard)
+  in
+  match outcome with
+  | Ok (Ok (Some _))  -> `Committed
+  | Ok (Ok None)      -> bump_counter client k   (* retry *)
+  | Ok (Error e)      -> `Failed e
+  | Error e           -> `Failed e
+```
 
-A future version of `Batch` will add a separate
-`Batch.watch client ~keys` call that sends `WATCH` immediately,
-restoring the familiar semantics to the buffered API.
+`with_watch` sends `WATCH` immediately (so the server is already
+tracking the keys when you read), holds the watched primary's
+atomic mutex across the closure (so other atomic ops on that
+primary serialise behind you, but non-atomic traffic still
+multiplexes), and runs `MULTI`/queued commands/`EXEC` when you
+call `run_with_guard`. On commit, `EXEC` implicitly clears the
+watch state on the server (per the spec); on closure-exit
+without `run_with_guard`, an `UNWATCH` is sent and the mutex is
+released.
+
+If you need explicit lifetime control (e.g. interleave with code
+that mustn't be inside a closure), use the lower-level pieces:
+
+```ocaml
+match Valkey.Batch.watch client [ "user:{42}:counter" ] with
+| Error e -> ...
+| Ok guard ->
+    (* read, compute *)
+    let b =
+      Valkey.Batch.create ~atomic:true
+        ~hint_key:"user:{42}:counter" ()
+    in
+    let _ = Valkey.Batch.queue b [| "INCR"; "user:{42}:counter" |] in
+    (match Valkey.Batch.run_with_guard b guard with
+     | Ok (Some _) -> `Committed
+     | Ok None     -> `Aborted
+     | Error e     -> `Failed e)
+    (* On the early-return paths above the guard is already
+       released. If you bail out before run_with_guard, call
+       Batch.release_guard manually to UNWATCH and unlock. *)
+```
+
+A few rules baked in:
+
+- **All watched keys must hash to one slot** (cluster). Mismatch
+  surfaces as `Server_error { code = "CROSSSLOT"; … }` from
+  `watch` itself — no I/O is sent. Pass `~hint_key` to override
+  the slot.
+- **The mutex isn't reentrant.** Don't open a second atomic op
+  (Transaction, atomic Batch, nested `with_watch`) on the same
+  slot inside the closure.
+- **Reads inside the guard window must reach the watched primary
+  on the same connection** for `WATCH` to see them. The router
+  pins by slot automatically when `target` / `read_from` aren't
+  overridden.
+- **Empty batch under guard** is a no-op: `UNWATCH` is sent and
+  `Ok (Some [||])` returned. Use this to abort cleanly when your
+  read says "no write needed."
+
+### Legacy `~watch:` on `Batch.create`
+
+`Batch.create ~watch:[...]` still exists but is largely useless
+in the buffered model — `WATCH` is sent inside the same wire
+batch as `MULTI`, protecting only the submillisecond window
+before `EXEC`. Treat it as paranoia padding; the real CAS API
+is `with_watch`/`run_with_guard` above.
+
+[`Transaction`](transactions.md) (eager MULTI/EXEC, server-side
+per-command validation) also remains supported and works the
+same way it always has — its `~watch:` happens at `begin_` time
+on a pinned connection.
 
 ## Typed helpers
 

@@ -20,11 +20,12 @@ let standalone_reachable () =
   try
     Eio_main.run @@ fun env ->
     Eio.Switch.run @@ fun sw ->
-    let _ =
+    let c =
       C.connect ~sw
         ~net:(Eio.Stdenv.net env) ~clock:(Eio.Stdenv.clock env)
         ~host:"localhost" ~port:6379 ()
     in
+    C.close c;
     true
   with _ -> false
 

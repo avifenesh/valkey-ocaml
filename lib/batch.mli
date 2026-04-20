@@ -106,7 +106,97 @@ val run :
     [run] time if any queued command's key doesn't hash to the
     pinned slot. [Transaction] continues to exist with its eager
     (server-side-queued) semantics; atomic [Batch] is the buffered
-    variant. A later version will fold them together. *)
+    variant. A later version will fold them together.
+
+    {2 A note on [~watch:] and the buffered model}
+
+    Passing [~watch:] to [create] sends the [WATCH] inside the
+    same wire batch as [MULTI], so the only window protected is
+    the submillisecond span between [WATCH] and [EXEC] — useful
+    for paranoia, useless for the classic "read, decide, then
+    commit" CAS pattern. Use {!watch} / {!run_with_guard} /
+    {!with_watch} below for that. *)
+
+(** {1 WATCH guards — read-modify-write CAS}
+
+    A {!guard} is a live, server-side [WATCH] held open while the
+    caller reads, decides, builds a batch, and finally commits.
+    The guard pins a connection to the slot of the watched keys
+    and holds that primary's atomic mutex (see
+    {!Client.atomic_lock_for_slot}) for its lifetime, so other
+    atomic ops on the same primary serialise behind it; non-atomic
+    pipeline traffic is unaffected.
+
+    Typical use:
+    {[
+      Batch.with_watch client ["counter"] (fun guard ->
+        match Client.get client "counter" with
+        | Ok (Some s) ->
+          let n = int_of_string s in
+          let b = Batch.create ~atomic:true ~hint_key:"counter" () in
+          ignore (Batch.queue b [| "SET"; "counter"; string_of_int (n+1) |]);
+          (match Batch.run_with_guard b guard with
+           | Ok (Some _) -> `Committed
+           | Ok None     -> `Aborted_retry
+           | Error e     -> `Failed e)
+        | _ -> `Empty)
+    ]}
+
+    Caveats:
+    - All watched keys must hash to the same slot (cluster). Pass
+      [hint_key] to override; mismatching keys return CROSSSLOT.
+    - Reads inside the guard window must reach the watched
+      primary on the {i same connection}. The router pins by slot
+      automatically when [target] / [read_from] aren't overridden.
+    - The mutex is non-reentrant: don't open a second atomic
+      operation on the same slot inside the closure.
+    - On exception the guard is released (UNWATCH + mutex unlock),
+      not committed. *)
+
+type guard
+
+val watch :
+  ?hint_key:string ->
+  Client.t -> string list ->
+  (guard, Connection.Error.t) result
+(** Open a WATCH guard. Resolves the slot from [hint_key] (if
+    given) or from the first watched key, validates every other
+    watched key hashes to the same slot, acquires the primary's
+    atomic mutex, then sends [WATCH k1 k2 …] on the pinned
+    connection. Caller must eventually call {!run_with_guard} or
+    {!release_guard}; {!with_watch} handles the release for you. *)
+
+val run_with_guard :
+  ?timeout:float ->
+  t -> guard ->
+  (batch_entry_result array option, Connection.Error.t) result
+(** Commit an atomic batch under an open guard. Sends [MULTI],
+    every queued command, [EXEC] on the guard's connection, then
+    releases the guard (mutex unlock; EXEC implicitly clears
+    WATCH on the server). Returns:
+    - [Ok (Some results)] — committed, one [One reply] per
+      queued command in order.
+    - [Ok None] — a watched key was modified between {!watch}
+      and EXEC; caller retries the read-modify-write loop.
+    - [Error _] — transport / protocol failure; outcome unknown.
+
+    Errors before commit (non-atomic batch, slot mismatch with
+    guard, queued key in wrong slot) release the guard and return
+    [Error]. An empty batch is treated as "user decided not to
+    write": UNWATCH is sent and [Ok (Some [||])] returned. *)
+
+val release_guard : guard -> unit
+(** Send UNWATCH and release the guard's mutex. Idempotent —
+    safe to call after {!run_with_guard} has already released. *)
+
+val with_watch :
+  ?hint_key:string ->
+  Client.t -> string list ->
+  (guard -> 'a) -> ('a, Connection.Error.t) result
+(** Scoped WATCH guard. Opens the guard, runs [f guard], and
+    releases (UNWATCH + mutex unlock) whether [f] returns
+    normally or raises. If [watch] itself fails, returns the
+    error and never calls [f]. *)
 
 (** {1 Cluster-aware typed helpers}
 

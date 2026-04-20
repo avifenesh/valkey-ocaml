@@ -8,12 +8,10 @@
    [Router.atomic_lock_for_slot]. See [test/test_batch.ml]'s
    [test_atomic_concurrent] for a functional exercise.
 
-   WATCH is not shown here: [Batch.create ~watch] sends WATCH at
-   [run] time alongside MULTI, which gives a submillisecond
-   protection window and isn't the classic "read, decide, commit"
-   flow. Use [Transaction] today for that pattern; a future
-   [Batch.watch] call will restore the familiar semantics to the
-   buffered API. *)
+   WATCH isn't shown here because this path doesn't need CAS.
+   For read-modify-write see [cas_with_watch.ml] in this same
+   directory, which uses [Batch.with_watch] to open a real guard
+   across the read + EXEC window. *)
 
 module B = Valkey.Batch
 module C = Valkey.Client

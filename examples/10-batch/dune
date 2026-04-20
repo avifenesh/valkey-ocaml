@@ -1,3 +1,3 @@
 (executables
- (names bulk scatter atomic_counters)
+ (names bulk scatter atomic_counters cas_with_watch)
  (libraries valkey eio_main))

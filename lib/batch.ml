@@ -251,6 +251,160 @@ let run ?timeout client t =
   if t.atomic then run_atomic ?timeout client t
   else run_non_atomic ?timeout client t
 
+(* ---------- WATCH guards ---------- *)
+
+type guard = {
+  conn : Connection.t;
+  pinned_slot : int;
+  atomic_lock : Eio.Mutex.t;
+  mutable released : bool;
+}
+
+(* All watched keys must share a slot (cluster). Either resolve
+   from [hint_key] and verify each watch key matches it, or pick
+   the first watch key's slot and verify the rest. *)
+let resolve_watch_slot ~hint_key keys =
+  match hint_key, keys with
+  | _, [] ->
+      Error
+        (Connection.Error.Terminal
+           "Batch.watch: at least one key required")
+  | Some hk, _ ->
+      let s = Slot.of_key hk in
+      (match List.find_opt (fun k -> Slot.of_key k <> s) keys with
+       | None -> Ok s
+       | Some k ->
+           Error
+             (Connection.Error.Server_error
+                { code = "CROSSSLOT";
+                  message =
+                    Printf.sprintf
+                      "Batch.watch: hint_key %S hashes to slot %d \
+                       but watched key %S hashes to slot %d"
+                      hk s k (Slot.of_key k) }))
+  | None, k0 :: rest ->
+      let s = Slot.of_key k0 in
+      (match List.find_opt (fun k -> Slot.of_key k <> s) rest with
+       | None -> Ok s
+       | Some k ->
+           Error
+             (Connection.Error.Server_error
+                { code = "CROSSSLOT";
+                  message =
+                    Printf.sprintf
+                      "Batch.watch: keys %S and %S hash to \
+                       different slots (%d vs %d) — all watched \
+                       keys must share a slot"
+                      k0 k s (Slot.of_key k) }))
+
+let watch ?hint_key client keys =
+  match resolve_watch_slot ~hint_key keys with
+  | Error e -> Error e
+  | Ok slot ->
+      (match Client.connection_for_slot client slot with
+       | None ->
+           Error
+             (Connection.Error.Terminal
+                (Printf.sprintf
+                   "Batch.watch: no live connection for slot %d"
+                   slot))
+       | Some conn ->
+           let mutex = Client.atomic_lock_for_slot client slot in
+           Eio.Mutex.lock mutex;
+           let g = {
+             conn; pinned_slot = slot;
+             atomic_lock = mutex; released = false;
+           } in
+           let args = Array.of_list ("WATCH" :: keys) in
+           (match request_ok conn args with
+            | Error e ->
+                g.released <- true;
+                Eio.Mutex.unlock mutex;
+                Error e
+            | Ok () -> Ok g))
+
+let release_guard g =
+  if not g.released then begin
+    g.released <- true;
+    (* Best-effort UNWATCH; ignore errors — we're tearing down
+       anyway and the next command on this connection won't have
+       stale WATCH state once the server reset it on disconnect
+       in the worst case. *)
+    let _ = Connection.request g.conn [| "UNWATCH" |] in
+    Eio.Mutex.unlock g.atomic_lock
+  end
+
+let run_with_guard ?timeout:_ t g =
+  if g.released then
+    Error
+      (Connection.Error.Terminal
+         "Batch.run_with_guard: guard already released")
+  else if not t.atomic then begin
+    release_guard g;
+    Error
+      (Connection.Error.Terminal
+         "Batch.run_with_guard: guard requires an atomic batch \
+          (create with ~atomic:true)")
+  end
+  else begin
+    let queued = List.rev t.queued in
+    let expected_n = t.count in
+    let slot_check =
+      if expected_n = 0 then Ok g.pinned_slot
+      else
+        match atomic_slot t with
+        | Error e -> Error e
+        | Ok s ->
+            if s <> g.pinned_slot then
+              Error
+                (Connection.Error.Server_error
+                   { code = "CROSSSLOT";
+                     message =
+                       Printf.sprintf
+                         "Batch.run_with_guard: batch pinned to \
+                          slot %d but guard watches slot %d"
+                         s g.pinned_slot })
+            else Ok s
+    in
+    match slot_check with
+    | Error e -> release_guard g; Error e
+    | Ok slot ->
+        match validate_same_slot ~slot queued with
+        | Error e -> release_guard g; Error e
+        | Ok () ->
+            let conn = g.conn in
+            let result =
+              if expected_n = 0 then begin
+                (* Empty batch under guard: user looked, decided
+                   no write needed. UNWATCH and return []. *)
+                let _ = Connection.request conn [| "UNWATCH" |] in
+                Ok (Some [||])
+              end else
+                match request_ok conn [| "MULTI" |] with
+                | Error e -> Error e
+                | Ok () ->
+                    queue_all conn queued;
+                    (match Connection.request conn [| "EXEC" |] with
+                     | Error e -> Error e
+                     | Ok v -> decode_exec_reply ~expected_n v)
+            in
+            (* EXEC implicitly clears WATCH on the server. The
+               empty-batch path already sent UNWATCH. Either way
+               there's nothing left to UNWATCH; just drop the
+               mutex without re-sending. *)
+            g.released <- true;
+            Eio.Mutex.unlock g.atomic_lock;
+            result
+  end
+
+let with_watch ?hint_key client keys f =
+  match watch ?hint_key client keys with
+  | Error e -> Error e
+  | Ok g ->
+      Fun.protect
+        ~finally:(fun () -> release_guard g)
+        (fun () -> Ok (f g))
+
 (* ---- typed cluster helpers ---- *)
 
 let protocol_violation cmd v =

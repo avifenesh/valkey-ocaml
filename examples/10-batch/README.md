@@ -1,12 +1,13 @@
-# 10-batch — cluster-aware batches (atomic + scatter)
+# 10-batch — cluster-aware batches (atomic + scatter + CAS)
 
-Three programs demonstrating the `Batch` primitive end-to-end.
+Four programs demonstrating the `Batch` primitive end-to-end.
 
 | File | Demonstrates |
 |---|---|
 | [bulk.ml](bulk.ml) | `mset_cluster` / `mget_cluster` / `del_cluster` over 1000 keys; side-by-side with a per-key loop so the speedup is visible |
 | [scatter.ml](scatter.ml) | heterogeneous non-atomic batch (SET / INCR / HSET / GET) across slots, showing the `batch_entry_result` sum |
 | [atomic_counters.ml](atomic_counters.ml) | `~atomic:true` commit: SET NX + INCR + INCR + GET pinned to one slot via hashtag |
+| [cas_with_watch.ml](cas_with_watch.ml) | `Batch.with_watch` — two fibers race to increment the same counter; conflicting EXEC returns `Ok None` and retries |
 
 ## Run
 
@@ -19,6 +20,7 @@ docker compose -f docker-compose.cluster.yml up -d
 dune exec examples/10-batch/bulk.exe
 dune exec examples/10-batch/scatter.exe
 dune exec examples/10-batch/atomic_counters.exe
+dune exec examples/10-batch/cas_with_watch.exe
 ```
 
 ## Notes
@@ -42,9 +44,21 @@ dune exec examples/10-batch/atomic_counters.exe
 
 - **`atomic_counters.ml`** uses the `{demo}` hashtag to pin the
   key to one slot — required for atomic mode. It demonstrates
-  the commit path only; WATCH-based optimistic concurrency needs
-  the eager `Transaction` module today — see
-  [docs/batch.md](../../docs/batch.md#watch-caveat) for why.
+  the commit path only; for optimistic-concurrency CAS see
+  `cas_with_watch.ml`.
+
+- **`cas_with_watch.ml`** runs two fibers in parallel, each
+  looping 50 read-modify-write rounds against one counter. The
+  guard's per-primary mutex means atomic commits serialise on
+  the primary, but the reads and actual `SET`s that fire outside
+  other guards race and can trip `WATCH`. The retry loop absorbs
+  those `Ok None` replies; the final counter lands at exactly
+  `2 * rounds`. Expected output on a local cluster:
+  ```
+  fiber A: 50-60 commit attempts (incl. retries)
+  fiber B: 50-60 commit attempts (incl. retries)
+  final counter value: 100 (expected 100)
+  ```
 
 ## See also
 

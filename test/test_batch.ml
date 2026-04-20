@@ -199,27 +199,12 @@ let test_atomic_crossslot_detected () =
          | Ok _ -> "Ok"
          | Error e -> Format.asprintf "Error %a" err_pp e)
 
-(* WATCH abort: open a second mutation path for the key between
-   [queue] and [run]; EXEC returns Null → [Ok None]. *)
-let test_atomic_watch_abort () =
-  with_cluster_client @@ fun client ->
-  let k = "watch:{wa}" in
-  let _ = C.set client k "v0" in
-
-  let b = B.create ~atomic:true ~hint_key:k ~watch:[ k ] () in
-  let _ = B.queue b [| "SET"; k; "v-attempted" |] in
-
-  let _ = C.set client k "v-rival" in
-
-  (match B.run client b with
-   | Ok None -> ()
-   | Ok (Some _) ->
-       Alcotest.fail "expected WATCH abort but batch committed"
-   | Error e ->
-       Alcotest.failf "unexpected error: %a" err_pp e);
-
-  let _ = C.del client [ k ] in
-  ()
+(* The buffered-atomic [Batch.create ~watch:] cannot reliably
+   demonstrate a WATCH abort: WATCH, MULTI, and EXEC are sent
+   back-to-back on one connection with no user code in between,
+   so there's no window for a rival fiber to dirty the watched
+   key. That's the known limitation — real CAS goes through the
+   guard API, exercised by [test_watch_guard_aborts_on_rival]. *)
 
 (* Before the per-primary atomic-lock: two fibers running atomic
    batches through the same router would step on each other's
@@ -255,6 +240,166 @@ let test_atomic_concurrent () =
   let _ = C.del client [ a_key; b_key; a_key ^ ":ctr"; b_key ^ ":ctr" ] in
   ()
 
+(* WATCH guard happy path: with_watch opens WATCH, the closure
+   reads, builds an atomic batch with the new value, and
+   run_with_guard commits. *)
+let test_watch_guard_commits () =
+  with_cluster_client @@ fun client ->
+  let k = "wg:counter:{wg}" in
+  let _ = C.set client k "10" in
+
+  let outcome =
+    B.with_watch client [ k ] (fun guard ->
+      let cur =
+        match C.get client k with
+        | Ok (Some s) -> int_of_string s
+        | _ -> Alcotest.fail "GET counter under guard"
+      in
+      let b = B.create ~atomic:true ~hint_key:k () in
+      let _ = B.queue b [| "SET"; k; string_of_int (cur + 1) |] in
+      B.run_with_guard b guard)
+  in
+  (match outcome with
+   | Ok (Ok (Some _)) -> ()
+   | Ok (Ok None) -> Alcotest.fail "unexpected WATCH abort (no rival)"
+   | Ok (Error e) -> Alcotest.failf "run_with_guard: %a" err_pp e
+   | Error e -> Alcotest.failf "with_watch setup: %a" err_pp e);
+
+  (match C.get client k with
+   | Ok (Some "11") -> ()
+   | Ok v ->
+       Alcotest.failf "expected 11; got %s"
+         (match v with Some s -> s | None -> "<nil>")
+   | Error e -> Alcotest.failf "post-commit GET: %a" err_pp e);
+
+  let _ = C.del client [ k ] in
+  ()
+
+(* WATCH guard abort path: rival mutation between watch() and EXEC
+   makes EXEC return Null → run_with_guard returns Ok None. The
+   caller can then retry the read-modify-write loop. *)
+let test_watch_guard_aborts_on_rival () =
+  with_cluster_client @@ fun client ->
+  let k = "wg:race:{wg}" in
+  let _ = C.set client k "v0" in
+
+  let outcome =
+    B.with_watch client [ k ] (fun guard ->
+      (* Read inside guard so we'd notice the rival *)
+      let _ = C.get client k in
+      (* Rival mutates the key while we hold the guard.
+         The mutex allows non-atomic traffic, so this SET goes
+         through on the same primary connection and bumps the
+         server-side WATCH dirty flag. *)
+      let _ = C.set client k "v-rival" in
+      let b = B.create ~atomic:true ~hint_key:k () in
+      let _ = B.queue b [| "SET"; k; "v-attempted" |] in
+      B.run_with_guard b guard)
+  in
+  (match outcome with
+   | Ok (Ok None) -> ()
+   | Ok (Ok (Some _)) ->
+       Alcotest.fail "expected WATCH abort but batch committed"
+   | Ok (Error e) -> Alcotest.failf "run_with_guard: %a" err_pp e
+   | Error e -> Alcotest.failf "with_watch setup: %a" err_pp e);
+
+  (* Verify rival's value won. *)
+  (match C.get client k with
+   | Ok (Some "v-rival") -> ()
+   | Ok v ->
+       Alcotest.failf "expected v-rival; got %s"
+         (match v with Some s -> s | None -> "<nil>")
+   | Error e -> Alcotest.failf "post-abort GET: %a" err_pp e);
+
+  let _ = C.del client [ k ] in
+  ()
+
+(* with_watch must release the guard even if the closure raises.
+   After the exception bubbles out, a new with_watch on the same
+   primary must be able to acquire the mutex (no deadlock) and
+   issue commands cleanly. *)
+let test_watch_guard_released_on_exception () =
+  with_cluster_client @@ fun client ->
+  let k = "wg:exn:{wg}" in
+  let _ = C.set client k "before" in
+
+  let raised =
+    try
+      let _ =
+        B.with_watch client [ k ] (fun _g ->
+          failwith "user-code crashed")
+      in
+      false
+    with Failure _ -> true
+  in
+  Alcotest.(check bool) "exception propagated" true raised;
+
+  (* If the mutex leaked, this second with_watch would deadlock or
+     time out; if WATCH state leaked, the caller's atomic batch
+     might fail at EXEC time. Both negative paths are covered by
+     the second cycle completing successfully. *)
+  let outcome =
+    B.with_watch client [ k ] (fun guard ->
+      let b = B.create ~atomic:true ~hint_key:k () in
+      let _ = B.queue b [| "SET"; k; "after" |] in
+      B.run_with_guard b guard)
+  in
+  (match outcome with
+   | Ok (Ok (Some _)) -> ()
+   | _ -> Alcotest.fail "second with_watch failed; mutex leaked?");
+
+  (match C.get client k with
+   | Ok (Some "after") -> ()
+   | _ -> Alcotest.fail "expected 'after' after recovery commit");
+
+  let _ = C.del client [ k ] in
+  ()
+
+(* CROSSSLOT validation happens in [watch] before any wire I/O,
+   keeping a misuse from acquiring a mutex that would never be
+   released. *)
+let test_watch_crossslot_rejected () =
+  with_cluster_client @@ fun client ->
+  let outcome =
+    B.with_watch client [ "{slot-a}x"; "{slot-b}y" ] (fun _g ->
+      Alcotest.fail "closure should not run on CROSSSLOT keys")
+  in
+  match outcome with
+  | Error (E.Server_error { code = "CROSSSLOT"; _ }) -> ()
+  | r ->
+      Alcotest.failf "expected CROSSSLOT; got %s"
+        (match r with
+         | Ok _ -> "Ok"
+         | Error e -> Format.asprintf "Error %a" err_pp e)
+
+(* Empty batch under guard is treated as "no write needed":
+   UNWATCH is sent and Ok (Some [||]) returned. *)
+let test_watch_empty_batch_is_noop () =
+  with_cluster_client @@ fun client ->
+  let k = "wg:empty:{wg}" in
+  let _ = C.set client k "untouched" in
+  let outcome =
+    B.with_watch client [ k ] (fun guard ->
+      let b = B.create ~atomic:true ~hint_key:k () in
+      B.run_with_guard b guard)
+  in
+  (match outcome with
+   | Ok (Ok (Some [||])) -> ()
+   | Ok (Ok (Some arr)) ->
+       Alcotest.failf "expected empty array; got %d entries"
+         (Array.length arr)
+   | Ok (Ok None) -> Alcotest.fail "unexpected WATCH abort"
+   | Ok (Error e) -> Alcotest.failf "run_with_guard: %a" err_pp e
+   | Error e -> Alcotest.failf "with_watch setup: %a" err_pp e);
+
+  (* And the key is unchanged. *)
+  (match C.get client k with
+   | Ok (Some "untouched") -> ()
+   | _ -> Alcotest.fail "key was modified by an empty batch?!");
+
+  let _ = C.del client [ k ] in
+  ()
+
 let skip_placeholder name () =
   Printf.printf
     "[skipped] %s (cluster unreachable; docker-compose.cluster.yml)\n%!"
@@ -276,7 +421,16 @@ let tests =
     tc "atomic batch commits (SET / INCR / GET)" test_atomic_commits;
     tc "atomic batch CROSSSLOT detected at run time"
       test_atomic_crossslot_detected;
-    tc "atomic batch WATCH abort returns Ok None" test_atomic_watch_abort;
     tc "concurrent atomic batches on same router both commit"
       test_atomic_concurrent;
+    tc "watch guard: read-modify-write commits"
+      test_watch_guard_commits;
+    tc "watch guard: rival mutation aborts run_with_guard"
+      test_watch_guard_aborts_on_rival;
+    tc "with_watch releases guard on closure exception"
+      test_watch_guard_released_on_exception;
+    tc "watch rejects cross-slot key set"
+      test_watch_crossslot_rejected;
+    tc "watch guard: empty batch sends UNWATCH and returns []"
+      test_watch_empty_batch_is_noop;
   ]
