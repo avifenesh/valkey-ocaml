@@ -29,7 +29,7 @@ dune exec bin/bench/bench.exe -- \
   --ops "$OPS" --warmup "$WARMUP" --keys "$KEYS"
 
 printf '\n\033[1;32m>>> ocaml-redis (redis-sync, thread-per-conn, RESP2)\033[0m\n'
-dune exec bin/bench_redis/bench_redis.exe -- \
+WITH_BENCH_REDIS=1 dune exec bin/bench_redis/bench_redis.exe -- \
   --host "$HOST" --port "$PORT" \
   --ops "$OPS" --warmup "$WARMUP" --keys "$KEYS"
 

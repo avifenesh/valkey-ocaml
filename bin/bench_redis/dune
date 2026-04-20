@@ -1,9 +1,14 @@
 ; bench_redis compares us against the existing OCaml Redis client.
 ; redis-sync is intentionally not a project dependency — most users
-; don't need it. Build only when the library is available locally
-; (install it with `opam install redis-sync` if you want to run
-; the comparison via scripts/run-bench.sh).
+; don't need it. Build only when WITH_BENCH_REDIS=1 is set:
+;
+;   opam install redis-sync
+;   WITH_BENCH_REDIS=1 dune build bin/bench_redis/
+;
+; scripts/run-bench.sh already sets the env. Default builds (and CI)
+; skip this binary so the project doesn't carry redis-sync as a
+; transitive dependency.
 (executable
  (name bench_redis)
  (libraries redis-sync threads.posix)
- (enabled_if (= %{lib-available:redis-sync} true)))
+ (enabled_if (= %{env:WITH_BENCH_REDIS=0} 1)))
