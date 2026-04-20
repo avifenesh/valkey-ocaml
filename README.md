@@ -382,7 +382,7 @@ state:
 - ✅ Phase 3 — CI / CD + coverage + bench + nightly fuzz + docs
 - ✅ Phase 4 — documentation (9 guides + CONTRIBUTING + CHANGELOG)
 - ✅ Phase 5 — initial 9 examples + standing rule "ship features with their example"
-- ⏳ Phase 6 — publishing (0.1.0-alpha to opam)
+- ⏳ Phase 6 — publishing (0.1.0 to opam)
 - ⏳ Phases 7–12 — batch commands, client-side caching, connection
   pool, IAM + mTLS, module support, deep audit, 1.0.0 stable
 

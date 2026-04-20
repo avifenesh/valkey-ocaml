@@ -366,7 +366,7 @@ in accordingly.
 
 ## Phase 6 — Publishing / releasing
 
-**Goal.** `opam install valkey` works. A clear 1.0.0-alpha out in
+**Goal.** `opam install valkey` works. A first `0.1.0` is out in
 the wild. A public announcement lands.
 
 **Scope.**
@@ -383,14 +383,20 @@ the wild. A public announcement lands.
       (Phase 11). Released alongside or after 1.0.
   - `dune-project` pins lang + package metadata.
   - `dune build @install` + `opam-lint` pass clean.
-- **Versioning policy (SemVer):**
-  - `0.x.y` during alpha. Breaking changes allowed within 0.x.
+- **Versioning policy (SemVer, opam style):**
+  - Plain `0.x.y` while pre-stable — no `-alpha` / `-beta` suffix
+    needed; the leading zero already signals "API may change."
+    Matches Eio, Dune, Lwt, Mirage, and the rest of the opam
+    ecosystem.
+  - If a pre-release marker is ever needed, opam uses the tilde
+    syntax (`0.1.0~alpha1` sorts *before* `0.1.0`) — never the
+    npm-style `-alpha` hyphen suffix, which sorts the wrong way.
   - `1.0.0` when the public API is declared stable.
   - Deprecation: mark with `[@@deprecated]` for one minor version
     before removal. `CHANGELOG.md` notes it in both the deprecating
     release and the removing release.
 - **Release process:**
-  - GPG-signed annotated tag `v0.1.0-alpha`.
+  - GPG-signed annotated tag `v0.1.0`.
   - GitHub release with generated notes from `CHANGELOG.md`.
   - `opam publish` PR to `ocaml/opam-repository`.
   - Automate most of it via `scripts/release.sh`.
@@ -405,7 +411,7 @@ the wild. A public announcement lands.
 **Deliverables.**
 
 - Correct `valkey.opam` accepted into the opam-repository.
-- Git tag `v0.1.0-alpha` + GitHub release.
+- Git tag `v0.1.0` + GitHub release.
 - Announcement posted in ≥ 3 channels.
 - `scripts/release.sh` that handles CHANGELOG bump + tag + push.
 
@@ -476,7 +482,7 @@ carefully hashtag their keys.
 - `mget_cluster` of 1000 keys hits ≥ 3× the per-key-loop ops/s.
 
 **Depends on.** Phases 1 (for the non-typed primitives underneath)
-and 6 (we want this in 1.0 + an alpha release).
+and 6 (we want a 0.x release published before this lands).
 
 ---
 
