@@ -2,10 +2,10 @@
 
 A modern Valkey client for OCaml 5 + [Eio](https://github.com/ocaml-multicore/eio).
 
-**Status: alpha.** Full core + cluster + fuzz + CI + docs. 211
-tests. Phases 0–4 closed (command surface, testing rigour, CI/CD
-coverage, documentation); next up is examples and an opam
-release. Not yet published to opam.
+**Status: alpha.** v0.1.0 tagged and pending opam-repository
+merge ([PR #29748](https://github.com/ocaml/opam-repository/pull/29748));
+0.2 in progress on `main`. Full core + cluster + batch + fuzz + CI
++ docs. Phases 0-5 and 7 closed; Phase 6 waiting on the opam review.
 
 ## Why
 
@@ -29,6 +29,9 @@ No Lwt compat layer. No legacy Redis support.
 - **Guides** for deeper topics:
   - [docs/cluster.md](docs/cluster.md) — topology, MOVED/ASK,
     Read_from, hashtags, failover walkthrough.
+  - [docs/batch.md](docs/batch.md) — scatter-gather and atomic
+    batches, `mget_cluster` / `mset_cluster` / etc., timeout
+    semantics.
   - [docs/transactions.md](docs/transactions.md) — MULTI/EXEC,
     WATCH, when *not* to use transactions.
   - [docs/pubsub.md](docs/pubsub.md) — regular + sharded pub/sub,
@@ -77,22 +80,29 @@ No Lwt compat layer. No legacy Redis support.
 - Periodic background refresh fibre, wakes early on
   unknown-address redirects.
 - Seed fallback when the live pool can no longer reach quorum.
-- Typed `Read_from` (Primary / Prefer_replica / AZ-affinity).
+- Typed `Read_from` — Primary, Prefer_replica (random), AZ-affinity
+  with 3-tier fallback (in-AZ replica → any replica → primary).
 - `Target` types for `By_slot` / `By_node` / `Random`;
   `Fan_target` for `All_nodes` / `All_primaries` / `All_replicas`.
+- **Per-primary atomic mutex** (`Router.atomic_lock_for_slot`) —
+  serialises concurrent MULTI/EXEC blocks (from `Batch ~atomic` or
+  `Transaction`) on the shared pinned connection. Non-atomic
+  traffic bypasses the lock and multiplexes freely.
 - **Standalone = one-shard cluster** — single-node connections go
   through the same router behind a synthetic topology; dispatch
   is unified.
 
 ### Typed commands
 
-- ~130 typed helpers across strings, counters, TTL, hashes
-  (incl. field TTL), sets, lists, sorted sets, **bitmaps**,
-  **HLL**, **geo**, **generic keyspace**, **CLIENT admin**,
-  **FUNCTION + FCALL**, **CLUSTER introspection**, **LATENCY**,
-  **MEMORY**, streams (non-blocking + consumer groups + admin),
-  scripting (with automatic `EVALSHA → EVAL` fallback on
-  `NOSCRIPT`), blocking commands.
+- ~140 typed helpers across strings, counters, TTL, hashes
+  (incl. field TTL), sets, lists, **sorted sets** (ZADD with 6
+  mode variants / ZINCRBY / ZRANK / ZSCORE / ZPOPMIN/MAX /
+  WITHSCORES variants), **bitmaps**, **HLL**, **geo**, **generic
+  keyspace**, **CLIENT admin**, **FUNCTION + FCALL**,
+  **CLUSTER introspection**, **LATENCY**, **MEMORY**, streams
+  (non-blocking + consumer groups + admin), scripting (with
+  automatic `EVALSHA → EVAL` fallback on `NOSCRIPT`), blocking
+  commands.
 - **Per-command default routing** (`Command_spec`): ~230 command
   + sub-command entries, cross-checked against live
   `COMMAND INFO` in a test.
@@ -106,13 +116,46 @@ No Lwt compat layer. No legacy Redis support.
   a template once (`[| "HSET"; "$1"; "$2"; "$3" |]`) and invoke
   by name; same for named transactions.
 
+### Batch (scatter-gather + atomic)
+
+- **`Valkey.Batch.t`** — one primitive, two modes:
+  - **Non-atomic** (default): queue heterogeneous commands,
+    `Batch.run` splits by slot, runs a per-slot pipeline in
+    parallel, merges replies in input order. Partial success is
+    the norm; each command gets its own `result`.
+  - **Atomic** (`~atomic:true`): all keys must hash to one slot
+    (client-side CROSSSLOT validation). Single
+    `WATCH`/`MULTI`/cmds/`EXEC` burst on the slot's primary;
+    returns `Ok (Some results)` on commit, `Ok None` on WATCH
+    abort.
+- **Fan-out commands** (`SCRIPT LOAD`, `FLUSHALL`, `CLUSTER
+  NODES`, …) route through `exec_multi` in non-atomic mode and
+  return `Many (node_id, reply) list` entries; they're rejected
+  at `queue` time in atomic mode.
+- **Wall-clock `?timeout`** applies to the whole batch; completed
+  commands keep their replies, stragglers come back as
+  `One (Error Timeout)`.
+- **Typed cluster helpers**: `Batch.mget_cluster`,
+  `mset_cluster`, `del_cluster`, `unlink_cluster`,
+  `exists_cluster`, `touch_cluster`.
+- **Concurrent atomic batches are safe** — `Router.atomic_lock_for_slot`
+  serialises MULTI/EXEC blocks on the shared connection; ops on
+  different primaries run in parallel.
+
+See [docs/batch.md](docs/batch.md).
+
 ### Transactions
 
 - `Valkey.Transaction.begin_ / queue / exec / discard` +
   `with_transaction` scope helper.
-- Pins the MULTI/EXEC block to `slot(hint_key)`'s primary.
+- Eager model (server-queued): per-command errors surface at
+  `queue` time.
+- Pins the MULTI/EXEC block to `slot(hint_key)`'s primary; holds
+  the per-primary atomic mutex for the duration so concurrent
+  transactions on the same slot queue behind each other safely.
 - `exec` returns `(Resp3.t list option, Error.t) result` —
   `Ok None` on WATCH abort.
+- For buffered semantics, see `Batch ~atomic:true`.
 
 ### Pub/sub
 
@@ -139,8 +182,8 @@ and `Client.spublish` (slot-pinned).
 
 ### Testing, fuzzing, chaos
 
-- **211 tests** — unit + integration against standalone and
-  cluster. `dune runtest` takes ~18 s.
+- **~230 tests** — unit + integration against standalone and
+  cluster. `dune runtest` takes ~20 s.
 - **Parser fuzzer** (`bin/fuzz_parser/`) — byte-level + tree
   mutation + length-field poisoning + shrinker. 10 M strict
   clean at ~145 k inputs/s.
@@ -190,7 +233,9 @@ reference ceiling):
 At concurrency ≥ 10 we are **3–3.5× faster than ocaml-redis and
 within 85–96 % of the C reference**. Full matrix + methodology +
 optimisation history in [BENCHMARKS.md](BENCHMARKS.md). Run
-locally with `bash scripts/run-bench.sh`.
+locally with `bash scripts/run-bench.sh`. Batch paths add a
+further ≈20× speedup vs per-key loops on 1000-key bulk operations
+in cluster mode (`examples/10-batch/bulk.ml`).
 
 ## Installation
 
@@ -201,8 +246,9 @@ opam install . --deps-only --with-test
 dune build
 ```
 
-Not yet published to the opam repository — see ROADMAP Phase 6
-for the release plan.
+`opam install valkey` will work once
+[opam-repository PR #29748](https://github.com/ocaml/opam-repository/pull/29748)
+merges.
 
 ## Quick start
 
@@ -247,7 +293,34 @@ match Valkey.Cluster_router.create ~sw ~net ~clock ~config () with
     ...
 ```
 
-See [docs/cluster.md](docs/cluster.md) for the full picture.
+See [docs/cluster.md](docs/cluster.md).
+
+### Bulk ops across cluster slots
+
+```ocaml
+(* MGET that spans slots — splits by slot, parallel pipelines,
+   merges in input order. *)
+match Valkey.Batch.mget_cluster client
+        [ "user:1"; "user:2"; "user:3"; (* ...1000 more... *) ]
+with
+| Ok pairs -> List.iter (fun (k, v_opt) -> ...) pairs
+| Error e  -> ...
+```
+
+Or a heterogeneous batch:
+
+```ocaml
+let b = Valkey.Batch.create () in
+let _ = Valkey.Batch.queue b [| "SET"; "a"; "1" |] in
+let _ = Valkey.Batch.queue b [| "INCR"; "ctr" |] in
+let _ = Valkey.Batch.queue b [| "HSET"; "h"; "k"; "v" |] in
+let _ = Valkey.Batch.queue b [| "GET"; "a" |] in
+match Valkey.Batch.run ~timeout:2.0 client b with
+| Ok (Some results) -> Array.iter decode results
+| _ -> ...
+```
+
+See [docs/batch.md](docs/batch.md).
 
 ### Transactions
 
@@ -343,16 +416,16 @@ Four layers, bottom up:
   expected, used by `Pubsub`).
 - **`Cluster_router`** owns the fleet: topology discovery, node
   pool, slot dispatch, redirect retry, periodic refresh, seed
-  fallback, typed `Read_from` / `Target` / `Fan_target`.
-  Standalone is wrapped as a synthetic single-shard cluster
-  through the same dispatch path.
+  fallback, typed `Read_from` / `Target` / `Fan_target`,
+  per-primary atomic mutex. Standalone is wrapped as a synthetic
+  single-shard cluster through the same dispatch path.
 - **`Client`** is the typed command surface built on any
   `Router.t`. Handles `Command_spec`-driven routing, fan-out
   aggregation, and the `Client.custom` escape hatch.
-- **`Transaction`** / **`Pubsub`** / **`Cluster_pubsub`** /
-  **`Named_commands`** sit beside `Client` and use its
-  primitives. Each is a small, focused module with its own
-  integration tests.
+- **`Batch`** / **`Transaction`** / **`Pubsub`** /
+  **`Cluster_pubsub`** / **`Named_commands`** sit beside `Client`
+  and use its primitives. Each is a small, focused module with
+  its own integration tests.
 
 ## Pre-push gate
 
@@ -382,10 +455,13 @@ state:
 - ✅ Phase 3 — CI / CD + coverage + bench + nightly fuzz + docs
 - ✅ Phase 4 — documentation (9 guides + CONTRIBUTING + CHANGELOG)
 - ✅ Phase 5 — initial 9 examples + standing rule "ship features with their example"
-- ✅ Phase 7 — Batch primitive + cluster-aware typed helpers (mget/mset/del/unlink/exists/touch cluster)
 - 🔄 Phase 6 — publishing (v0.1.0 tagged, [opam-repository PR #29748](https://github.com/ocaml/opam-repository/pull/29748) open)
-- ⏳ Phases 7–12 — batch commands, client-side caching, connection
-  pool, IAM + mTLS, module support, deep audit, 1.0.0 stable
+- ✅ Phase 7 — Batch primitive (atomic + scatter-gather) + cluster typed helpers
+- ⏳ Phase 8 — client-side caching (`CLIENT TRACKING` + LRU)
+- ⏳ Phase 9 — connection pool + blocking pool
+- ⏳ Phase 10 — IAM + mTLS + secret-hygiene audit
+- ⏳ Phase 11 — module support (valkey-json / -search / -bloom)
+- ⏳ Phase 12 — deep audit → 1.0.0 stable
 
 ## License
 
