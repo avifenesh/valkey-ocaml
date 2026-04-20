@@ -1,4 +1,9 @@
+; bench_redis compares us against the existing OCaml Redis client.
+; redis-sync is intentionally not a project dependency — most users
+; don't need it. Build only when the library is available locally
+; (install it with `opam install redis-sync` if you want to run
+; the comparison via scripts/run-bench.sh).
 (executable
  (name bench_redis)
- (public_name valkey-bench-redis)
- (libraries redis-sync threads.posix))
+ (libraries redis-sync threads.posix)
+ (enabled_if (= %{lib-available:redis-sync} true)))

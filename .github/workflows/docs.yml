@@ -38,11 +38,16 @@ jobs:
         run: |
           mkdir -p site
           cp -r _build/default/_doc/_html/* site/
+          # odoc copies files read-only from the dune cache; make them
+          # writable so we can overwrite the top-level index.html with
+          # our landing page.
+          chmod -R u+w site
           mkdir -p site/guides
           if [ -d docs ]; then
             cp -r docs/* site/guides/ || true
           fi
-          # Minimal landing page that links to both.
+          # Overwrite odoc's auto-generated top index with our landing.
+          rm -f site/index.html
           cat > site/index.html <<'EOF'
           <!doctype html>
           <meta charset="utf-8">
