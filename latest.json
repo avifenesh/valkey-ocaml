@@ -1,0 +1,15 @@
+{
+  "scenarios": [
+    { "name": "SET           size=100   conc=1", "count": 5000, "ops_per_sec": 8175.80, "avg_ms": 0.122, "p50_ms": 0.121, "p90_ms": 0.136, "p99_ms": 0.186, "p999_ms": 0.239, "max_ms": 0.965 },
+    { "name": "GET           size=100   conc=1", "count": 5000, "ops_per_sec": 8725.71, "avg_ms": 0.114, "p50_ms": 0.110, "p90_ms": 0.126, "p99_ms": 0.152, "p999_ms": 0.245, "max_ms": 0.314 },
+    { "name": "SET           size=100   conc=10", "count": 5000, "ops_per_sec": 49656.95, "avg_ms": 0.201, "p50_ms": 0.195, "p90_ms": 0.251, "p99_ms": 0.362, "p999_ms": 0.494, "max_ms": 0.517 },
+    { "name": "GET           size=100   conc=10", "count": 5000, "ops_per_sec": 50813.56, "avg_ms": 0.197, "p50_ms": 0.190, "p90_ms": 0.252, "p99_ms": 0.376, "p999_ms": 0.510, "max_ms": 0.567 },
+    { "name": "MIX(80G/20S)  size=100   conc=10", "count": 5000, "ops_per_sec": 48548.89, "avg_ms": 0.206, "p50_ms": 0.201, "p90_ms": 0.254, "p99_ms": 0.366, "p999_ms": 0.490, "max_ms": 0.554 },
+    { "name": "SET           size=100   conc=100", "count": 5000, "ops_per_sec": 65634.86, "avg_ms": 1.508, "p50_ms": 1.480, "p90_ms": 1.797, "p99_ms": 2.115, "p999_ms": 2.251, "max_ms": 2.346 },
+    { "name": "GET           size=100   conc=100", "count": 5000, "ops_per_sec": 58176.65, "avg_ms": 1.704, "p50_ms": 1.683, "p90_ms": 1.945, "p99_ms": 2.681, "p999_ms": 2.828, "max_ms": 3.056 },
+    { "name": "MIX(80G/20S)  size=100   conc=100", "count": 5000, "ops_per_sec": 59668.70, "avg_ms": 1.662, "p50_ms": 1.679, "p90_ms": 1.890, "p99_ms": 2.138, "p999_ms": 2.288, "max_ms": 2.328 },
+    { "name": "SET           size=16384 conc=10", "count": 5000, "ops_per_sec": 28393.30, "avg_ms": 0.352, "p50_ms": 0.344, "p90_ms": 0.435, "p99_ms": 0.588, "p999_ms": 0.846, "max_ms": 0.879 },
+    { "name": "GET           size=16384 conc=10", "count": 5000, "ops_per_sec": 31116.40, "avg_ms": 0.321, "p50_ms": 0.263, "p90_ms": 0.624, "p99_ms": 0.929, "p999_ms": 0.967, "max_ms": 0.970 },
+    { "name": "MIX(80G/20S)  size=1024  conc=100", "count": 5000, "ops_per_sec": 44108.78, "avg_ms": 2.254, "p50_ms": 2.197, "p90_ms": 2.772, "p99_ms": 2.901, "p999_ms": 2.961, "max_ms": 2.995 }
+  ]
+}
