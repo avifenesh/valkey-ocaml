@@ -101,16 +101,154 @@ let run_non_atomic ?timeout client t =
   in
   Ok (Some finalized)
 
+(* ---------- atomic mode ---------- *)
+
+(* Determine the slot an atomic batch will run against.
+     1. Explicit [hint_key] wins.
+     2. Else: first queued command whose spec has a key, use that key.
+     3. Else: fail — a pure keyless atomic batch has no target. *)
+let atomic_slot t =
+  match t.hint_key with
+  | Some k -> Ok (Slot.of_key k)
+  | None ->
+      let rec first_keyed = function
+        | [] -> None
+        | q :: rest ->
+            match q.spec with
+            | Command_spec.Single_key { key_index; _ }
+            | Command_spec.Multi_key { first_key_index = key_index; _ } ->
+                if Array.length q.args > key_index
+                then Some (Slot.of_key q.args.(key_index))
+                else first_keyed rest
+            | _ -> first_keyed rest
+      in
+      (match first_keyed (List.rev t.queued) with
+       | Some slot -> Ok slot
+       | None ->
+           Error
+             (Connection.Error.Terminal
+                "atomic batch: no hint_key and no queued command has a \
+                 key — cannot determine target slot"))
+
+(* Validate every queued command's key hashes to [slot]. Returns
+   [Error] with a CROSSSLOT-style message on the first mismatch. *)
+let validate_same_slot ~slot queued =
+  let rec loop = function
+    | [] -> Ok ()
+    | q :: rest ->
+        (match q.spec with
+         | Command_spec.Single_key { key_index; _ }
+         | Command_spec.Multi_key { first_key_index = key_index; _ } ->
+             if Array.length q.args > key_index then begin
+               let k = q.args.(key_index) in
+               let s = Slot.of_key k in
+               if s <> slot then
+                 Error
+                   (Connection.Error.Server_error
+                      { code = "CROSSSLOT";
+                        message =
+                          Printf.sprintf
+                            "atomic batch: key %S hashes to slot %d but \
+                             the batch is pinned to slot %d"
+                            k s slot })
+               else loop rest
+             end
+             else loop rest
+         | _ -> loop rest)
+  in
+  loop queued
+
+let request_ok conn args =
+  match Connection.request conn args with
+  | Error e -> Error e
+  | Ok (Resp3.Simple_string _) -> Ok ()
+  | Ok v ->
+      Error
+        (Connection.Error.Protocol_violation
+           (Format.asprintf "%s: unexpected reply %a"
+              (if Array.length args > 0 then args.(0) else "?")
+              Resp3.pp v))
+
+(* Send the queued commands back to back (each reply should be
+   +QUEUED), collect replies without fast-failing on a single
+   bad-arity error — the server will EXECABORT at EXEC time. *)
+let queue_all conn queued =
+  List.iter
+    (fun q ->
+      (* The request may come back as a Server_error for bad arity /
+         unknown command — that's still a real RESP reply the server
+         sent; dropping it here is fine because EXECABORT propagates
+         through EXEC. *)
+      let _ = Connection.request conn q.args in
+      ())
+    queued
+
+let decode_exec_reply ~expected_n = function
+  | Resp3.Null ->
+      Ok None          (* WATCH abort *)
+  | Resp3.Array items ->
+      let arr = Array.make expected_n (One (Error Connection.Error.Closed)) in
+      List.iteri
+        (fun i reply ->
+          if i < expected_n then
+            arr.(i) <- One (Ok reply))
+        items;
+      Ok (Some arr)
+  | v ->
+      Error
+        (Connection.Error.Protocol_violation
+           (Format.asprintf "EXEC: unexpected reply %a" Resp3.pp v))
+
+let run_atomic ?timeout:_ client t =
+  let queued = List.rev t.queued in
+  let expected_n = t.count in
+  if expected_n = 0 then
+    (* Empty atomic batch — nothing to run. Return an empty array. *)
+    Ok (Some [||])
+  else
+    match atomic_slot t with
+    | Error e -> Error e
+    | Ok slot ->
+        (match validate_same_slot ~slot queued with
+         | Error e -> Error e
+         | Ok () ->
+             (match Client.connection_for_slot client slot with
+              | None ->
+                  Error
+                    (Connection.Error.Terminal
+                       (Printf.sprintf
+                          "atomic batch: no live connection for slot %d"
+                          slot))
+              | Some conn ->
+                  let send () =
+                    (* WATCH first (if any), then MULTI, then all
+                       queued commands (server replies +QUEUED or
+                       error), then EXEC returning an array (or Null
+                       on WATCH abort). Each step is serial on the
+                       same connection to preserve MULTI ordering. *)
+                    let watch_result =
+                      match t.watch with
+                      | [] -> Ok ()
+                      | keys ->
+                          request_ok conn
+                            (Array.of_list ("WATCH" :: keys))
+                    in
+                    match watch_result with
+                    | Error e -> Error e
+                    | Ok () ->
+                        (match request_ok conn [| "MULTI" |] with
+                         | Error e -> Error e
+                         | Ok () ->
+                             queue_all conn queued;
+                             match Connection.request conn [| "EXEC" |] with
+                             | Error e -> Error e
+                             | Ok v -> decode_exec_reply ~expected_n v)
+                  in
+                  send ()))
+
 let run ?timeout client t =
-  if t.atomic then
-    Error
-      (Connection.Error.Terminal
-         "Batch.run: atomic mode pending — use Transaction for now")
-  else begin
-    let _ = t.hint_key in
-    let _ = t.watch in
-    run_non_atomic ?timeout client t
-  end
+  if t.atomic then run_atomic ?timeout client t
+  else run_non_atomic ?timeout client t
 
 (* ---- typed cluster helpers ---- *)
 

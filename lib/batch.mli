@@ -89,9 +89,24 @@ val run :
     clock deadline to the whole batch; each in-flight command's
     per-call timeout is computed against the remaining window.
 
-    Atomic: not yet implemented in 0.2 — returns
-    [Error (Terminal "Batch.run: atomic mode pending")]. Use
-    [Transaction] for now; the modules merge in a later version. *)
+    Atomic: serial on the slot's primary connection. Sends
+    [WATCH] (if any), [MULTI], each queued command, [EXEC]. Parses
+    the aggregate EXEC reply:
+    - [Ok (Some results)] — the block committed; one [One reply]
+      per queued command in queue order. Individual per-command
+      errors surface as [One (Ok (Simple_error …))] inside the
+      array, or propagate via EXECABORT on bad-arity / unknown
+      command during queueing.
+    - [Ok None] — a watched key was modified between [WATCH] and
+      [EXEC]; caller should retry the whole batch.
+    - [Error _] — transport or protocol failure; outcome unknown.
+
+    Slot is determined by [hint_key] if given, else the first
+    queued command's key. Returns [Server_error "CROSSSLOT" …] at
+    [run] time if any queued command's key doesn't hash to the
+    pinned slot. [Transaction] continues to exist with its eager
+    (server-side-queued) semantics; atomic [Batch] is the buffered
+    variant. A later version will fold them together. *)
 
 (** {1 Cluster-aware typed helpers}
 

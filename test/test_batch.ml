@@ -152,22 +152,74 @@ let test_atomic_rejects_fan_out () =
   | Ok () ->
       Alcotest.fail "atomic batch accepted a fan-out command (SCRIPT LOAD)"
 
-(* Atomic mode isn't wired yet; confirm the placeholder error is
-   what we documented so callers know to reach for Transaction. *)
-let test_atomic_not_yet_implemented () =
+(* Atomic batch: commit path. Hashtag pins everything to the same
+   slot; EXEC returns the per-command array. *)
+let test_atomic_commits () =
   with_cluster_client @@ fun client ->
-  let b = B.create ~atomic:true ~hint_key:"x" () in
-  let _ = B.queue b [| "GET"; "x" |] in
+  let k = "cart:{atomic-demo}" in
+  let ctr = "ctr:{atomic-demo}" in
+  let _ = C.del client [ k; ctr ] in
+
+  let b = B.create ~atomic:true ~hint_key:k () in
+  let _ = B.queue b [| "SET"; k; "hello" |] in
+  let _ = B.queue b [| "INCR"; ctr |] in
+  let _ = B.queue b [| "GET"; k |] in
+
+  (match B.run client b with
+   | Error e -> Alcotest.failf "atomic run: %a" err_pp e
+   | Ok None -> Alcotest.fail "unexpected WATCH abort (no WATCH set)"
+   | Ok (Some rs) ->
+       Alcotest.(check int) "length" 3 (Array.length rs);
+       (match rs.(0) with
+        | B.One (Ok (Valkey.Resp3.Simple_string "OK")) -> ()
+        | _ -> Alcotest.fail "atomic.0: expected SET OK");
+       (match rs.(1) with
+        | B.One (Ok (Valkey.Resp3.Integer 1L)) -> ()
+        | _ -> Alcotest.fail "atomic.1: expected INCR 1");
+       (match rs.(2) with
+        | B.One (Ok (Valkey.Resp3.Bulk_string "hello")) -> ()
+        | _ -> Alcotest.fail "atomic.2: expected GET hello"));
+
+  let _ = C.del client [ k; ctr ] in
+  ()
+
+(* Atomic batch: cross-slot rejection at run time via client-side
+   validation against the pinned slot. *)
+let test_atomic_crossslot_detected () =
+  with_cluster_client @@ fun client ->
+  let b = B.create ~atomic:true ~hint_key:"{slot-a}x" () in
+  let _ = B.queue b [| "GET"; "{slot-a}x" |] in
+  let _ = B.queue b [| "GET"; "{slot-b}other" |] in
   match B.run client b with
-  | Error (E.Terminal msg) when
-      String.length msg >= 10 && String.sub msg 0 10 = "Batch.run:" ->
-      ()
+  | Error (E.Server_error { code = "CROSSSLOT"; _ }) -> ()
   | r ->
       Alcotest.failf
-        "expected Terminal 'Batch.run: ...' placeholder; got %s"
+        "expected Server_error CROSSSLOT; got %s"
         (match r with
          | Ok _ -> "Ok"
          | Error e -> Format.asprintf "Error %a" err_pp e)
+
+(* WATCH abort: open a second mutation path for the key between
+   [queue] and [run]; EXEC returns Null → [Ok None]. *)
+let test_atomic_watch_abort () =
+  with_cluster_client @@ fun client ->
+  let k = "watch:{wa}" in
+  let _ = C.set client k "v0" in
+
+  let b = B.create ~atomic:true ~hint_key:k ~watch:[ k ] () in
+  let _ = B.queue b [| "SET"; k; "v-attempted" |] in
+
+  let _ = C.set client k "v-rival" in
+
+  (match B.run client b with
+   | Ok None -> ()
+   | Ok (Some _) ->
+       Alcotest.fail "expected WATCH abort but batch committed"
+   | Error e ->
+       Alcotest.failf "unexpected error: %a" err_pp e);
+
+  let _ = C.del client [ k ] in
+  ()
 
 let skip_placeholder name () =
   Printf.printf
@@ -187,6 +239,8 @@ let tests =
       test_mset_mget_del_roundtrip;
     tc "heterogeneous batch (GET / SET / INCR / HSET)"
       test_heterogeneous_batch;
-    tc "atomic mode returns Terminal placeholder for 0.2"
-      test_atomic_not_yet_implemented;
+    tc "atomic batch commits (SET / INCR / GET)" test_atomic_commits;
+    tc "atomic batch CROSSSLOT detected at run time"
+      test_atomic_crossslot_detected;
+    tc "atomic batch WATCH abort returns Ok None" test_atomic_watch_abort;
   ]
