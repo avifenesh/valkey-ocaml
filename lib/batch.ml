@@ -509,3 +509,77 @@ let exists_cluster ?timeout client keys =
 
 let touch_cluster ?timeout client keys =
   per_key_sum ?timeout ~cmd:"TOUCH" client keys
+
+(* PFCOUNT across cluster slots via PFMERGE. When every key
+   already shares a slot we just hand off to the server's
+   multi-key PFCOUNT. Otherwise we materialise every non-missing
+   HLL as a temp in a hashtag-controlled slot, PFMERGE them into
+   a destination, PFCOUNT that, then DEL everything. *)
+let pfcount_cluster ?timeout client keys =
+  match keys with
+  | [] -> Ok 0
+  | _ ->
+      let slots = List.map (fun k -> Slot.of_key k) keys in
+      let same_slot =
+        match slots with
+        | [] -> true
+        | s :: rest -> List.for_all (fun s' -> s' = s) rest
+      in
+      if same_slot then
+        Client.pfcount ?timeout client keys
+      else begin
+        (* Cross-slot: bring every input HLL into one hashtag-
+           controlled slot via DUMP+RESTORE, PFMERGE, PFCOUNT,
+           cleanup. The hashtag text determines the temp slot
+           deterministically. *)
+        let tag =
+          Printf.sprintf "%d.%d"
+            (Unix.getpid ())
+            (Random.bits ())
+        in
+        let temp_of i =
+          Printf.sprintf "{pfc:%s}:src:%d" tag i
+        in
+        let dest = Printf.sprintf "{pfc:%s}:dest" tag in
+        let temps = ref [] in
+        let err = ref None in
+        List.iteri
+          (fun i k ->
+            if !err = None then
+              match Client.dump ?timeout client k with
+              | Error e -> err := Some e
+              | Ok None -> () (* missing key = empty HLL, skip *)
+              | Ok (Some bytes) ->
+                  let t = temp_of i in
+                  (match
+                     Client.restore ?timeout client t
+                       ~ttl_ms:0 ~serialized:bytes ~replace:true
+                   with
+                   | Error e -> err := Some e
+                   | Ok () -> temps := t :: !temps))
+          keys;
+        let cleanup () =
+          let all = dest :: !temps in
+          let _ = Client.del ?timeout client all in
+          ()
+        in
+        match !err with
+        | Some e -> cleanup (); Error e
+        | None ->
+            let sources = List.rev !temps in
+            (match sources with
+             | [] ->
+                 (* All inputs were missing — union is empty. *)
+                 cleanup ();
+                 Ok 0
+             | _ ->
+                 (match
+                    Client.pfmerge ?timeout client
+                      ~destination:dest ~sources
+                  with
+                  | Error e -> cleanup (); Error e
+                  | Ok () ->
+                      let r = Client.pfcount ?timeout client [ dest ] in
+                      cleanup ();
+                      r))
+      end

@@ -372,6 +372,74 @@ let test_watch_crossslot_rejected () =
          | Ok _ -> "Ok"
          | Error e -> Format.asprintf "Error %a" err_pp e)
 
+(* pfcount_cluster: union cardinality across HLLs spread across
+   multiple slots. With overlapping membership we'd expect
+   ~3000 uniques despite the per-slot sum being 4500. *)
+let test_pfcount_cluster_crossslot () =
+  with_cluster_client @@ fun client ->
+  let k1 = "pfc:a" in
+  let k2 = "pfc:b" in
+  let k3 = "pfc:c" in
+  let _ = C.del client [ k1; k2; k3 ] in
+  (* Seed three HLLs with overlap — 3000 distinct items total
+     across the three, each HLL carrying 1500 items with 1000
+     shared with its neighbour. *)
+  let add_range k lo hi =
+    let rec loop i =
+      if i > hi then ()
+      else begin
+        let _ =
+          C.pfadd client k
+            ~elements:[ Printf.sprintf "item-%d" i ]
+        in
+        loop (i + 1)
+      end
+    in
+    loop lo
+  in
+  add_range k1 0 1499;       (* 0..1499 *)
+  add_range k2 500 1999;     (* 500..1999 (overlaps k1 by 1000) *)
+  add_range k3 1000 2499;    (* 1000..2499 (overlaps k2 by 1000) *)
+  (* Make sure at least two keys live on different slots — if
+     they happened to collide we'd be testing the single-slot
+     fast path, which is fine but misses the point. *)
+  let slots =
+    List.sort_uniq compare
+      (List.map (fun k -> Valkey.Slot.of_key k) [ k1; k2; k3 ])
+  in
+  Alcotest.(check bool)
+    "test keys hit multiple slots" true
+    (List.length slots > 1);
+
+  (match B.pfcount_cluster client [ k1; k2; k3 ] with
+   | Error e -> Alcotest.failf "pfcount_cluster: %a" err_pp e
+   | Ok n ->
+       (* True union is 2500 unique items. HLL has ~0.81% relative
+          error so we allow ±5% wiggle. *)
+       if n < 2375 || n > 2625 then
+         Alcotest.failf
+           "expected ~2500 (true union), got %d" n);
+
+  let _ = C.del client [ k1; k2; k3 ] in
+  ()
+
+(* Missing inputs contribute nothing, matching PFCOUNT's
+   nonexistent-key-is-empty-HLL semantics. *)
+let test_pfcount_cluster_missing_keys_ok () =
+  with_cluster_client @@ fun client ->
+  let _ =
+    C.del client
+      [ "pfc:missing:a"; "pfc:missing:b"; "pfc:missing:c" ]
+  in
+  (match
+     B.pfcount_cluster client
+       [ "pfc:missing:a"; "pfc:missing:b"; "pfc:missing:c" ]
+   with
+   | Ok 0 -> ()
+   | Ok n ->
+       Alcotest.failf "expected 0 for all-missing; got %d" n
+   | Error e -> Alcotest.failf "pfcount_cluster: %a" err_pp e)
+
 (* Empty batch under guard is treated as "no write needed":
    UNWATCH is sent and Ok (Some [||]) returned. *)
 let test_watch_empty_batch_is_noop () =
@@ -433,4 +501,8 @@ let tests =
       test_watch_crossslot_rejected;
     tc "watch guard: empty batch sends UNWATCH and returns []"
       test_watch_empty_batch_is_noop;
+    tc "pfcount_cluster union across slots within error bounds"
+      test_pfcount_cluster_crossslot;
+    tc "pfcount_cluster all-missing returns 0"
+      test_pfcount_cluster_missing_keys_ok;
   ]

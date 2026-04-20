@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Batch.pfcount_cluster
+
+- `Valkey.Batch.pfcount_cluster` — HLL union cardinality across
+  keys that may live on different cluster slots. Single-slot
+  inputs go straight to server-side multi-key `PFCOUNT`.
+  Cross-slot inputs are materialised under a hashtag-controlled
+  slot via `DUMP` + `RESTORE`, `PFMERGE`d into a destination HLL,
+  `PFCOUNT`ed, and cleaned up before returning. Missing input
+  keys are treated as empty HLLs (no contribution). Closes the
+  long-standing "pfcount_cluster is intentionally missing" note
+  in the CHANGELOG.
+
 ### Changed — Transaction folded into Batch
 
 - `Valkey.Transaction` is now a thin wrapper over atomic

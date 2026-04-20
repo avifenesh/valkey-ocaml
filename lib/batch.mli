@@ -254,9 +254,29 @@ val touch_cluster :
 (** [TOUCH] that spans cluster slots. Bumps each key's
     last-access time; returns the count of keys that existed. *)
 
-(** Note: [pfcount_cluster] is intentionally not provided.
-    Summing per-slot [PFCOUNT] values over-counts any element
-    that appears in multiple HLLs spread across slots. Correct
-    handling needs a client-side HLL merge or a [PFMERGE]-first
-    workflow; tracked in ROADMAP Phase 7. Use [Client.pfcount]
-    directly with keys that share a slot (via hashtags). *)
+val pfcount_cluster :
+  ?timeout:float ->
+  Client.t -> string list ->
+  (int, Connection.Error.t) result
+(** [PFCOUNT] that spans cluster slots. Returns the approximate
+    cardinality of the union of every HLL in [keys].
+
+    Implementation: when every key already hashes to the same
+    slot, defers to {!Client.pfcount} (one round-trip). Otherwise,
+    each input HLL is [DUMP]ed and [RESTORE]d under a temporary
+    key in a dedicated hashtag slot, the temps are merged via
+    [PFMERGE] into a destination HLL, that destination's
+    cardinality is read via [PFCOUNT], and every temporary plus
+    the destination is cleaned up before returning. Missing input
+    keys are treated as empty HLLs (no contribution).
+
+    Correctness: simply summing per-slot [PFCOUNT] values
+    over-counts any element that appears in HLLs on more than one
+    slot; this wrapper always goes through [PFMERGE] in the
+    cross-slot case.
+
+    Cost: one [PFCOUNT] round-trip in the single-slot case. In
+    the cross-slot case: [DUMP + RESTORE] per non-missing key,
+    plus [PFMERGE], [PFCOUNT], and cleanup [DEL]. All HLLs are
+    small (≤ 12KiB dense encoding), so the wire volume stays
+    modest. *)
