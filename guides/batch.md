@@ -6,10 +6,12 @@ primitive, two modes:
 - **Non-atomic** (default) — scatter-gather: bucket by slot, run
   a per-slot pipeline in parallel, merge replies in input order.
   Each command gets its own result; partial success is the norm.
-- **Atomic** (`~atomic:true`) — every queued key must hash to the
-  same slot. The batch runs as a `WATCH` / `MULTI` / ... / `EXEC`
-  block on that slot's primary; all commands commit together or
-  none do (WATCH abort → `Ok None`).
+- **Atomic** (`~atomic:true`) — in cluster mode, every queued key
+  must hash to the same slot. Standalone ignores slot
+  distinctions because there's only one server. The batch runs as
+  a `WATCH` / `MULTI` / ... / `EXEC` block on the pinned
+  primary; all commands commit together or none do (WATCH abort
+  → `Ok None`).
 
 Same module, one flag. Matches the GLIDE model.
 
@@ -226,9 +228,11 @@ visibility use `Batch.run` directly.
   on that connection.
 - **Across slots** (non-atomic only): sub-batches run
   concurrently. No global ordering.
-- **Atomic mode**: all keys must hash to the same slot, checked
-  client-side before `MULTI` is sent. Mismatch surfaces as
-  `Server_error { code = "CROSSSLOT"; … }` at `run` time.
+- **Atomic mode**: in cluster mode, all keys must hash to the
+  same slot, checked client-side before `MULTI` is sent.
+  Standalone keeps native one-server semantics. A mismatch
+  surfaces as `Server_error { code = "CROSSSLOT"; … }` at
+  `run` time.
 
 ## Relationship to Transaction
 
