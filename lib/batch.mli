@@ -14,12 +14,14 @@
       FLUSHALL, CLUSTER NODES, …) are dispatched via
       [Client.exec_multi] and their results carry per-node replies.
 
-    - **Atomic** ([atomic=true]) — every command must target the
-      same slot. The batch runs as a [MULTI] / [EXEC] block on
-      that slot's primary with optional [WATCH]. Replies arrive
-      as a single aggregate; [run] returns [Ok (Some array)] on
-      commit or [Ok None] on a WATCH abort. This is the same
-      primitive the [Transaction] module sits on top of.
+    - **Atomic** ([atomic=true]) — in cluster mode, every command
+      must target the same slot. Standalone ignores slot
+      distinctions because there's only one server. The batch runs
+      as a [MULTI] / [EXEC] block on the pinned primary with
+      optional [WATCH]. Replies arrive as a single aggregate;
+      [run] returns [Ok (Some array)] on commit or [Ok None] on a
+      WATCH abort. This is the same primitive the [Transaction]
+      module sits on top of.
 
     {1 Choosing atomic vs non-atomic}
 

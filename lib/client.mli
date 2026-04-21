@@ -41,6 +41,11 @@ val connection_for_slot : t -> int -> Connection.t option
     single connection. Used by modules like [Transaction] that need
     to pin a sequence of commands to one server. *)
 
+val is_standalone : t -> bool
+(** [true] only for the synthetic standalone/single-node path.
+    Cluster mode remains [false] even when several slots currently
+    map to the same primary. *)
+
 val atomic_lock_for_slot : t -> int -> Eio.Mutex.t
 (** Mutex serialising atomic operations (MULTI/EXEC blocks from
     {!Batch} with [~atomic:true], and from {!Transaction}) on the

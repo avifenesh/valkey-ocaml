@@ -122,6 +122,56 @@ let test_has_and_unregister () =
   NC.unregister nc "x";
   Alcotest.(check bool) "after unregister" false (NC.has nc "x")
 
+let test_run_transaction_timeout_forwarded () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let c = C.connect ~sw ~net ~clock ~host ~port () in
+  let admin = C.connect ~sw ~net ~clock ~host ~port () in
+  Fun.protect
+    ~finally:(fun () -> C.close admin; C.close c)
+  @@ fun () ->
+  let nc = NC.create c in
+  let key = "nc:timeout" in
+  let _ = C.del c [ key ] in
+  NC.register_transaction nc
+    ~name:"set-under-pause"
+    ~commands:[ [| "SET"; "$1"; "$2" |] ]
+    ();
+  (match C.client_pause admin ~timeout_ms:200 with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "CLIENT PAUSE: %a" err_pp e);
+  Eio.Time.sleep clock 0.01;
+  (match
+     NC.run_transaction ~timeout:0.05 nc
+       ~name:"set-under-pause" ~args:[ key; "during-pause" ]
+   with
+   | Error E.Timeout -> ()
+   | Ok _ -> Alcotest.fail "expected Timeout from paused transaction"
+   | Error e -> Alcotest.failf "expected Timeout, got %a" err_pp e);
+  Eio.Time.sleep clock 0.25;
+  (match
+     NC.run_transaction nc
+       ~name:"set-under-pause" ~args:[ key; "after-pause" ]
+   with
+   | Ok (Some [ R.Simple_string "OK" ]) -> ()
+   | Ok v ->
+       Alcotest.failf "unexpected post-timeout replies: %s"
+         (match v with
+          | None -> "WATCH abort"
+          | Some rs ->
+              String.concat ", "
+                (List.map (Format.asprintf "%a" R.pp) rs))
+   | Error e -> Alcotest.failf "post-timeout retry: %a" err_pp e);
+  (match C.get c key with
+   | Ok (Some "after-pause") -> ()
+   | Ok v ->
+       Alcotest.failf "expected after-pause, got %s"
+         (match v with Some s -> s | None -> "<nil>")
+   | Error e -> Alcotest.failf "GET after timeout: %a" err_pp e);
+  ignore (C.del c [ key ])
+
 let tests =
   [ Alcotest.test_case "register + run_command" `Quick
       test_register_and_run_command;
@@ -131,6 +181,8 @@ let tests =
       test_wrong_kind;
     Alcotest.test_case "register + run_transaction" `Quick
       test_run_transaction;
+    Alcotest.test_case "run_transaction forwards timeout" `Quick
+      test_run_transaction_timeout_forwarded;
     Alcotest.test_case "placeholder literal pass-through" `Quick
       test_placeholder_literal_passthrough;
     Alcotest.test_case "has / unregister" `Quick

@@ -31,6 +31,8 @@ module Chan = struct
     stream : 'a Eio.Stream.t;
     mutable closed : bool;
     closed_mutex : Eio.Mutex.t;
+    close_signal : unit Eio.Promise.t;
+    close_resolver : unit Eio.Promise.u;
   }
 
   exception Closed
@@ -41,9 +43,12 @@ module Chan = struct
   let capacity = 1_000_000
 
   let create () =
+    let close_signal, close_resolver = Eio.Promise.create () in
     { stream = Eio.Stream.create capacity;
       closed = false;
-      closed_mutex = Eio.Mutex.create () }
+      closed_mutex = Eio.Mutex.create ();
+      close_signal;
+      close_resolver }
 
   let push t v =
     Eio.Mutex.use_rw ~protect:true t.closed_mutex (fun () ->
@@ -51,12 +56,24 @@ module Chan = struct
     Eio.Stream.add t.stream v
 
   let take t =
-    if t.closed && Eio.Stream.length t.stream = 0 then raise Closed
-    else Eio.Stream.take t.stream
+    Eio.Mutex.use_rw ~protect:true t.closed_mutex (fun () ->
+        if t.closed then raise Closed);
+    match
+      Eio.Fiber.first
+        (fun () -> `Value (Eio.Stream.take t.stream))
+        (fun () ->
+          Eio.Promise.await t.close_signal;
+          `Closed)
+    with
+    | `Value v -> v
+    | `Closed -> raise Closed
 
   let close t =
     Eio.Mutex.use_rw ~protect:true t.closed_mutex (fun () ->
-        t.closed <- true)
+        if not t.closed then begin
+          t.closed <- true;
+          Eio.Promise.resolve t.close_resolver ()
+        end)
 
   let drain t =
     let drained = Queue.create () in
@@ -868,6 +885,19 @@ let availability_zone t = t.availability_zone
 let server_info t = t.server_info
 let state t = t.state
 let keepalive_count t = t.keepalive_count
+
+let interrupt t =
+  if Atomic.get t.closing then ()
+  else
+    let sock_to_close =
+      Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () -> t.current)
+    in
+    match sock_to_close with
+    | Some sock ->
+        (try sock.close ()
+         with Eio.Io _ | End_of_file | Invalid_argument _
+            | Unix.Unix_error _ -> ())
+    | None -> ()
 
 let close t =
   if Atomic.exchange t.closing true then ()

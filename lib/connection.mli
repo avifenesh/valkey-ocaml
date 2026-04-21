@@ -130,4 +130,12 @@ val keepalive_count : t -> int
 (** Number of successful keepalive PINGs since [connect]. For observability
     and tests; zero if [keepalive_interval] is None. *)
 
+val interrupt : t -> unit
+(** Force-close the current transport without marking the connection
+    permanently closed. If the owning switch is still alive, the
+    supervisor treats this like a disconnect and runs the normal
+    reconnect path. Used by higher layers when a timed-out
+    MULTI/EXEC-like sequence leaves server-side connection state
+    potentially tainted. *)
+
 val close : t -> unit

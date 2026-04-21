@@ -459,12 +459,20 @@ let sunsubscribe t channels =
 let next_message ?timeout t =
   if Atomic.get t.closing then Error `Closed
   else
+    let take_or_close () =
+      Eio.Fiber.first
+        (fun () -> `Msg (Eio.Stream.take t.incoming))
+        (fun () -> Eio.Promise.await t.close_signal; `Closed)
+    in
     match timeout with
     | None ->
-        (try Ok (Eio.Stream.take t.incoming)
-         with _ -> Error `Closed)
+        (match take_or_close () with
+         | `Msg v -> Ok v
+         | `Closed -> Error `Closed)
     | Some secs ->
-        (match t.with_timeout secs
-                 (fun () -> Eio.Stream.take t.incoming) with
-         | Ok v -> Ok v
-         | Error `Timeout -> Error `Timeout)
+        (match t.with_timeout secs take_or_close with
+         | Ok (`Msg v) -> Ok v
+         | Ok `Closed -> Error `Closed
+         | Error `Timeout ->
+             if Atomic.get t.closing then Error `Closed
+             else Error `Timeout)

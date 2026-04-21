@@ -134,6 +134,22 @@ let test_availability_zone () =
   let _ = C.availability_zone conn in
   ()
 
+let test_close_idle_connection_does_not_hang () =
+  Eio_main.run @@ fun env ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  match
+    Eio.Time.with_timeout clock 1.0 (fun () ->
+        Ok
+          (Eio.Switch.run @@ fun sw ->
+           let conn = C.connect ~sw ~net ~clock ~host ~port () in
+           C.close conn))
+  with
+  | Ok () -> ()
+  | Error `Timeout ->
+      Alcotest.fail
+        "closing an idle connection left background fibers running"
+
 let tls_port = 6390
 
 let rec find_repo_file rel dir =
@@ -385,6 +401,8 @@ let tests =
     Alcotest.test_case "concurrent" `Quick test_concurrent_set_get;
     Alcotest.test_case "large_value" `Quick test_large_value;
     Alcotest.test_case "availability_zone" `Quick test_availability_zone;
+    Alcotest.test_case "close idle connection" `Quick
+      test_close_idle_connection_does_not_hang;
     Alcotest.test_case "recovery" `Quick test_recovery_client_kill;
     Alcotest.test_case "timeout_late_reply" `Quick test_timeout_late_reply;
     Alcotest.test_case "stress" `Quick test_stress;

@@ -62,6 +62,11 @@ let remaining_window ~deadline =
          value to signal "fire and time out immediately". *)
       Some (Float.max 0.001 left)
 
+let close_connection conn =
+  try Connection.interrupt conn
+  with Eio.Io _ | End_of_file | Invalid_argument _
+     | Unix.Unix_error _ -> ()
+
 let dispatch_one client raw ~deadline q =
   let per_timeout = remaining_window ~deadline in
   let result : batch_entry_result =
@@ -130,16 +135,11 @@ let atomic_slot t =
                 "atomic batch: no hint_key and no queued command has a \
                  key — cannot determine target slot"))
 
-(* Validate every queued command's key resolves to the same
-   connection as the pinned slot. We compare *connections*, not
-   slot numbers: in standalone mode the router returns the sole
-   connection for any slot (so every key trivially matches); in
-   cluster mode, co-located keys (same primary) also share a
-   connection even if they land on different slots within that
-   primary. Only true cross-primary batches fail. Returns
-   [Error CROSSSLOT] on the first mismatch. *)
+(* In cluster mode every key in an atomic batch must hash to the
+   exact same slot. Standalone keeps native Valkey semantics and
+   allows any keys because there is only one server. *)
 let validate_same_slot ~client ~slot queued =
-  let pinned_conn = Client.connection_for_slot client slot in
+  let standalone = Client.is_standalone client in
   let rec loop = function
     | [] -> Ok ()
     | q :: rest ->
@@ -149,21 +149,14 @@ let validate_same_slot ~client ~slot queued =
              if Array.length q.args > key_index then begin
                let k = q.args.(key_index) in
                let s = Slot.of_key k in
-               let k_conn = Client.connection_for_slot client s in
-               let same_conn =
-                 match pinned_conn, k_conn with
-                 | Some a, Some b -> a == b
-                 | _ -> s = slot
-               in
-               if not same_conn then
+               if not standalone && s <> slot then
                  Error
                    (Connection.Error.Server_error
                       { code = "CROSSSLOT";
                         message =
                           Printf.sprintf
                             "atomic batch: key %S hashes to slot %d \
-                             which maps to a different primary than \
-                             the batch's pinned slot %d"
+                             but the batch is pinned to slot %d"
                             k s slot })
                else loop rest
              end
@@ -172,8 +165,8 @@ let validate_same_slot ~client ~slot queued =
   in
   loop queued
 
-let request_ok conn args =
-  match Connection.request conn args with
+let request_ok ?timeout conn args =
+  match Connection.request ?timeout conn args with
   | Error e -> Error e
   | Ok (Resp3.Simple_string _) -> Ok ()
   | Ok v ->
@@ -184,18 +177,28 @@ let request_ok conn args =
               Resp3.pp v))
 
 (* Send the queued commands back to back (each reply should be
-   +QUEUED), collect replies without fast-failing on a single
-   bad-arity error — the server will EXECABORT at EXEC time. *)
-let queue_all conn queued =
-  List.iter
-    (fun q ->
-      (* The request may come back as a Server_error for bad arity /
-         unknown command — that's still a real RESP reply the server
-         sent; dropping it here is fine because EXECABORT propagates
-         through EXEC. *)
-      let _ = Connection.request conn q.args in
-      ())
-    queued
+   +QUEUED), but don't fast-fail on a single bad-arity error — the
+   server will EXECABORT at EXEC time. Transport / timeout /
+   protocol errors mean the connection state is no longer
+   trustworthy, so bail out and let the caller reconnect. *)
+let queue_all ~deadline conn queued =
+  let rec loop = function
+    | [] -> Ok ()
+    | q :: rest ->
+        let per_timeout = remaining_window ~deadline in
+        (match Connection.request ?timeout:per_timeout conn q.args with
+         | Ok (Resp3.Simple_string "QUEUED") -> loop rest
+         | Ok v ->
+             Error
+               (Connection.Error.Protocol_violation
+                  (Format.asprintf
+                     "queue inside MULTI: unexpected reply %a"
+                     Resp3.pp v))
+         | Error (Connection.Error.Server_error _) ->
+             loop rest
+         | Error e -> Error e)
+  in
+  loop queued
 
 let decode_exec_reply ~expected_n = function
   | Resp3.Null ->
@@ -213,9 +216,14 @@ let decode_exec_reply ~expected_n = function
         (Connection.Error.Protocol_violation
            (Format.asprintf "EXEC: unexpected reply %a" Resp3.pp v))
 
-let run_atomic ?timeout:_ client t =
+let run_atomic ?timeout client t =
   let queued = List.rev t.queued in
   let expected_n = t.count in
+  let deadline =
+    match timeout with
+    | None -> None
+    | Some s -> Some (Unix.gettimeofday () +. s)
+  in
   if expected_n = 0 then
     (* Empty atomic batch — nothing to run. Return an empty array. *)
     Ok (Some [||])
@@ -234,6 +242,10 @@ let run_atomic ?timeout:_ client t =
                           "atomic batch: no live connection for slot %d"
                           slot))
               | Some conn ->
+                  let fail e =
+                    close_connection conn;
+                    Error e
+                  in
                   (* Serialise concurrent atomic ops on the same
                      primary connection so their MULTI/EXEC blocks
                      don't interleave. Non-atomic pipeline traffic
@@ -245,21 +257,34 @@ let run_atomic ?timeout:_ client t =
                         match t.watch with
                         | [] -> Ok ()
                         | keys ->
-                            request_ok conn
+                            request_ok ?timeout:(remaining_window ~deadline) conn
                               (Array.of_list ("WATCH" :: keys))
                       in
                       match watch_result with
-                      | Error e -> Error e
+                      | Error e -> fail e
                       | Ok () ->
-                          (match request_ok conn [| "MULTI" |] with
-                           | Error e -> Error e
+                          (match
+                             request_ok
+                               ?timeout:(remaining_window ~deadline)
+                               conn [| "MULTI" |]
+                           with
+                           | Error e -> fail e
                            | Ok () ->
-                               queue_all conn queued;
-                               match
-                                 Connection.request conn [| "EXEC" |]
-                               with
-                               | Error e -> Error e
-                               | Ok v -> decode_exec_reply ~expected_n v))))
+                               (match queue_all ~deadline conn queued with
+                                | Error e -> fail e
+                                | Ok () ->
+                                    (match
+                                       Connection.request
+                                         ?timeout:(remaining_window ~deadline)
+                                         conn [| "EXEC" |]
+                                     with
+                                     | Error e -> fail e
+                                     | Ok v ->
+                                         (match
+                                            decode_exec_reply ~expected_n v
+                                          with
+                                          | Ok _ as ok -> ok
+                                          | Error e -> fail e)))))))
 
 let run ?timeout client t =
   if t.atomic then run_atomic ?timeout client t
@@ -349,7 +374,7 @@ let release_guard g =
     Eio.Mutex.unlock g.atomic_lock
   end
 
-let run_with_guard ?timeout:_ t g =
+let run_with_guard ?timeout t g =
   if g.released then
     Error
       (Connection.Error.Terminal
@@ -364,6 +389,11 @@ let run_with_guard ?timeout:_ t g =
   else begin
     let queued = List.rev t.queued in
     let expected_n = t.count in
+    let deadline =
+      match timeout with
+      | None -> None
+      | Some s -> Some (Unix.gettimeofday () +. s)
+    in
     let slot_check =
       if expected_n = 0 then Ok g.pinned_slot
       else
@@ -388,20 +418,41 @@ let run_with_guard ?timeout:_ t g =
         | Error e -> release_guard g; Error e
         | Ok () ->
             let conn = g.conn in
+            let fail e =
+              close_connection conn;
+              Error e
+            in
             let result =
               if expected_n = 0 then begin
                 (* Empty batch under guard: user looked, decided
                    no write needed. UNWATCH and return []. *)
-                let _ = Connection.request conn [| "UNWATCH" |] in
+                let _ =
+                  Connection.request
+                    ?timeout:(remaining_window ~deadline)
+                    conn [| "UNWATCH" |]
+                in
                 Ok (Some [||])
               end else
-                match request_ok conn [| "MULTI" |] with
-                | Error e -> Error e
+                match
+                  request_ok
+                    ?timeout:(remaining_window ~deadline)
+                    conn [| "MULTI" |]
+                with
+                | Error e -> fail e
                 | Ok () ->
-                    queue_all conn queued;
-                    (match Connection.request conn [| "EXEC" |] with
-                     | Error e -> Error e
-                     | Ok v -> decode_exec_reply ~expected_n v)
+                    (match queue_all ~deadline conn queued with
+                     | Error e -> fail e
+                     | Ok () ->
+                         (match
+                            Connection.request
+                              ?timeout:(remaining_window ~deadline)
+                              conn [| "EXEC" |]
+                          with
+                          | Error e -> fail e
+                          | Ok v ->
+                              (match decode_exec_reply ~expected_n v with
+                               | Ok _ as ok -> ok
+                               | Error e -> fail e)))
             in
             (* EXEC implicitly clears WATCH on the server. The
                empty-batch path already sent UNWATCH. Either way

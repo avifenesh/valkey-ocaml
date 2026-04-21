@@ -30,6 +30,19 @@ let cluster_reachable () =
       true
     with _ -> false
 
+let create_router_retry ~sw ~net ~clock ~config =
+  let deadline = Eio.Time.now clock +. 5.0 in
+  let rec loop last_error =
+    match CR.create ~sw ~net ~clock ~config () with
+    | Ok router -> Ok router
+    | Error m ->
+        if Eio.Time.now clock >= deadline then Error last_error
+        else (
+          Eio.Time.sleep clock 0.2;
+          loop m)
+  in
+  loop "Cluster_router.create did not run"
+
 let with_cluster_client f =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -38,13 +51,43 @@ let with_cluster_client f =
   let config =
     { (CR.Config.default ~seeds) with prefer_hostname = true }
   in
-  match CR.create ~sw ~net ~clock ~config () with
+  match create_router_retry ~sw ~net ~clock ~config with
   | Error m -> Alcotest.failf "Cluster_router.create: %s" m
   | Ok router ->
       let client = C.from_router ~config:C.Config.default router in
       Fun.protect ~finally:(fun () -> C.close client) @@ fun () -> f client
 
+let with_cluster_client_and_admin ~admin_host ~admin_port f =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match create_router_retry ~sw ~net ~clock ~config with
+  | Error m -> Alcotest.failf "Cluster_router.create: %s" m
+  | Ok router ->
+      let client = C.from_router ~config:C.Config.default router in
+      let admin =
+        C.connect ~sw ~net ~clock ~host:admin_host ~port:admin_port ()
+      in
+      Fun.protect
+        ~finally:(fun () -> C.close admin; C.close client)
+      @@ fun () ->
+      f ~clock client admin
+
 let err_pp = E.pp
+
+let contains s needle =
+  let ls = String.length s
+  and ln = String.length needle in
+  let rec loop i =
+    if i + ln > ls then false
+    else if String.sub s i ln = needle then true
+    else loop (i + 1)
+  in
+  if ln = 0 then true else loop 0
 
 (* 500 spread keys: mset_cluster populates, mget_cluster fetches
    them back, del_cluster wipes. No hashtags — each key lands on
@@ -192,6 +235,34 @@ let test_atomic_crossslot_detected () =
   let _ = B.queue b [| "GET"; "{slot-b}other" |] in
   match B.run client b with
   | Error (E.Server_error { code = "CROSSSLOT"; _ }) -> ()
+  | r ->
+      Alcotest.failf
+        "expected Server_error CROSSSLOT; got %s"
+        (match r with
+         | Ok _ -> "Ok"
+         | Error e -> Format.asprintf "Error %a" err_pp e)
+
+(* Different slots on the same primary must still be rejected
+   client-side in cluster mode. Before the fix, this slipped
+   through to the server because the validation compared pooled
+   connections instead of hash slots. *)
+let test_atomic_same_primary_crossslot_detected_client_side () =
+  with_cluster_client @@ fun client ->
+  let key_a = "alpha" in
+  let key_b = "gamma" in
+  let slot_a = Valkey.Slot.of_key key_a in
+  let slot_b = Valkey.Slot.of_key key_b in
+  Alcotest.(check bool) "different slots" true (slot_a <> slot_b);
+  Alcotest.(check bool) "same c1 shard"
+    true (slot_a <= 5460 && slot_b <= 5460);
+  let b = B.create ~atomic:true ~hint_key:key_a () in
+  let _ = B.queue b [| "GET"; key_a |] in
+  let _ = B.queue b [| "GET"; key_b |] in
+  match B.run client b with
+  | Error (E.Server_error { code = "CROSSSLOT"; message }) ->
+      if not (contains message "batch is pinned to slot") then
+        Alcotest.failf
+          "expected client-side CROSSSLOT message, got %S" message
   | r ->
       Alcotest.failf
         "expected Server_error CROSSSLOT; got %s"
@@ -355,6 +426,64 @@ let test_watch_guard_released_on_exception () =
   let _ = C.del client [ k ] in
   ()
 
+let test_atomic_timeout_respected () =
+  with_cluster_client_and_admin
+    ~admin_host:"valkey-c1" ~admin_port:7000
+  @@ fun ~clock client admin ->
+  let key = "alpha" in
+  let _ = C.set client key "before-timeout" in
+  let b = B.create ~atomic:true ~hint_key:key () in
+  let _ = B.queue b [| "GET"; key |] in
+  (match C.client_pause admin ~timeout_ms:200 with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "CLIENT PAUSE: %a" err_pp e);
+  Eio.Time.sleep clock 0.01;
+  (match B.run ~timeout:0.05 client b with
+   | Error E.Timeout -> ()
+   | Ok _ -> Alcotest.fail "expected atomic batch Timeout"
+   | Error e -> Alcotest.failf "expected Timeout, got %a" err_pp e);
+  Eio.Time.sleep clock 0.25;
+  (match C.get client key with
+   | Ok (Some "before-timeout") -> ()
+   | Ok v ->
+       Alcotest.failf "expected before-timeout, got %s"
+         (match v with Some s -> s | None -> "<nil>")
+   | Error e -> Alcotest.failf "GET after timeout: %a" err_pp e);
+  ignore (C.del client [ key ])
+
+let test_watch_guard_timeout_respected () =
+  with_cluster_client_and_admin
+    ~admin_host:"valkey-c1" ~admin_port:7000
+  @@ fun ~clock client admin ->
+  let key = "alpha" in
+  let _ = C.set client key "before-guard-timeout" in
+  let outcome =
+    B.with_watch client [ key ] (fun guard ->
+      let b = B.create ~atomic:true ~hint_key:key () in
+      let _ = B.queue b [| "SET"; key; "after-guard-timeout" |] in
+      (match C.client_pause admin ~timeout_ms:200 with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "CLIENT PAUSE: %a" err_pp e);
+      Eio.Time.sleep clock 0.01;
+      B.run_with_guard ~timeout:0.05 b guard)
+  in
+  (match outcome with
+   | Ok (Error E.Timeout) -> ()
+   | Ok (Ok _) ->
+       Alcotest.fail "expected guard commit path to time out"
+   | Ok (Error e) ->
+       Alcotest.failf "expected Timeout, got %a" err_pp e
+   | Error e ->
+       Alcotest.failf "with_watch setup failed: %a" err_pp e);
+  Eio.Time.sleep clock 0.25;
+  (match C.get client key with
+   | Ok (Some "before-guard-timeout") -> ()
+   | Ok v ->
+       Alcotest.failf "expected before-guard-timeout, got %s"
+         (match v with Some s -> s | None -> "<nil>")
+   | Error e -> Alcotest.failf "GET after guard timeout: %a" err_pp e);
+  ignore (C.del client [ key ])
+
 (* CROSSSLOT validation happens in [watch] before any wire I/O,
    keeping a misuse from acquiring a mutex that would never be
    released. *)
@@ -489,12 +618,18 @@ let tests =
     tc "atomic batch commits (SET / INCR / GET)" test_atomic_commits;
     tc "atomic batch CROSSSLOT detected at run time"
       test_atomic_crossslot_detected;
+    tc "atomic batch same-primary CROSSSLOT detected client-side"
+      test_atomic_same_primary_crossslot_detected_client_side;
     tc "concurrent atomic batches on same router both commit"
       test_atomic_concurrent;
+    tc "atomic batch timeout is respected"
+      test_atomic_timeout_respected;
     tc "watch guard: read-modify-write commits"
       test_watch_guard_commits;
     tc "watch guard: rival mutation aborts run_with_guard"
       test_watch_guard_aborts_on_rival;
+    tc "watch guard: timeout is respected"
+      test_watch_guard_timeout_respected;
     tc "with_watch releases guard on closure exception"
       test_watch_guard_released_on_exception;
     tc "watch rejects cross-slot key set"

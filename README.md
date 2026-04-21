@@ -125,7 +125,8 @@ No Lwt compat layer. No legacy Redis support.
     `Batch.run` splits by slot, runs a per-slot pipeline in
     parallel, merges replies in input order. Partial success is
     the norm; each command gets its own `result`.
-  - **Atomic** (`~atomic:true`): all keys must hash to one slot
+  - **Atomic** (`~atomic:true`): in cluster mode, all keys must
+    hash to one slot
     (client-side CROSSSLOT validation). Single
     `WATCH`/`MULTI`/cmds/`EXEC` burst on the slot's primary;
     returns `Ok (Some results)` on commit, `Ok None` on WATCH

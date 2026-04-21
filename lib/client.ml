@@ -60,6 +60,8 @@ let raw_connection t =
 
 let connection_for_slot t slot = Router.connection_for_slot t.router slot
 
+let is_standalone t = Router.is_standalone t.router
+
 let atomic_lock_for_slot t slot =
   Router.atomic_lock_for_slot t.router slot
 

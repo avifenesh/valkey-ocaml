@@ -243,7 +243,10 @@ let make_exec ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
     | Router.Target.Random ->
         (match Node_pool.connections pool with
          | [] -> err_terminal "cluster has no live connections"
-         | c :: _ -> send_once ?timeout c args)
+         | conns ->
+             (match pick_random conns with
+              | Some c -> send_once ?timeout c args
+              | None -> err_terminal "cluster has no live connections"))
     | Router.Target.By_channel _ ->
         err_terminal "cluster router: sharded pub/sub not yet implemented"
   in
@@ -351,12 +354,18 @@ let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
       ~connection_config:Connection.Config.default
       slot
   in
+  let is_standalone =
+    match Topology.primaries topology, Topology.replicas topology with
+    | [ primary ], [] ->
+        primary.Topology.Node.id = Topology.standalone_node_id
+    | _ -> false
+  in
   let for_primary = make_atomic_lock_table () in
   let atomic_lock_for_slot slot =
     atomic_lock_for_slot_via ~topology_ref ~for_primary slot
   in
   Router.make ~exec ~exec_multi ~close ~primary ~connection_for_slot
-    ~endpoint_for_slot ~atomic_lock_for_slot
+    ~endpoint_for_slot ~is_standalone ~atomic_lock_for_slot
 
 (* ---------- refresh fiber ---------- *)
 
@@ -554,6 +563,7 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
       in
       Ok (Router.make ~exec ~exec_multi ~close ~primary
             ~connection_for_slot ~endpoint_for_slot
+            ~is_standalone:false
             ~atomic_lock_for_slot)
 
 module For_testing = struct

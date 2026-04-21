@@ -48,14 +48,16 @@ type t = {
   primary : unit -> Connection.t option;
   connection_for_slot : connection_for_slot_fn;
   endpoint_for_slot : endpoint_for_slot_fn;
+  is_standalone : bool;
   atomic_lock_for_slot : atomic_lock_for_slot_fn;
 }
 [@@warning "-69"]
 
 let make ~exec ~exec_multi ~close ~primary ~connection_for_slot
-    ~endpoint_for_slot ~atomic_lock_for_slot =
+    ~endpoint_for_slot ~is_standalone ~atomic_lock_for_slot =
   { exec; exec_multi; close; primary;
     connection_for_slot; endpoint_for_slot;
+    is_standalone;
     atomic_lock_for_slot }
 
 let standalone (conn : Connection.t) : t =
@@ -72,6 +74,7 @@ let standalone (conn : Connection.t) : t =
     primary = (fun () -> Some conn);
     connection_for_slot = (fun _ -> Some conn);
     endpoint_for_slot = (fun _ -> None);
+    is_standalone = true;
     atomic_lock_for_slot = (fun _ -> atomic_mutex);
   }
 
@@ -81,4 +84,5 @@ let close t = t.close ()
 let primary_connection t = t.primary ()
 let connection_for_slot t slot = t.connection_for_slot slot
 let endpoint_for_slot t slot = t.endpoint_for_slot slot
+let is_standalone t = t.is_standalone
 let atomic_lock_for_slot t slot = t.atomic_lock_for_slot slot

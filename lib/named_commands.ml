@@ -84,7 +84,14 @@ let arg_at ~args i =
   if i >= 1 && i <= Array.length arr then Some arr.(i - 1)
   else None
 
-let run_transaction ?timeout:_ t ~name ~args =
+let flatten_entries arr =
+  Array.to_list arr
+  |> List.map (function
+       | Batch.One (Ok v) -> v
+       | Batch.One (Error _) -> Resp3.Null
+       | Batch.Many _ -> Resp3.Null)
+
+let run_transaction ?timeout t ~name ~args =
   match lookup t name with
   | None ->
       terminal
@@ -100,19 +107,26 @@ let run_transaction ?timeout:_ t ~name ~args =
       let queue_result : (unit, Connection.Error.t) result ref =
         ref (Ok ())
       in
-      let outcome =
-        Transaction.with_transaction ?hint_key t.client (fun tx ->
-            List.iter
-              (fun tmpl ->
-                let cmd = substitute ~args tmpl in
-                match !queue_result with
-                | Error _ -> ()   (* stop queueing after first error *)
-                | Ok () ->
-                    (match Transaction.queue tx cmd with
-                     | Ok () -> ()
-                     | Error e -> queue_result := Error e))
-              commands)
-      in
+      let batch = Batch.create ~atomic:true ?hint_key () in
+      List.iter
+        (fun tmpl ->
+          let cmd = substitute ~args tmpl in
+          match !queue_result with
+          | Error _ -> ()   (* stop queueing after first error *)
+          | Ok () ->
+              (match Batch.queue batch cmd with
+               | Ok () -> ()
+               | Error (Batch.Fan_out_in_atomic_batch cmd_name) ->
+                   queue_result :=
+                     terminal
+                       (Printf.sprintf
+                          "transaction: fan-out command %S not allowed inside \
+                           MULTI/EXEC" cmd_name)))
+        commands;
       match !queue_result with
       | Error e -> Error e
-      | Ok () -> outcome
+      | Ok () ->
+          (match Batch.run ?timeout t.client batch with
+           | Error e -> Error e
+           | Ok None -> Ok None
+           | Ok (Some arr) -> Ok (Some (flatten_entries arr)))

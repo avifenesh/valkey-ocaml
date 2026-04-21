@@ -198,6 +198,46 @@ let test_cluster_pubsub_regular () =
       | Ok _ -> Alcotest.fail "expected Channel delivery"
       | Error _ -> Alcotest.fail "no message within 2s"
 
+let test_cluster_pubsub_close_unblocks_waiter () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match CR.create ~sw ~net ~clock ~config () with
+  | Error m -> Alcotest.failf "cluster router: %s" m
+  | Ok router ->
+      let cp = CP.create ~sw ~net ~clock ~router () in
+      Fun.protect
+        ~finally:(fun () ->
+          CP.close cp;
+          Valkey.Router.close router)
+      @@ fun () ->
+      let waiting, wake = Eio.Promise.create () in
+      let outcome = ref None in
+      Eio.Fiber.fork ~sw (fun () ->
+          outcome := Some (CP.next_message cp);
+          Eio.Promise.resolve wake ());
+      Eio.Time.sleep clock 0.05;
+      CP.close cp;
+      match
+        Eio.Time.with_timeout clock 1.0
+          (fun () -> Ok (Eio.Promise.await waiting))
+      with
+      | Ok () ->
+          (match !outcome with
+           | Some (Error `Closed) -> ()
+           | Some (Error `Timeout) ->
+               Alcotest.fail "waiter timed out instead of returning `Closed"
+           | Some (Ok _) ->
+               Alcotest.fail "waiter received a message while idle"
+           | None ->
+               Alcotest.fail "waiter finished without storing a result")
+      | Error `Timeout ->
+          Alcotest.fail "close did not unblock next_message within 1s"
+
 (* Sharded SSUBSCRIBE: channel is pinned to its slot's primary.
    Both subscriber and publisher route by slot, so SPUBLISH must
    reach the same primary SSUBSCRIBE is listening on. *)
@@ -317,6 +357,23 @@ let test_cluster_keyslot_matches_client () =
                 server_slot local)
         [ "foo"; "bar"; "{user}:1"; "{user}:2";
           "long-key-with-lots-of-bytes-for-crc16" ]
+
+let test_random_target_spreads_across_connections () =
+  with_cluster_client @@ fun client ->
+  let ids = Hashtbl.create 8 in
+  for _ = 1 to 40 do
+    match C.custom ~target:C.Target.Random client [| "CLIENT"; "ID" |] with
+    | Ok (Valkey.Resp3.Integer id) ->
+        Hashtbl.replace ids id ()
+    | Ok v ->
+        Alcotest.failf "CLIENT ID via Random returned %a"
+          Valkey.Resp3.pp v
+    | Error e ->
+        Alcotest.failf "CLIENT ID via Random: %a" err_pp e
+  done;
+  if Hashtbl.length ids < 2 then
+    Alcotest.fail
+      "Target.Random never moved off one pooled connection"
 
 (* Commands whose first-key position is dynamic on the wire (the
    server reports firstkey=0 as a sentinel because the real
@@ -555,6 +612,8 @@ let tests =
       test_cross_slot_surfaces_crossslot;
     tc "cluster_pubsub: regular SUBSCRIBE"
       test_cluster_pubsub_regular;
+    tc "cluster_pubsub: close unblocks next_message"
+      test_cluster_pubsub_close_unblocks_waiter;
     tc "cluster_pubsub: sharded SSUBSCRIBE"
       test_cluster_pubsub_sharded;
     tc "cluster_pubsub: multi-slot shard subscriptions"
@@ -563,6 +622,8 @@ let tests =
       test_cluster_pubsub_failover_replay;
     tc "CLUSTER KEYSLOT matches client-side CRC16"
       test_cluster_keyslot_matches_client;
+    tc "Target.Random spreads across pooled connections"
+      test_random_target_spreads_across_connections;
     tc "CLUSTER INFO contains cluster_state"
       test_cluster_info_contains_state;
     tc "Command_spec key indices match server COMMAND INFO"

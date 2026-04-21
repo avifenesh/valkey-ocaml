@@ -65,6 +65,7 @@ val make :
   primary:(unit -> Connection.t option) ->
   connection_for_slot:connection_for_slot_fn ->
   endpoint_for_slot:endpoint_for_slot_fn ->
+  is_standalone:bool ->
   atomic_lock_for_slot:(int -> Eio.Mutex.t) ->
   t
 
@@ -96,6 +97,10 @@ val endpoint_for_slot : t -> int -> (string * string * int) option
 (** Returns [Some (primary_id, host, port)] of the current primary
     for [slot], or [None] if the slot is unowned in the router's
     topology. *)
+
+val is_standalone : t -> bool
+(** [true] only for the synthetic standalone/single-node path
+    created by {!standalone} (and wrappers built from it). *)
 
 val atomic_lock_for_slot : t -> int -> Eio.Mutex.t
 (** Mutex to acquire for the duration of an atomic operation
