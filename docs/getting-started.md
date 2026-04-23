@@ -7,7 +7,8 @@ instance (any version ≥ 7.2, but Valkey 9 is what we test against).
 ## Install
 
 ```bash
-opam install valkey     # once published; until then pin to this repo
+opam update
+opam install valkey
 opam install eio_main   # runtime for the examples below
 ```
 

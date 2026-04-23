@@ -2,12 +2,11 @@
 
 A modern Valkey client for OCaml 5 + [Eio](https://github.com/ocaml-multicore/eio).
 
-**Status: alpha.** v0.2.0 released (0.1.0 superseded — `@runtest`
-tried to hit a server that doesn't exist in the opam sandbox, so
-0.1.0 never made it through opam CI). Full core + cluster + batch
-(incl. WATCH guards + cross-slot `pfcount_cluster`) + fuzz + CI
-+ docs. Phases 0–5 and 7 closed; Phase 6 shipping v0.2.0 to
-opam-repository; Phase 8 (client-side caching) next.
+**Status: alpha.** v0.2.0 is live on opam (0.1.0 was superseded
+after `@runtest` hit a server that doesn't exist in the opam
+sandbox). Full core + cluster + batch (incl. WATCH guards +
+cross-slot `pfcount_cluster`) + fuzz + CI + docs. Phases 0–7
+closed; Phase 8 (client-side caching) next.
 
 ## Why
 
@@ -258,13 +257,16 @@ in cluster mode (`examples/10-batch/bulk.ml`).
 Requires OCaml 5.3+ and opam 2.2+.
 
 ```sh
+opam update
+opam install valkey eio_main
+```
+
+Or to build from a checkout:
+
+```sh
 opam install . --deps-only --with-test
 dune build
 ```
-
-`opam install valkey` will work once
-[opam-repository PR #29748](https://github.com/ocaml/opam-repository/pull/29748)
-merges.
 
 ## Quick start
 
@@ -474,7 +476,7 @@ state:
 - ✅ Phase 3 — CI / CD + coverage + bench + nightly fuzz + docs
 - ✅ Phase 4 — documentation (9 guides + CONTRIBUTING + CHANGELOG)
 - ✅ Phase 5 — initial 9 examples + standing rule "ship features with their example"
-- 🔄 Phase 6 — publishing (v0.2.0 submitted to opam-repository)
+- ✅ Phase 6 — publishing (v0.2.0 live on opam)
 - ✅ Phase 7 — Batch primitive (atomic + scatter-gather + WATCH
   guards + cross-slot `pfcount_cluster`) + cluster typed helpers
 - ⏳ Phase 8 — client-side caching (`CLIENT TRACKING` + LRU)

@@ -4,11 +4,14 @@ Elaborated, phased plan toward a public `valkey` package and beyond.
 Each phase is a checkpoint: a self-contained chunk of work with its
 own success criteria. Re-assessed after every phase.
 
-Current commit as of this roadmap: **153 tests passing, all core
-features shipped** (standalone, cluster, transactions, pub/sub
+Current tree snapshot: **241 tests passing; Phases 0-7 shipped;
+`valkey.0.2.0` live on opam** (standalone, cluster, transactions,
+batch incl. `with_watch` + cross-slot `pfcount_cluster`, pub/sub
 standalone + cluster-aware with failover replay, named commands,
-stability fuzzer, parser fuzzer, pre-push gate). See
-[README.md](README.md) for what's in today.
+stability fuzzer, parser fuzzer, pre-push gate). The phase bodies
+below preserve the original planning text; when the shipped shape
+changed later, the `Shipped.` paragraphs are the current source of
+truth. See [README.md](README.md) for the user-facing surface.
 
 ---
 
@@ -55,10 +58,10 @@ becomes "Valkey-complete."
 
 - Typed wrappers for ≥95 % of the commands a real app uses (GLIDE
   frequency list as the benchmark).
-- `Command_spec.command_count ()` > 300 with every entry validated.
+- Routing table in the ~230 command / sub-command range, with the
+  covered surface validated against live `COMMAND INFO`.
 - One test per newly typed command (smoke: arg-building + a success
   reply + a known error reply).
-- A `docs/adding-commands.md` cookbook.
 
 **Success criteria.**
 
@@ -210,8 +213,8 @@ enforced. Benchmarks are tracked over time. Fuzzing runs nightly.
 
 - `.github/workflows/ci.yml`, `coverage.yml`, `bench.yml`, `fuzz-nightly.yml`.
 - `bin/bench_compare/` that produces PR comments.
-- Coverage badge in the README.
-- Pre-commit link from the README to the latest bench chart.
+- Coverage report published from CI (artifact + gh-pages deploy).
+- Bench baselines published to the `bench-history` branch.
 
 **Success criteria.**
 
@@ -231,7 +234,10 @@ enforced. Benchmarks are tracked over time. Fuzzing runs nightly.
 troubleshooting, security, migration-from-ocaml-redis),
 `CONTRIBUTING.md`, a rewritten `CHANGELOG.md` covering Phase 0-3,
 and `docs.yml` building odoc + staging guides under `/guides/` on
-gh-pages. `dune build @doc` is warning-clean on all 20 modules.
+gh-pages. The current tree still builds with `dune build @doc`,
+but it now emits one odoc warning about hidden constructors in
+`Valkey.Connection.Error.t`, so the older "warning-clean"
+statement no longer holds.
 
 
 **Goal.** A new user can go from `opam install valkey` to running
@@ -303,14 +309,13 @@ one-shot batch into a standing rule.
 | 06 | `06-distributed-lock/` | SET NX EX + CAD release; not Redlock |
 | 07 | `07-task-queue/` | streams + consumer groups + XAUTOCLAIM reclaim |
 | 08 | `08-blocking-commands/` | BRPOP worker on a dedicated client |
-| 09 | `09-leaderboard/` | sorted-set leaderboard (uses Client.custom for ZADD/ZINCRBY pending typed wrappers) |
+| 09 | `09-leaderboard/` | sorted-set leaderboard using typed `ZADD` / `ZINCRBY` / `ZRANGE*` helpers |
 
-While building these, two tasks fell out:
+While building these, two follow-ons fell out:
   - Random replica selection inside `pick_node_by_read_from`
     (was first-only, now properly randomised).
-  - ZADD / ZINCRBY / ZRANK / ZSCORE remain unwrapped — go through
-    `Client.custom`. A small batch to add typed sorted-set
-    wrappers will land before 1.0.
+  - The sorted-set wrapper batch landed later in `0.2`, so the
+    leaderboard example no longer needs `Client.custom`.
 
 
 
@@ -348,7 +353,7 @@ run it, and what to observe.
 
 **Deliverables.**
 
-- 8 runnable examples, each buildable with `dune build examples/XX`.
+- 9 initial runnable examples, each buildable with `dune build examples/XX`.
 - `examples/README.md` as an index with recommended reading order.
 - Links from the main README's Quick Start.
 
@@ -364,10 +369,11 @@ in accordingly.
 
 ---
 
-## Phase 6 — Publishing / releasing
+## Phase 6 — Publishing / releasing ✅ done (0.2.0 on opam)
 
-**Goal.** `opam install valkey` works. A first `0.1.0` is out in
-the wild. A public announcement lands.
+**Goal.** `opam install valkey` works. `0.2.0` is the first
+opam-published release (`0.1.0` was superseded after opam CI
+rejected its test setup). A public announcement lands.
 
 **Scope.**
 
@@ -396,7 +402,7 @@ the wild. A public announcement lands.
     before removal. `CHANGELOG.md` notes it in both the deprecating
     release and the removing release.
 - **Release process:**
-  - GPG-signed annotated tag `v0.1.0`.
+  - GPG-signed annotated tag `v0.2.0`.
   - GitHub release with generated notes from `CHANGELOG.md`.
   - `opam publish` PR to `ocaml/opam-repository`.
   - Automate most of it via `scripts/release.sh`.
@@ -410,8 +416,9 @@ the wild. A public announcement lands.
 
 **Deliverables.**
 
-- Correct `valkey.opam` accepted into the opam-repository.
-- Git tag `v0.1.0` + GitHub release.
+- Correct `valkey.opam` accepted into the opam-repository as
+  `valkey.0.2.0`.
+- Git tag `v0.2.0` + GitHub release.
 - Announcement posted in ≥ 3 channels.
 - `scripts/release.sh` that handles CHANGELOG bump + tag + push.
 
@@ -433,15 +440,10 @@ be complete enough to use).
 gather) and atomic (`WATCH`/`MULTI`/`EXEC`) modes selected by a
 flag. Typed cluster helpers (`mget_cluster`, `mset_cluster`,
 `del_cluster`, `unlink_cluster`, `exists_cluster`,
-`touch_cluster`). `examples/10-batch/` plus `docs/batch.md`.
-
-Deferred to 0.3:
-  - `Batch.watch client ~keys` for classic WATCH semantics
-    (today `~watch:` at `create` only covers the WATCH→EXEC
-    microsecond window — use `Transaction` for now).
-  - `pfcount_cluster` — needs HLL merge support, not a simple
-    sum; sum over-counts across slots.
-  - Fold `Transaction` into a facade over `Batch ~atomic:true`.
+`touch_cluster`, `pfcount_cluster`), `Batch.with_watch` /
+`run_with_guard` for classic WATCH-style CAS, `Transaction`
+rebased as a thin façade over atomic `Batch`, plus
+`examples/10-batch/` and `docs/batch.md`.
 
 Concurrent atomic batches on one router are **now safe** — the
 router exposes a per-primary mutex (`atomic_lock_for_slot`) that
