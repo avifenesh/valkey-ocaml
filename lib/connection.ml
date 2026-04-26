@@ -402,6 +402,21 @@ let full_handshake (sock : socket) (hs : Handshake.t) :
             | Ok () -> Ok (hello_map, az)
             | Error e -> Error e))
 
+(* Non-leaking exception describer for [Error.t] payloads.
+   [Printexc.to_string] would print constructor args (paths, raw cert
+   bytes, internal state). We classify the common cases by hand and
+   fall back to the bare constructor name. Errno text from
+   [Unix.error_message] is stable and path-free.
+   The user matches on the [Error.t] variant for programmatic
+   handling; this string is for logs only. *)
+let describe_exn = function
+  | End_of_file -> "peer_closed"
+  | Unix.Unix_error (e, _, _) -> Unix.error_message e
+  | Tls_eio.Tls_alert _ -> "tls_alert"
+  | Tls_eio.Tls_failure _ -> "tls_failure"
+  | Eio.Io _ -> "io_error"
+  | exn -> Printexc.exn_slot_name exn
+
 let wrap_with_tls ~tls_cfg sock =
   match
     Tls.Config.client ~authenticator:(Tls_config.authenticator tls_cfg) ()
@@ -418,14 +433,14 @@ let wrap_with_tls ~tls_cfg sock =
        with
        | (Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _
          | End_of_file | Eio.Io _) as exn ->
-           Error (Error.Tls_failed (Printexc.to_string exn)))
+           Error (Error.Tls_failed (describe_exn exn)))
 
 let make_tcp_connector ~sw ~net ~host ~port ~tls =
   fun () ->
     match
       try
         Ok (Eio.Net.getaddrinfo_stream ~service:(string_of_int port) net host)
-      with exn -> Error (Error.Dns_failed (Printexc.to_string exn))
+      with exn -> Error (Error.Dns_failed (describe_exn exn))
     with
     | Error e -> Error e
     | Ok [] -> Error (Error.Dns_failed host)
@@ -462,7 +477,7 @@ let make_tcp_connector ~sw ~net ~host ~port ~tls =
                          | Unix.Unix_error _ -> ()
                     in
                     Ok { write; reader; read_into; close })
-         with exn -> Error (Error.Tcp_refused (Printexc.to_string exn)))
+         with exn -> Error (Error.Tcp_refused (describe_exn exn)))
 
 let connect_and_handshake t : (socket * Resp3.t * string option, Error.t) result =
   match t.connect_once () with
