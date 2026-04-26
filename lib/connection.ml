@@ -415,7 +415,10 @@ let wrap_with_tls ~tls_cfg sock =
              sock
          in
          Ok flow
-       with exn -> Error (Error.Tls_failed (Printexc.to_string exn)))
+       with
+       | (Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _
+         | End_of_file | Eio.Io _) as exn ->
+           Error (Error.Tls_failed (Printexc.to_string exn)))
 
 let make_tcp_connector ~sw ~net ~host ~port ~tls =
   fun () ->
