@@ -252,6 +252,12 @@ module Config = struct
     max_queued_bytes : int;
     tls : Tls_config.t option;
     circuit_breaker : Circuit_breaker.Config.t option;
+    client_cache : Client_cache.t option;
+    (** Client-side caching (Phase 8). [None] disables; [Some cfg]
+        issues [CLIENT TRACKING ON ...] after each (re)connect per
+        [cfg.mode], [cfg.optin], [cfg.noloop]. Storage is
+        [cfg.cache]; later steps wire the invalidator fiber and
+        race-safe GET path. *)
   }
   let default = {
     handshake = Handshake.default;
@@ -266,6 +272,7 @@ module Config = struct
        protection lower [error_threshold] or shrink [window_size]; users
        who want it off set [circuit_breaker] to None. *)
     circuit_breaker = Some Circuit_breaker.Config.default;
+    client_cache = None;
   }
 end
 
@@ -391,18 +398,64 @@ let run_select (sock : socket) db : (unit, Error.t) result =
   | exception Resp3_parser.Parse_error msg ->
       Error (Protocol_violation msg)
 
-let full_handshake (sock : socket) (hs : Handshake.t) :
+(* Build the CLIENT TRACKING command line from a Client_cache.t
+   config. ON + mode-specific options + NOLOOP when requested. *)
+let client_tracking_args (cfg : Client_cache.t) : string array =
+  let base = [ "CLIENT"; "TRACKING"; "ON" ] in
+  let with_mode =
+    match cfg.mode with
+    | Client_cache.Default ->
+        if cfg.optin then base @ [ "OPTIN" ] else base
+    | Client_cache.Bcast { prefixes } ->
+        let prefix_flags =
+          List.concat_map (fun p -> [ "PREFIX"; p ]) prefixes
+        in
+        base @ prefix_flags @ [ "BCAST" ]
+  in
+  let with_noloop =
+    if cfg.noloop then with_mode @ [ "NOLOOP" ] else with_mode
+  in
+  Array.of_list with_noloop
+
+(* Issue CLIENT TRACKING during handshake. Fail-closed: if the
+   server rejects (older server, ACL denies, typo in prefixes),
+   the whole connect fails rather than silently falling back to
+   an unconfigured cache. *)
+let run_client_tracking (sock : socket) (cfg : Client_cache.t) :
+    (unit, Error.t) result =
+  sock.write (Resp3_writer.command_to_cstruct (client_tracking_args cfg));
+  match Resp3_parser.read (Resp3_parser.of_buf_read sock.reader) with
+  | Simple_string "OK" -> Ok ()
+  | Simple_error s | Bulk_error s ->
+      Error (Handshake_rejected (Valkey_error.of_string s))
+  | other ->
+      Error
+        (Protocol_violation
+           (Format.asprintf "CLIENT TRACKING returned %a" Resp3.pp other))
+  | exception Resp3_parser.Parse_error msg ->
+      Error (Protocol_violation msg)
+
+let full_handshake (sock : socket) (hs : Handshake.t)
+    ~(client_cache : Client_cache.t option) :
     (Resp3.t * string option, Error.t) result =
   match run_hello sock hs with
   | Error _ as e -> e
   | Ok hello_map ->
       let az = extract_string_field "availability_zone" hello_map in
-      (match hs.select_db with
-       | None -> Ok (hello_map, az)
-       | Some db ->
-           (match run_select sock db with
-            | Ok () -> Ok (hello_map, az)
-            | Error e -> Error e))
+      let after_select =
+        match hs.select_db with
+        | None -> Ok ()
+        | Some db -> run_select sock db
+      in
+      (match after_select with
+       | Error e -> Error e
+       | Ok () ->
+           (match client_cache with
+            | None -> Ok (hello_map, az)
+            | Some cfg ->
+                (match run_client_tracking sock cfg with
+                 | Ok () -> Ok (hello_map, az)
+                 | Error e -> Error e)))
 
 (* Non-leaking exception describer for [Error.t] payloads.
    [Printexc.to_string] would print constructor args (paths, raw cert
@@ -490,7 +543,10 @@ let connect_and_handshake t : (socket * Resp3.t * string option, Error.t) result
       match t.connect_once () with
       | Error e -> Error e
       | Ok sock ->
-          (match full_handshake sock t.config.handshake with
+          (match
+             full_handshake sock t.config.handshake
+               ~client_cache:t.config.client_cache
+           with
            | Ok (info, az) -> Ok (sock, info, az)
            | Error e ->
                sock.close ();

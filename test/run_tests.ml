@@ -12,8 +12,8 @@ let () =
       "command_spec", Test_command_spec.tests;
       "connection (needs docker valkey :6379)", Test_connection.tests;
       "client (needs docker valkey :6379)", Test_client.tests;
-      "client-side cache (needs docker valkey :6379 >=7.4)",
-        Test_client_side_cache.tests;
+      "csc tracking (needs docker valkey :6379 >=7.4)",
+        Test_csc_tracking.tests;
       "sorted set (needs docker valkey :6379)", Test_sorted_set.tests;
       "transaction (needs docker valkey :6379)", Test_transaction.tests;
       "pubsub (needs docker valkey :6379)", Test_pubsub.tests;

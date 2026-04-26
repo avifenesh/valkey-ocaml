@@ -63,6 +63,11 @@ module Config : sig
     max_queued_bytes : int;
     tls : Tls_config.t option;
     circuit_breaker : Circuit_breaker.Config.t option;
+    client_cache : Client_cache.t option;
+    (** Client-side caching (Phase 8). When [Some], [CLIENT
+        TRACKING ON ...] is issued after every (re)connect per
+        [mode]/[optin]/[noloop]. When [None], tracking is not
+        enabled and the cache is unused. *)
   }
   val default : t
 end

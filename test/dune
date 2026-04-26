@@ -37,7 +37,7 @@
           test_cluster
           test_command_spec_property
           test_batch
-          test_client_side_cache
+          test_csc_tracking
           test_resp3
           test_resp3_roundtrip
           test_retry_state
@@ -49,4 +49,4 @@
           test_redirect
           test_command_spec
           test_cache)
- (libraries valkey alcotest eio_main str))
+ (libraries valkey alcotest eio_main))
