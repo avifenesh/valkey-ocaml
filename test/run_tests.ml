@@ -14,6 +14,8 @@ let () =
       "client (needs docker valkey :6379)", Test_client.tests;
       "csc tracking (needs docker valkey :6379 >=7.4)",
         Test_csc_tracking.tests;
+      "csc invalidation (needs docker valkey :6379 >=7.4)",
+        Test_csc_invalidation.tests;
       "sorted set (needs docker valkey :6379)", Test_sorted_set.tests;
       "transaction (needs docker valkey :6379)", Test_transaction.tests;
       "pubsub (needs docker valkey :6379)", Test_pubsub.tests;

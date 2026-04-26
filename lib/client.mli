@@ -11,6 +11,18 @@ module Config : sig
     connection : Connection.Config.t;
     client_az : string option;
     read_from : Read_from.t;
+    client_cache : Client_cache.t option;
+    (** Enable client-side caching at the Client level. When set,
+        [Client.connect] propagates this into the inner
+        [Connection.Config] for every shard connection it creates
+        (standalone and cluster), so all shards share a single
+        [Cache.t] and agree on tracking mode.
+
+        Setting both this field and [connection.client_cache]
+        simultaneously is an error: [Client.connect] raises
+        [Invalid_argument]. Users who want CSC should set this
+        field; users who build raw [Connection.t] directly set
+        [Connection.Config.client_cache] instead. *)
   }
   val default : t
 end

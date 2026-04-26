@@ -97,9 +97,34 @@ behaviour is unit-tested directly against `Cache.t`.
 
 Nothing populates the cache yet — that's step 4.
 
-### … 4. Race-safe GET path
+### ✅ 4. Read-path caching (`optin=false`)
 
-In-flight tracking + concurrent-fetch dedup + drop-on-invalidation.
+`Client.Config.t` gains a `client_cache : Client_cache.t option`
+field. When set, `Client.connect` propagates it into the inner
+`Connection.Config` so every shard connection shares one
+`Cache.t` and one tracking mode. Atomic batches, pubsub, and raw
+`Connection.request` paths bypass the cache by construction —
+they don't go through `Client.get`.
+
+`Client.get` consults the cache first. On hit, returns the
+cached value with no wire traffic and no replica selection
+(the cache is a logical view of server state keyed by the
+Valkey key, not by routing target). On miss, `exec` as
+before; the returned `Bulk_string` is cached so the next `get`
+hits. `Null` (missing key) is intentionally not cached — a
+later external SET would have no entry to evict via the
+invalidation path, so a negative cache could stay stale forever.
+
+`optin=true` is planned for a later step (`B2.5`, pipelined
+`CLIENT CACHING YES` + read). Setting `optin=true` on the config
+today raises `Invalid_argument` at connect time.
+
+Single-flight dedup and in-flight/invalidation race handling
+land in step 5.
+
+See `lib/client.ml` — `resolve_connection_config`, the
+`client_cache` field on `t`, and the `Client.get` branch that
+checks cache first.
 
 ### … 5. Per-command coverage
 

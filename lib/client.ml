@@ -6,17 +6,42 @@ module Config = struct
     connection : Connection.Config.t;
     client_az : string option;
     read_from : Read_from.t;
+    client_cache : Client_cache.t option;
   }
   let default = {
     connection = Connection.Config.default;
     client_az = None;
     read_from = Read_from.default;
+    client_cache = None;
   }
 end
+
+(* Merge [Config.client_cache] into the inner [Connection.Config]
+   so every Connection the Client builds carries the same cache
+   reference. Enforces the "set one or the other, not both" rule. *)
+let resolve_connection_config (cfg : Config.t) : Connection.Config.t =
+  match cfg.client_cache, cfg.connection.client_cache with
+  | None, _ -> cfg.connection
+  | Some _, Some _ ->
+      invalid_arg
+        "Client.connect: set client_cache on Config.t OR on \
+         Config.t.connection, not both"
+  | Some cc, None ->
+      if cc.Client_cache.optin then
+        invalid_arg
+          "Client.Config.client_cache: optin=true is not yet \
+           supported (planned for Phase 8 step B2.5); use \
+           optin=false for now";
+      { cfg.connection with client_cache = Some cc }
 
 type t = {
   router : Router.t;
   config : Config.t;
+  client_cache : Client_cache.t option;
+  (** Effective cache: resolved from [config.client_cache] or
+      [config.connection.client_cache] at connect time. Cached here
+      so cache-aware command paths don't re-run the precedence
+      check on every call. *)
   loaded_shas : (string, unit) Hashtbl.t;
   loaded_shas_mutex : Eio.Mutex.t;
 }
@@ -26,9 +51,10 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
   (* Standalone is a degenerate one-shard cluster: synthesise a topology,
      stash the one Connection in a Node_pool, and dispatch through the
      same Cluster_router code path that handles real clusters. *)
+  let conn_cfg = resolve_connection_config config in
   let connection =
     Connection.connect ~sw ~net ~clock ?domain_mgr
-      ~config:config.connection ~host ~port ()
+      ~config:conn_cfg ~host ~port ()
   in
   let tls_port =
     if config.connection.tls <> None then Some port else None
@@ -40,11 +66,14 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
     Cluster_router.from_pool_and_topology ~clock ~pool ~topology ()
   in
   { router; config;
+    client_cache = conn_cfg.Connection.Config.client_cache;
     loaded_shas = Hashtbl.create 16;
     loaded_shas_mutex = Eio.Mutex.create () }
 
 let from_router ~config router =
+  let conn_cfg = resolve_connection_config config in
   { router; config;
+    client_cache = conn_cfg.Connection.Config.client_cache;
     loaded_shas = Hashtbl.create 16;
     loaded_shas_mutex = Eio.Mutex.create () }
 
@@ -153,9 +182,43 @@ let string_option_of_reply cmd = function
 (* ---------- strings / keys ---------- *)
 
 let get ?timeout ?read_from t key =
-  match exec ?timeout ?read_from t [| "GET"; key |] with
-  | Error e -> Error e
-  | Ok v -> string_option_of_reply "GET" v
+  (* Client-side cache path. Cache is logical: shared across all
+     shard connections, keyed by the full Valkey key. On hit, we
+     short-circuit routing entirely — no wire traffic, no replica
+     selection. On miss, we [exec] as normal; on a successful
+     Bulk_string reply, populate the cache so the next GET hits.
+     Null replies (missing key) are intentionally not cached:
+     an external SET would arrive with no prior entry to evict,
+     so a Null cache would stay stale. *)
+  match t.client_cache with
+  | Some ccfg ->
+      (match Cache.get ccfg.Client_cache.cache key with
+       | Some (Resp3.Bulk_string s) -> Ok (Some s)
+       | Some Resp3.Null -> Ok None
+       | Some other ->
+           (* Cache holds a non-string value for this key —
+              someone stuffed a non-GET reply in there. Fall back
+              to the server; don't corrupt the user's result. *)
+           ignore other;
+           (match exec ?timeout ?read_from t [| "GET"; key |] with
+            | Error e -> Error e
+            | Ok v ->
+                (match v with
+                 | Resp3.Bulk_string _ -> Cache.put ccfg.cache key v
+                 | _ -> ());
+                string_option_of_reply "GET" v)
+       | None ->
+           (match exec ?timeout ?read_from t [| "GET"; key |] with
+            | Error e -> Error e
+            | Ok v ->
+                (match v with
+                 | Resp3.Bulk_string _ -> Cache.put ccfg.cache key v
+                 | _ -> ());
+                string_option_of_reply "GET" v))
+  | None ->
+      (match exec ?timeout ?read_from t [| "GET"; key |] with
+       | Error e -> Error e
+       | Ok v -> string_option_of_reply "GET" v)
 
 let set ?timeout ?cond ?ttl ?ifeq t key value =
   let args = build_set_args ?cond ?ttl ?ifeq ~get:false key value in

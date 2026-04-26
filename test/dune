@@ -39,6 +39,7 @@
           test_command_spec_property
           test_batch
           test_csc_tracking
+          test_csc_invalidation
           test_resp3
           test_resp3_roundtrip
           test_retry_state
