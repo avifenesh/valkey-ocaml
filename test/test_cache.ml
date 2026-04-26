@@ -128,6 +128,43 @@ let test_zero_budget_rejects_everything () =
   Alcotest.(check int) "zero-budget cache stays empty" 0 (C.count c);
   Alcotest.(check (option reject)) "miss" None (C.get c "k")
 
+(* --- TTL ---------------------------------------------------- *)
+
+let sleep_ms ms = Unix.sleepf (ms /. 1000.0)
+
+let test_ttl_unset_entries_never_expire () =
+  let c = C.create ~byte_budget:1024 in
+  C.put c "k" (bs "v");
+  sleep_ms 30.0;
+  Alcotest.(check bool) "still there without ttl" true
+    (Option.is_some (C.get c "k"))
+
+let test_ttl_expired_entry_is_miss () =
+  let c = C.create ~byte_budget:1024 in
+  C.put ~ttl_ms:30 c "k" (bs "v");
+  (* Not expired yet. *)
+  Alcotest.(check bool) "hit before expiry" true
+    (Option.is_some (C.get c "k"));
+  sleep_ms 60.0;
+  Alcotest.(check (option reject)) "miss after expiry"
+    None (C.get c "k");
+  (* Expired entry was evicted in place; count reflects it. *)
+  Alcotest.(check int) "count 0 after expired get" 0 (C.count c)
+
+let test_ttl_put_refreshes_deadline () =
+  let c = C.create ~byte_budget:1024 in
+  C.put ~ttl_ms:30 c "k" (bs "v1");
+  sleep_ms 20.0;
+  (* Refresh with longer TTL before expiry. *)
+  C.put ~ttl_ms:200 c "k" (bs "v2");
+  sleep_ms 30.0;
+  (* Original ttl would have expired by now (~50ms elapsed). *)
+  Alcotest.(check bool) "still hit after refresh" true
+    (Option.is_some (C.get c "k"));
+  match C.get c "k" with
+  | Some (Valkey.Resp3.Bulk_string "v2") -> ()
+  | _ -> Alcotest.fail "expected v2"
+
 let tests =
   [ Alcotest.test_case "empty cache" `Quick test_create_empty;
     Alcotest.test_case "negative byte_budget rejected" `Quick
@@ -149,4 +186,10 @@ let tests =
     Alcotest.test_case "size_of bulk string" `Quick test_size_of_bulk_string;
     Alcotest.test_case "zero budget rejects everything" `Quick
       test_zero_budget_rejects_everything;
+    Alcotest.test_case "ttl unset entries never expire" `Quick
+      test_ttl_unset_entries_never_expire;
+    Alcotest.test_case "ttl expired entry is miss" `Slow
+      test_ttl_expired_entry_is_miss;
+    Alcotest.test_case "put refreshes ttl deadline" `Slow
+      test_ttl_put_refreshes_deadline;
   ]

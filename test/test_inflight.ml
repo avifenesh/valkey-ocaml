@@ -97,6 +97,26 @@ let test_abandon_clears_entry () =
   I.abandon t "k";
   Alcotest.(check int) "empty after abandon" 0 (I.pending_count t)
 
+(* --- mark_all_dirty (Flush_all hook) --------------------------- *)
+
+let test_mark_all_dirty_flips_every_pending () =
+  let t = I.create () in
+  let _ = fresh_resolver (I.begin_fetch t "a") in
+  let _ = fresh_resolver (I.begin_fetch t "b") in
+  let _ = fresh_resolver (I.begin_fetch t "c") in
+  I.mark_all_dirty t;
+  (match I.complete t "a" with
+   | I.Dirty -> () | I.Clean -> Alcotest.fail "a should be dirty");
+  (match I.complete t "b" with
+   | I.Dirty -> () | I.Clean -> Alcotest.fail "b should be dirty");
+  (match I.complete t "c" with
+   | I.Dirty -> () | I.Clean -> Alcotest.fail "c should be dirty")
+
+let test_mark_all_dirty_on_empty_is_noop () =
+  let t = I.create () in
+  I.mark_all_dirty t;
+  Alcotest.(check int) "still empty" 0 (I.pending_count t)
+
 let tests =
   [ Alcotest.test_case "first fetch is fresh" `Quick test_first_is_fresh;
     Alcotest.test_case "second concurrent fetch joins" `Quick
@@ -117,4 +137,8 @@ let tests =
       test_complete_absent_is_clean;
     Alcotest.test_case "abandon clears entry" `Quick
       test_abandon_clears_entry;
+    Alcotest.test_case "mark_all_dirty flips every pending" `Quick
+      test_mark_all_dirty_flips_every_pending;
+    Alcotest.test_case "mark_all_dirty on empty is noop" `Quick
+      test_mark_all_dirty_on_empty_is_noop;
   ]

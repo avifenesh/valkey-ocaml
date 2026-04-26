@@ -40,6 +40,12 @@ val mark_dirty : 'v t -> string -> unit
     No-op if no fetch is in flight.  Called by the invalidator
     fiber before {!Cache.evict}. *)
 
+val mark_all_dirty : 'v t -> unit
+(** Flip the dirty flag on every pending fetch.  Used by the
+    invalidator fiber on a flush-all push so in-flight owners
+    don't cache values that were fresh pre-flush but stale
+    post-flush. *)
+
 type completion = Clean | Dirty
 
 val complete : 'v t -> string -> completion

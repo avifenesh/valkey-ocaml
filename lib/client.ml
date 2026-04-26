@@ -227,7 +227,7 @@ let cached_read t ccfg key ?timeout ?read_from
         in
         (match result with
          | Ok v when completion = Inflight.Clean && cache_ok v ->
-             Cache.put ccfg.cache key v
+             Cache.put ?ttl_ms:ccfg.entry_ttl_ms ccfg.cache key v
          | _ -> ());
         (match result with
          | Ok v -> Eio.Promise.resolve resolver (Ok v)
@@ -416,7 +416,7 @@ let finalise_batch_success ccfg ~batch_resolvers ~reply_items =
         let completion = Inflight.complete ccfg.Client_cache.inflight key in
         (match reply_v with
          | Resp3.Bulk_string _ when completion = Inflight.Clean ->
-             Cache.put ccfg.cache key reply_v
+             Cache.put ?ttl_ms:ccfg.entry_ttl_ms ccfg.cache key reply_v
          | _ -> ());
         Eio.Promise.resolve resolver (Ok reply_v);
         match decode_mget_element "MGET" reply_v with

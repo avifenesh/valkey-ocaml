@@ -158,6 +158,20 @@ let test_apply_keys_marks_inflight_dirty () =
    | IF.Clean -> ()
    | IF.Dirty -> Alcotest.fail "cold should still be clean")
 
+(* Flush_all closes the in-flight-race gap via mark_all_dirty. *)
+let test_apply_flush_all_marks_every_inflight_dirty () =
+  let c = C.create ~byte_budget:1024 in
+  let inf = fresh_infl () in
+  let _ = IF.begin_fetch inf "a" in
+  let _ = IF.begin_fetch inf "b" in
+  I.apply c inf I.Flush_all;
+  (match IF.complete inf "a" with
+   | IF.Dirty -> ()
+   | IF.Clean -> Alcotest.fail "a should be dirty after Flush_all");
+  (match IF.complete inf "b" with
+   | IF.Dirty -> ()
+   | IF.Clean -> Alcotest.fail "b should be dirty after Flush_all")
+
 let tests =
   [ Alcotest.test_case "keys list" `Quick test_keys;
     Alcotest.test_case "null body -> flush all" `Quick test_flush_all;
@@ -179,4 +193,6 @@ let tests =
     Alcotest.test_case "apply Keys [] is noop" `Quick test_apply_keys_empty;
     Alcotest.test_case "apply Keys marks inflight dirty" `Quick
       test_apply_keys_marks_inflight_dirty;
+    Alcotest.test_case "apply Flush_all marks every inflight dirty" `Quick
+      test_apply_flush_all_marks_every_inflight_dirty;
   ]

@@ -19,6 +19,11 @@ type entry = {
   mutable size : int;
   mutable prev : entry option;
   mutable next : entry option;
+  mutable expires_at : float option;
+  (** Wall-clock deadline in seconds (same epoch as
+      [Unix.gettimeofday]). [None] means no expiry — entry lives
+      until explicitly evicted, LRU-evicted, or replaced. Set
+      by [put] when the caller supplies [?ttl_ms]. *)
 }
 
 type t = {
@@ -121,10 +126,26 @@ let get t key =
       match Hashtbl.find_opt t.table key with
       | None -> None
       | Some e ->
-          move_to_front t e;
-          Some e.value)
+          (* Lazy TTL expiration: if the entry's deadline has
+             passed, treat as a miss and evict in place. No
+             background sweeper; expiration work only happens
+             on the read path. *)
+          let expired =
+            match e.expires_at with
+            | None -> false
+            | Some deadline -> Unix.gettimeofday () > deadline
+          in
+          if expired then begin
+            unlink t e;
+            Hashtbl.remove t.table key;
+            t.total_bytes <- t.total_bytes - e.size;
+            None
+          end else begin
+            move_to_front t e;
+            Some e.value
+          end)
 
-let put t key value =
+let put ?ttl_ms t key value =
   with_lock t (fun () ->
       let new_size = size_of value in
       if new_size > t.byte_budget then
@@ -133,20 +154,28 @@ let put t key value =
            this out). *)
         ()
       else begin
+        let expires_at =
+          match ttl_ms with
+          | None -> None
+          | Some ms ->
+              Some (Unix.gettimeofday () +. (float_of_int ms /. 1000.0))
+        in
         (match Hashtbl.find_opt t.table key with
          | Some e ->
              (* Replace existing entry; adjust total_bytes for the
-                size delta and move to MRU. *)
+                size delta, refresh TTL, and move to MRU. *)
              t.total_bytes <- t.total_bytes - e.size + new_size;
              e.value <- value;
              e.size <- new_size;
+             e.expires_at <- expires_at;
              move_to_front t e
          | None ->
              let e = { key;
                        value;
                        size = new_size;
                        prev = None;
-                       next = None } in
+                       next = None;
+                       expires_at } in
              Hashtbl.add t.table key e;
              push_front t e;
              t.total_bytes <- t.total_bytes + new_size);

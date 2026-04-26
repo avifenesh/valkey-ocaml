@@ -55,18 +55,11 @@ let of_push (v : Resp3.t) : t option =
    unit-testable without an Eio runtime. *)
 let apply cache inflight = function
   | Flush_all ->
-      (* We don't know which keys were pending; conservatively mark
-         every pending key dirty by recreating nothing — flush-all
-         means everything is stale. The simpler model is to just
-         clear the cache; any in-flight fetch whose Keys-scoped
-         invalidation didn't arrive will be caught by the TTL
-         safety net later if configured. For now, Flush_all does
-         not touch the in-flight table — the cache is emptied and
-         in-flight owners resolve with their (now-stale) value,
-         cache it, and the cache stays populated with one fresh
-         entry until the *next* invalidation for that key.
-         TODO (B6 / B8): revisit this. For now documented as a
-         known gap; matches what lettuce does in its CSC path. *)
+      (* Flush-all means every key is now stale. Order matters for
+         the same reason as the Keys branch: mark every in-flight
+         fetch dirty FIRST so completions after this point don't
+         cache now-stale values, then clear the cache itself. *)
+      Inflight.mark_all_dirty inflight;
       Cache.clear cache
   | Keys ks ->
       List.iter

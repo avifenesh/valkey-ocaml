@@ -28,15 +28,21 @@ val create : byte_budget:int -> t
     head of the LRU list. *)
 val get : t -> string -> Resp3.t option
 
-(** [put t key value] inserts [(key, value)], replacing any prior
-    entry for [key]. If after insertion the total size would exceed
-    the byte budget, LRU entries are evicted from the tail until the
-    budget is satisfied.
+(** [put ?ttl_ms t key value] inserts [(key, value)], replacing any
+    prior entry for [key]. If after insertion the total size would
+    exceed the byte budget, LRU entries are evicted from the tail
+    until the budget is satisfied.
 
-    If the size of [value] alone (per {!size_of}) is strictly larger
-    than the byte budget, the entry is not inserted and any prior
-    entry for [key] is left untouched. *)
-val put : t -> string -> Resp3.t -> unit
+    If [ttl_ms] is given, the entry carries a wall-clock expiry
+    (same epoch as [Unix.gettimeofday]). Expired entries are
+    evicted lazily on the next {!get} that hits them. If [ttl_ms]
+    is omitted, the entry has no expiry and lives until evicted
+    or replaced.
+
+    If the size of [value] alone (per {!size_of}) is strictly
+    larger than the byte budget, the entry is not inserted and
+    any prior entry for [key] is left untouched. *)
+val put : ?ttl_ms:int -> t -> string -> Resp3.t -> unit
 
 (** [evict t key] removes the entry if present. No-op if absent. *)
 val evict : t -> string -> unit

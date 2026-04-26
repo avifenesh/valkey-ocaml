@@ -75,6 +75,15 @@ let mark_dirty t key =
       | Some e -> e.dirty <- true
       | None -> ())
 
+(* Flip the dirty flag on every pending fetch. Used by the
+   invalidator fiber on a Flush_all push so in-flight owners
+   don't cache values that were fresh pre-flush but stale
+   post-flush. Cheap in practice: pending counts are small
+   (< wire-level concurrency). *)
+let mark_all_dirty t =
+  with_lock t (fun () ->
+      Hashtbl.iter (fun _ e -> e.dirty <- true) t.table)
+
 (* Complete a successful fetch. Returns [`Clean] if the caller
    should populate the cache with the fetched value, or [`Dirty]
    if an invalidation arrived during the fetch and the value must

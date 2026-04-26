@@ -256,9 +256,49 @@ let test_cluster_failover_flushes_cache () =
            worth it for a single test. *)
         ())
 
+(* --- TTL safety net (B9) --------------------------------------- *)
+
+(* With entry_ttl_ms set, a cached entry expires locally even if
+   no server invalidation arrives. Proves the safety-net path:
+   populate, sleep past TTL without touching the server (no
+   external writes, no FLUSHDB), assert the next GET sees a
+   miss-then-populate instead of a stale cached hit. *)
+let test_ttl_safety_net_expires_without_invalidation () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let cache = Cache.create ~byte_budget:(1024 * 1024) in
+  let ccfg =
+    Valkey.Client_cache.make ~cache ~entry_ttl_ms:100 ()
+  in
+  let client =
+    C.connect ~sw ~net ~clock
+      ~config:{ Cfg.default with client_cache = Some ccfg }
+      ~host ~port ()
+  in
+  let aux = C.connect ~sw ~net ~clock ~host ~port () in
+  let k = "ocaml:csc:lc:ttl:k" in
+  let _ = C.del aux [k] in
+  let _ = C.exec aux [| "SET"; k; "v" |] in
+  (match C.get client k with
+   | Ok (Some "v") -> ()
+   | _ -> Alcotest.fail "initial GET");
+  Alcotest.(check bool) "cached" true
+    (Option.is_some (Cache.get cache k));
+  (* Wait past TTL without any server-side change. *)
+  sleep_ms env 200.0;
+  Alcotest.(check (option reject)) "cache miss after TTL expiry"
+    None (Cache.get cache k);
+  let _ = C.del aux [k] in
+  C.close client;
+  C.close aux
+
 let tests =
   [ Alcotest.test_case "standalone: reconnect flushes cache" `Slow
       test_standalone_reconnect_flushes_cache;
     Alcotest.test_case "cluster: failover flushes cache" `Slow
       test_cluster_failover_flushes_cache;
+    Alcotest.test_case "ttl: expires entry without invalidation" `Slow
+      test_ttl_safety_net_expires_without_invalidation;
   ]
