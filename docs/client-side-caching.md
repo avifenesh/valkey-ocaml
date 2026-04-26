@@ -49,9 +49,26 @@ The byte budget is a *soft* limit: a `put` that fits in budget after
 evicting the LRU tail succeeds; a single value strictly larger than
 the budget is rejected (`put` is a no-op).
 
-### … 2. `CLIENT TRACKING ON OPTIN NOLOOP`
+### ✅ 2. `CLIENT TRACKING` handshake on connect / reconnect
 
-Wires up the connection-side tracking handshake on connect / reconnect.
+Connection config gains a `client_cache : Client_cache.t option`.
+When `Some cfg`, `full_handshake` issues `CLIENT TRACKING ON
+[OPTIN] [BCAST PREFIX …] [NOLOOP]` after `HELLO`/`SELECT`, per
+`cfg.mode`, `cfg.optin`, `cfg.noloop`. The existing `on_connected`
+hook re-issues the same sequence after every reconnect, matching
+the pubsub-resubscribe pattern.
+
+Fails closed: if the server rejects `CLIENT TRACKING` (older
+server, ACL denies the command, invalid prefix, etc.), the whole
+connect fails rather than silently dropping to an unconfigured
+cache. Users see a typed handshake error.
+
+No reads or writes go through the cache yet; this step just makes
+the server aware the connection is tracking so that subsequent
+steps can consume invalidation pushes. See
+[`lib/client_cache.ml`](../lib/client_cache.ml),
+[`lib/connection.ml`](../lib/connection.ml) (`run_client_tracking`,
+`full_handshake`).
 
 ### … 3. Invalidator fiber
 
