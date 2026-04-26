@@ -317,7 +317,24 @@ Tests:
 
 All 136 unit + 22 integration tests green.
 
-### … 10. Metrics + BCAST mode
+### ✅ 10a. Metrics
 
-Counters for hit/miss/eviction; BCAST alternative invalidation
-path with prefix subscription.
+`Cache` carries six `int Atomic.t` counters: `hits`, `misses`,
+`evicts_budget` (byte-budget LRU eviction), `evicts_ttl` (lazy
+TTL expiry on read), `invalidations` (`evict` calls; fed by the
+invalidator fiber and by user `evict`), and `puts` (every `put`
+call including oversize-rejected ones). Read non-locking via
+`Cache.metrics : t -> metrics`; `Cache.reset_metrics : t -> unit`
+zeroes the counters (for benchmarks — production should use
+deltas).
+
+Exposed at the Client layer as `Client.cache_metrics : t ->
+Cache.metrics option`. Returns `None` when caching isn't
+enabled.
+
+### … 10b. BCAST mode
+
+Alternative invalidation path where the server pushes invalidations
+for every key under a declared prefix instead of per-key tracking.
+Useful for fleet-scale workloads where the per-client tracking
+table grows unboundedly on the server.
