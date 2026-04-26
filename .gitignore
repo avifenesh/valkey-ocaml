@@ -48,6 +48,8 @@ coverage/
 
 # Session tooling artifacts (not project code)
 .remember/
+.claude/
+.fastembed_cache/
 
 # Generated TLS dev certs
 tls/
