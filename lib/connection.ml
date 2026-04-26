@@ -726,6 +726,20 @@ let recovery_loop (t : t) : unit =
           t.sleep (jittered_backoff policy n);
           attempt (n + 1)
       | Ok (Ok (sock, info, az)) ->
+          (* The server forgot our CLIENT TRACKING context while we
+             were disconnected. Any cached entry we own for a key
+             that routed through this connection is now un-tracked
+             on the server side — an external write won't produce
+             an invalidation for us. Conservative fix: clear the
+             whole CSC cache on every successful reconnect. Coarse
+             (a shard blip in a large cluster costs us every hit
+             until the cache warms back up) but correct, and
+             matches redis-py. B1's full_handshake has already
+             re-issued CLIENT TRACKING on [sock] so future reads
+             start tracked. *)
+          (match t.config.client_cache with
+           | None -> ()
+           | Some ccfg -> Cache.clear ccfg.Client_cache.cache);
           Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
               drain_sent t (Error Error.Interrupted);
               t.current <- Some sock;

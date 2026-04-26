@@ -428,7 +428,18 @@ let apply_new_topology ~sw ~net ~clock ?domain_mgr ~cfg ~pool
       ~connection_config:cfg.Config.connection
       ~prefer_hostname:cfg.Config.prefer_hostname
       ~pool ~new_topology:new_topo ();
-    Atomic.set topology_atomic new_topo
+    Atomic.set topology_atomic new_topo;
+    (* Topology changed — slot ownership may have shifted, failover
+       may have rotated primaries. The server on any reconnected
+       shard has forgotten our CLIENT TRACKING context, so entries
+       in the CSC cache keyed by keys that route to those shards
+       are now un-tracked on the server side: an external write
+       would not produce an invalidation for us. Conservative fix:
+       clear the whole CSC cache on any topology change. Matches
+       redis-py. See docs/client-side-caching.md step 7. *)
+    (match cfg.Config.connection.Connection.Config.client_cache with
+     | None -> ()
+     | Some ccfg -> Cache.clear ccfg.Client_cache.cache)
   end
 
 let refresh_from_seeds ~sw ~net ~clock ?domain_mgr ~cfg ~pool

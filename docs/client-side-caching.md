@@ -219,10 +219,43 @@ resolved with the error so joiners propagate it. The call
 returns `Error e`; hits and joiners-that-succeeded do not
 override the failure.
 
-### … 7. Cluster integration
+### ✅ 7. Cluster integration
 
-Per-shard tracking, single shared cache, reconnect-flush
-invariant, MOVED-evict on redirect.
+Per-shard tracking already worked by construction: Client
+threads the `Client_cache.t` reference into every per-shard
+`Connection.Config` that `Cluster_router.build_pool` creates,
+so every shard's handshake issues `CLIENT TRACKING ON` and
+every shard's invalidator fiber drains into the same shared
+`Cache.t`. This step added the missing flush invariants:
+
+- **Topology refresh** (`apply_new_topology` in
+  `cluster_router.ml`) calls `Cache.clear` when the topology
+  SHA changes. Slot migrations, failovers, and topology-
+  triggered reconnects all funnel through here. Closes the
+  slot-migration staleness window (key K migrated A→B; the
+  old cached value from A is dropped before the next read
+  routes to B).
+- **Per-connection reconnect** (`recovery_loop`'s success
+  branch in `connection.ml`) calls `Cache.clear` on every
+  successful reconnect. The server forgets our tracking
+  context while we're disconnected; entries cached from a
+  blipped shard would stop getting invalidations. Coarse
+  (one shard blip in a 100-shard cluster clears everything),
+  but correct; matches redis-py.
+
+MOVED/ASK redirect does not need its own eviction path: the
+existing `trigger_refresh ()` call in `handle_retries` wakes
+the refresh fiber, and the next `apply_new_topology` with a
+different SHA clears the cache.
+
+Integration tests (`test/test_csc_cluster.ml`, needs
+`docker-compose.cluster.yml`):
+- Two hashtag-distinct keys route to different shards; external
+  writes to both shards are caught by each shard's invalidator
+  fiber and evict from the shared cache.
+- `FLUSHDB` fanned out across all primaries clears the whole
+  cache (one null-body invalidation per shard, all evicting
+  the same shared cache).
 
 ### … 8. Failure-mode tests
 
