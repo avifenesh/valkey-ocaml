@@ -132,25 +132,27 @@ let map_optin_pair_reply :
               "CLIENT CACHING YES: unexpected reply %a"
               Resp3.pp other))
 
-(* OPTIN-armed read: pipeline [CLIENT CACHING YES] + [args] as
-   one wire-atomic submit through the router's [pair] dispatch.
-   On cluster, MOVED on the read frame triggers redirect-aware
-   retry of the WHOLE pair on the new owner (CACHING YES stays
-   adjacent to the read); on standalone the router's pair
-   collapses to a direct [Connection.request_pair]. OPTIN
-   reads force [Read_from.Primary] regardless of the user's
-   ~read_from hint — replicas don't run CLIENT TRACKING, so a
-   replica-side read either errors or silently fails to register
-   tracking. *)
+(* The OPTIN arming command. Lifted to a module-level constant so
+   we don't allocate a fresh array per cached read. *)
+let client_caching_yes = [| "CLIENT"; "CACHING"; "YES" |]
+
+(* OPTIN-armed read: pipeline CACHING YES + [args] as one
+   wire-atomic submit through the router's [pair] dispatch.
+   Routing is always [Read_from.Primary] (replicas don't run
+   CLIENT TRACKING), so [pair] takes the slot target and the
+   router pins to that slot's primary. *)
 let exec_optin_pair ?timeout t args =
-  let target =
-    match Command_spec.target_and_rf Router.Read_from.Primary args with
-    | Some (target, _rf) -> target
-    | None -> Router.Target.Random
-  in
-  map_optin_pair_reply
-    (Router.pair ?timeout t.router target Router.Read_from.Primary
-       [| "CLIENT"; "CACHING"; "YES" |] args)
+  match Command_spec.target_and_rf Router.Read_from.Primary args with
+  | None ->
+      Error
+        (Connection.Error.Protocol_violation
+           (Format.asprintf
+              "Client.exec_optin_pair: command has no derivable target \
+               (fan-out / unknown command); OPTIN reads must be keyed: %s"
+              (if Array.length args > 0 then args.(0) else "(empty)")))
+  | Some (target, _rf) ->
+      map_optin_pair_reply
+        (Router.pair ?timeout t.router target client_caching_yes args)
 
 let exec_multi ?timeout ?fan t args =
   let fan =

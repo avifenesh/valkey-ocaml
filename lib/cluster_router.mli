@@ -51,6 +51,7 @@ module For_testing : sig
     clock:_ Eio.Time.clock ->
     max_redirects:int ->
     trigger_refresh:(unit -> unit) ->
+    ?sync_ref:(unit -> unit) ->
     ?timeout:float ->
     dispatch:(unit -> (Resp3.t, Connection.Error.t) result) ->
     string array ->

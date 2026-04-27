@@ -335,7 +335,6 @@ let test_optin_moved_retry () =
     let result =
       Valkey.Router.pair ~timeout:1.0 router
         (Valkey.Router.Target.By_node wrong_id)
-        Valkey.Router.Read_from.Primary
         [| "CLIENT"; "CACHING"; "YES" |]
         [| "GET"; k |]
     in
@@ -354,15 +353,9 @@ let test_optin_moved_retry () =
          Alcotest.failf
            "OPTIN MOVED-retry should return Ok(OK,v0); got %s"
            (pp_pair other));
-    (* trigger_refresh's eager-clear should have dropped the
-       cache when MOVED was detected (topology says slot is
-       owned by [owner_id], MOVED redirects to [owner_id] too,
-       but the request was sent to [wrong_id] — so MOVED's
-       destination NODE matches what topology says → no clear
-       under our refined eager-clear policy). Do NOT assert
-       count = 0 here; the more robust assertion is that the
-       retry succeeded and the cache state is consistent with
-       the post-retry world (still has the entry). *)
+    (* Topology says slot is owned by [owner_id] and MOVED also
+       redirects to [owner_id] — destinations agree, so no eager
+       Cache.clear fires. The cached entry is still present. *)
     Alcotest.(check int) "cache state after retry" 1
       (Cache.count cache)
 

@@ -164,7 +164,8 @@ let clusterdown_backoff_for_attempt attempt =
   Float.min cap (base *. multiplier)
 
 let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
-    ?timeout ~dispatch args =
+    ?(sync_ref = ignore) ?timeout ~dispatch args =
+  let dispatch () = sync_ref (); dispatch () in
   let rec loop attempt result =
     match result with
     | Ok _ -> result
@@ -176,25 +177,18 @@ let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
                 Topology.find_node_by_address !topology_ref ~host ~port
               with
               | None ->
-                  (* Unknown address: wake the refresh fiber so the next
-                     call sees the new layout. Surface this attempt's
-                     error now rather than blocking on the refresh.
-                     trigger_refresh's eager Cache.clear is appropriate
-                     here — an unknown destination is unambiguous
-                     evidence the topology has shifted. *)
+                  (* Redirect target not in topology — topology has
+                     shifted; the eager Cache.clear in trigger_refresh
+                     is correct. *)
                   trigger_refresh ();
                   result
               | Some node ->
-                  (* For MOVED, additionally check whether our cached
-                     topology already agrees that [node] owns [slot].
-                     If yes, this is a benign in-flight redirect (the
-                     client's sender used a stale slot map but the
-                     atomic topology is fresh) and we just retry. If
-                     no, the topology IS stale — trigger_refresh and
-                     drop the CSC cache, otherwise other reads on
-                     this shard would silently serve unbacked
-                     entries. ASK is per-key, in-progress migration —
-                     doesn't imply ownership change, never refreshes. *)
+                  (* MOVED + node already in topology can mean either
+                     (a) an in-flight redirect against an already-fresh
+                     topology (no refresh needed), or (b) the cached
+                     topology disagrees and is stale. Distinguish by
+                     comparing the slot's owner. ASK is per-key and
+                     never implies ownership change. *)
                   (match kind with
                    | Redirect.Ask -> ()
                    | Redirect.Moved ->
@@ -206,17 +200,9 @@ let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
                        if not topology_agrees then trigger_refresh ());
                   (match Node_pool.get pool node.id with
                    | None ->
-                       (* Topology knows this node but the pool
-                          doesn't — race during pool diff after a
-                          topology refresh, OR an in-flight refresh
-                          hasn't yet added the new shard's primary
-                          connection. Trigger a refresh so the next
-                          attempt has the connection, and surface the
-                          error to the caller (this attempt). Without
-                          this, the redirect would silently fail
-                          forever for clients with traffic only on
-                          this slot, since the [None] short-circuit
-                          previously skipped trigger_refresh entirely. *)
+                       (* Pool doesn't have the redirect target —
+                          race against pool-diff. Trigger refresh so
+                          the next attempt sees the new pool entry. *)
                        trigger_refresh ();
                        result
                    | Some conn ->
@@ -254,41 +240,25 @@ let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
   in
   loop 0 (dispatch ())
 
-(* Pair dispatch + redirect-aware retry for OPTIN CSC reads.
-   Mirrors [handle_retries] for the pair-result shape returned
-   by [Connection.request_pair]. The retry policy is identical
-   to single-command [exec]:
-
-   - MOVED on the read frame: the WHOLE pair is re-submitted on
-     the new owner's connection directly (mirrors handle_retries'
-     send_once path — does NOT go back through topology, since
-     trigger_refresh's effect is async and topology may still
-     point at the old primary). frame 1 stays adjacent to
-     frame 2 across the redirect; the wasted CACHING YES on the
-     old connection is benign (server consumed it on a frame it
-     returned MOVED for, no tracking was registered).
-   - ASK on the read frame: surfaced as [Server_error] without
-     retry. An ASK retry would need [ASKING + CACHING YES + read]
-     as three wire-adjacent frames; [Connection.request_pair] is
-     two-frame. Rare in practice; tracked as a follow-up.
-   - CLUSTERDOWN / TRYAGAIN on the read frame: backoff +
-     re-dispatch via topology (same as handle_retries).
-   - Closed / Interrupted (outer error, or CACHING transport
-     error): refresh + re-dispatch with conn-lost backoff. *)
+(* Pair-shape mirror of [handle_retries] for OPTIN CSC reads.
+   Retry policy matches [exec] one-to-one. ASK on the read is
+   not retried — it would need [ASKING + CACHING YES + read]
+   as three wire-adjacent frames; [request_pair] is two-frame. *)
 let make_pair ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
-    ?timeout (target : Router.Target.t) (rf : Router.Read_from.t)
+    ?(sync_ref = ignore) ?timeout
+    (target : Router.Target.t)
     (args1 : string array) (args2 : string array) =
   let send_on conn = Connection.request_pair ?timeout conn args1 args2 in
-  let dispatch () =
-    let topology = !topology_ref in
+  let dispatch_inner () =
     match target with
     | Router.Target.By_slot slot ->
-        (match Topology.shard_for_slot topology slot with
+        (match Topology.shard_for_slot !topology_ref slot with
          | None -> err_protocol "no shard owns slot %d" slot
          | Some shard ->
-             let node = pick_node_by_read_from rf shard in
-             (match Node_pool.get pool node.id with
-              | None -> err_terminal "no live connection for node %s" node.id
+             (match Node_pool.get pool shard.primary.id with
+              | None ->
+                  err_terminal "no live connection for node %s"
+                    shard.primary.id
               | Some conn -> send_on conn))
     | Router.Target.By_node node_id ->
         (match Node_pool.get pool node_id with
@@ -298,6 +268,7 @@ let make_pair ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
         err_terminal
           "Router.pair: only By_slot / By_node supported (OPTIN reads)"
   in
+  let dispatch () = sync_ref (); dispatch_inner () in
   let rec loop attempt result =
     match result with
     | Error (Connection.Error.Interrupted | Connection.Error.Closed)
@@ -357,7 +328,8 @@ let make_pair ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
   loop 0 (dispatch ())
 
 let make_exec ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
-    ?timeout (target : Router.Target.t) (rf : Router.Read_from.t)
+    ?(sync_ref = ignore) ?timeout
+    (target : Router.Target.t) (rf : Router.Read_from.t)
     (args : string array) =
   let dispatch () =
     let topology = !topology_ref in
@@ -386,7 +358,7 @@ let make_exec ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
         err_terminal "cluster router: sharded pub/sub not yet implemented"
   in
   handle_retries ~pool ~topology_ref ~clock ~max_redirects
-    ~trigger_refresh ?timeout ~dispatch args
+    ~trigger_refresh ~sync_ref ?timeout ~dispatch args
 
 (* Fan a single command out to every node in the selected set. Each
    query runs in its own fiber; a per-node failure never collapses the
@@ -473,11 +445,8 @@ let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
   let exec_multi ?timeout fan args =
     make_exec_multi ~pool ~topology_ref ?timeout fan args
   in
-  (* Standalone-as-cluster pair: just call request_pair on the
-     single connection. No redirect handling needed — there's
-     only one node. The full cluster path with retry logic lives
-     in [create] below. *)
-  let pair ?timeout _target _rf args1 args2 =
+  (* Standalone-as-cluster pair: one node, no redirect handling. *)
+  let pair ?timeout _target args1 args2 =
     match Node_pool.connections pool with
     | [] ->
         Error
@@ -685,18 +654,11 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
           refresh_loop ~sw ~net ~clock ?domain_mgr ~cfg ~pool
             ~topology_atomic ~refresh_signal ~refresh_mutex ~closing ());
       let topology_ref = ref topology in
-      (* trigger_refresh fires when MOVED / ASK / CLUSTERDOWN /
-         connection-loss is observed by a request — i.e. the
-         caller saw evidence the topology might have shifted.
-         Eagerly drop the CSC cache here in addition to the
-         refresh loop's own clear-on-sha-change: refresh runs
-         async (its CLUSTER SHARDS round-trip can take 100s of
-         ms even on loopback), so without an eager clear a
-         second cached read on a different key from the same
-         migrated shard could serve a stale value before
-         refresh completes. Same conservative whole-cache
-         clear policy used by [apply_new_topology] and the
-         per-connection reconnect path. *)
+      (* Eager Cache.clear in addition to the refresh fiber's own
+         clear-on-sha-change: refresh is async (CLUSTER SHARDS
+         round-trip), so without an eager clear a second cached
+         read on a different key from the same migrated shard
+         would serve stale before refresh completes. *)
       let trigger_refresh () =
         Eio.Condition.broadcast refresh_signal;
         match cfg.connection.client_cache with
@@ -705,22 +667,18 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
       in
       let sync_ref () = topology_ref := Atomic.get topology_atomic in
       let exec ?timeout target rf args =
-        (* Thread the atomic's latest value through the existing ref-based
-           dispatch. On refresh the ref is re-synced. *)
-        sync_ref ();
         make_exec ~pool ~topology_ref ~clock
           ~max_redirects:cfg.max_redirects ~trigger_refresh
-          ?timeout target rf args
+          ~sync_ref ?timeout target rf args
       in
       let exec_multi ?timeout fan args =
         sync_ref ();
         make_exec_multi ~pool ~topology_ref ?timeout fan args
       in
-      let pair ?timeout target rf args1 args2 =
-        sync_ref ();
+      let pair ?timeout target args1 args2 =
         make_pair ~pool ~topology_ref ~clock
           ~max_redirects:cfg.max_redirects ~trigger_refresh
-          ?timeout target rf args1 args2
+          ~sync_ref ?timeout target args1 args2
       in
       let close () =
         if Atomic.exchange closing true then ()

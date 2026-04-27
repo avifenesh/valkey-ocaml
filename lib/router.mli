@@ -43,19 +43,20 @@ type exec_multi_fn =
   (string * (Resp3.t, Connection.Error.t) result) list
 
 type pair_fn =
-  ?timeout:float -> Target.t -> Read_from.t ->
+  ?timeout:float -> Target.t ->
   string array -> string array ->
   ( (Resp3.t, Connection.Error.t) result
     * (Resp3.t, Connection.Error.t) result
   , Connection.Error.t) result
-(** Pipelined two-frame submit through the routing layer. Frame 1
-    is the arming command (e.g. [CLIENT CACHING YES] for OPTIN
-    CSC); frame 2 is the keyed read. Both frames go to the same
-    connection in one indivisible enqueue ({!Connection.request_pair}).
-    On cluster mode, MOVED on the read frame triggers the same
-    redirect-aware retry as {!exec_fn} — the whole pair is
-    re-submitted on the new owner so frame 1 stays adjacent to
-    frame 2. *)
+(** Pipelined two-frame submit. Frame 1 arms (e.g. [CLIENT
+    CACHING YES] for OPTIN CSC); frame 2 is the keyed read.
+    Both frames go to the same connection in one indivisible
+    enqueue. On MOVED, the whole pair is re-submitted on the
+    new owner so frame 1 stays adjacent to frame 2.
+
+    [Read_from] is not a parameter: this primitive only exists
+    for OPTIN, where replicas don't run [CLIENT TRACKING] —
+    routing always pins to the slot's primary. *)
 
 type connection_for_slot_fn =
   int -> Connection.t option
@@ -96,7 +97,7 @@ val exec_multi :
   (string * (Resp3.t, Connection.Error.t) result) list
 
 val pair :
-  ?timeout:float -> t -> Target.t -> Read_from.t ->
+  ?timeout:float -> t -> Target.t ->
   string array -> string array ->
   ( (Resp3.t, Connection.Error.t) result
     * (Resp3.t, Connection.Error.t) result

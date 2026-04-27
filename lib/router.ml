@@ -32,7 +32,7 @@ type exec_multi_fn =
   (string * (Resp3.t, Connection.Error.t) result) list
 
 type pair_fn =
-  ?timeout:float -> Target.t -> Read_from.t ->
+  ?timeout:float -> Target.t ->
   string array -> string array ->
   ( (Resp3.t, Connection.Error.t) result
     * (Resp3.t, Connection.Error.t) result
@@ -75,7 +75,7 @@ let standalone (conn : Connection.t) : t =
   let exec_multi ?timeout _fan_target args =
     [ Topology.standalone_node_id, Connection.request ?timeout conn args ]
   in
-  let pair ?timeout _target _read_from args1 args2 =
+  let pair ?timeout _target args1 args2 =
     Connection.request_pair ?timeout conn args1 args2
   in
   (* One connection → one mutex shared by every slot. *)
@@ -91,8 +91,8 @@ let standalone (conn : Connection.t) : t =
 
 let exec ?timeout t target rf args = t.exec ?timeout target rf args
 let exec_multi ?timeout t fan args = t.exec_multi ?timeout fan args
-let pair ?timeout t target rf args1 args2 =
-  t.pair ?timeout target rf args1 args2
+let pair ?timeout t target args1 args2 =
+  t.pair ?timeout target args1 args2
 let close t = t.close ()
 let primary_connection t = t.primary ()
 let connection_for_slot t slot = t.connection_for_slot slot
