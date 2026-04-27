@@ -262,10 +262,53 @@ let test_optin_ask_concurrent () =
     "all ASK-retried reads cached" n (Cache.count cache);
   ignore env
 
+(* Non-CSC stress for the same migrating window: the cluster
+   router's standard [exec] also has an ASK retry that needs
+   [ASKING + cmd] to travel as one indivisible submit. Two
+   sequential [send_once] calls on a shared node connection let
+   another fiber's frame interleave between [ASKING] and the
+   retry, eating the one-shot flag and bouncing the actual
+   command as MOVED. Filed and fixed alongside the OPTIN ordering
+   bug; this test would have caught the latent non-CSC variant
+   under concurrency. *)
+let test_nonscs_ask_concurrent () =
+  let n = 25 in
+  let tag = "stress3" in
+  let slot = Valkey.Slot.of_key (Printf.sprintf "{%s}:probe" tag) in
+  let keys =
+    List.init n (fun i ->
+      Printf.sprintf "{%s}:noncsc:migrate:c:%d" tag i)
+  in
+  with_migrating_slot ~slot ~setup:setup_migrating
+  @@ fun ~env:_ ~client:_ ~cache:_ ~aux ~source:_ ~target ~target_addr:_
+       ~register ->
+  register keys;
+  let pairs =
+    List.mapi (fun i k -> (k, Printf.sprintf "v%d" i)) keys
+  in
+  List.iter
+    (fun (k, v) -> plant_on_target ~target ~key:k ~value:v)
+    pairs;
+  Eio.Fiber.List.iter
+    (fun (k, expected) ->
+      match C.get aux k with
+      | Ok (Some v) when v = expected -> ()
+      | other ->
+          Alcotest.failf
+            "non-CSC concurrent GET via ASK %S (want %S): %s" k expected
+            (match other with
+             | Ok None -> "None"
+             | Ok (Some s) -> Printf.sprintf "Some %S" s
+             | Error e -> Format.asprintf "Error %a" E.pp e))
+    pairs
+
 let tests =
   [ Alcotest.test_case "OPTIN cluster: ASK retry single-key smoke"
       `Quick test_optin_ask_smoke;
     Alcotest.test_case
       "OPTIN cluster: 25-fiber ASK retry under live MIGRATING slot"
       `Quick test_optin_ask_concurrent;
+    Alcotest.test_case
+      "non-CSC: 25-fiber ASK retry under live MIGRATING slot"
+      `Quick test_nonscs_ask_concurrent;
   ]

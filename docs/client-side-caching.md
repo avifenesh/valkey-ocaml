@@ -450,10 +450,18 @@ connection and handles MOVED on the read frame by
 re-submitting the WHOLE pair (`CACHING YES + read`) on the new
 owner — frame 1 stays adjacent to frame 2 across the redirect,
 so the new owner registers tracking correctly. ASK redirects
-are surfaced as `Server_error` (rare; would need a 3-frame
-`ASKING + CACHING YES + read` primitive). Standalone routers
-collapse to a direct `Connection.request_pair` on the single
-primary; the same code path serves both.
+go through the 3-frame primitive `Connection.request_triple`,
+which sends `[CACHING YES; ASKING; read]` as one wire-adjacent
+submit on the importing primary. Frame ordering is
+load-bearing: the server's `ASKING` flag is consumed by the
+very next command on the connection regardless of what it is,
+so `ASKING` must sit immediately before the slot-keyed read —
+not before `CACHING YES`, which would eat the flag and bounce
+the read as MOVED. The `ASKING` reply (must be `+OK`) is
+hidden from the caller, so the pair shape is preserved.
+Standalone routers collapse to a direct
+`Connection.request_pair` on the single primary; the same code
+path serves both.
 
 The reply is run through `map_optin_pair_reply`:
 

@@ -1,6 +1,6 @@
 # Project status and next steps
 
-**Snapshot taken:** 2026-04-27, branch `main` at commit `6cb6efe` (pushed to origin).
+**Snapshot taken:** 2026-04-28, branch `main` at commit `86cd22d` (pushed to origin).
 
 This document captures what's shipped on `main`, what's immediately
 runnable, the test posture, and what's queued next. Phase 8
@@ -166,7 +166,7 @@ Requires `docker compose up -d` (standalone at `:6379`) and optionally
 `docker compose -f docker-compose.cluster.yml up -d` plus
 `bash scripts/cluster-hosts-setup.sh` (cluster at `:7000..:7005`).
 
-CSC-specific slice (37 tests, all green at the current commit):
+CSC-specific slice (38 tests, all green at the current commit):
 
 | File | Count | Scope |
 |------|------:|-------|
@@ -179,7 +179,7 @@ CSC-specific slice (37 tests, all green at the current commit):
 | `test_csc_bcast.ml` | 3 | `TRACKINGINFO` flags; in-prefix evict; out-of-prefix isolation |
 | `test_csc_optin.ml` | 6 | Populate-then-hit; external SET evicts; 50-fiber concurrent OPTIN tracking; CACHING-error path; read after `Client.close` returns transport error; tiny `max_queued_bytes` returns `Queue_full` |
 | `test_csc_optin_cluster.ml` | 3 | Two-shard populate + cross-shard evict; 25-fiber concurrent OPTIN across all 3 shards; MOVED-retry against wrong-target routing |
-| `test_csc_optin_migration.ml` | 2 | Live `CLUSTER SETSLOT MIGRATING/IMPORTING` window; ASK redirect retry single-key smoke; 25-fiber ASK retry under contention |
+| `test_csc_optin_migration.ml` | 3 | Live `CLUSTER SETSLOT MIGRATING/IMPORTING` window; OPTIN ASK retry single-key smoke; 25-fiber OPTIN ASK retry; 25-fiber non-CSC ASK retry (catches the latent `[ASKING; cmd]` non-atomic-submit ordering bug under contention) |
 
 CSC tests run against live Valkey 9.0.3 standalone **and** a
 live 6-node cluster with real primary promotion. OPTIN cluster

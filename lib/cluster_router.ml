@@ -206,13 +206,37 @@ let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
                        trigger_refresh ();
                        result
                    | Some conn ->
-                       (match kind with
-                        | Redirect.Ask ->
-                            (match send_once ?timeout conn [| "ASKING" |] with
-                             | Ok _ -> ()
-                             | Error _ -> ());
-                        | Redirect.Moved -> ());
-                       let next = send_once ?timeout conn args in
+                       let next =
+                         match kind with
+                         | Redirect.Moved -> send_once ?timeout conn args
+                         | Redirect.Ask ->
+                             (* ASKING is one-shot: consumed by the
+                                very next command on the connection
+                                regardless of which fiber sent it.
+                                Two separate [send_once] calls would
+                                let another fiber's command interleave
+                                between [ASKING] and the retry on a
+                                shared node connection, eating the
+                                flag and bouncing this command as
+                                MOVED. Pipeline both wires as one
+                                indivisible submit. *)
+                             (match
+                                Connection.request_pair ?timeout conn
+                                  [| "ASKING" |] args
+                              with
+                              | Error e -> Error e
+                              | Ok (asking_reply, cmd_reply) ->
+                                  (match asking_reply with
+                                   | Ok (Resp3.Simple_string "OK") ->
+                                       cmd_reply
+                                   | Ok unexpected ->
+                                       Error
+                                         (Connection.Error.Protocol_violation
+                                            (Format.asprintf
+                                               "ASKING: unexpected reply %a"
+                                               Resp3.pp unexpected))
+                                   | Error e -> Error e))
+                       in
                        loop (attempt + 1) next))
          | None ->
              (match ve.code with

@@ -46,14 +46,21 @@ shape so OPTIN/BCAST mismatches stop compiling.
   on the read frame triggers a redirect-aware retry that re-
   submits the **whole** pair on the new owner so `CACHING YES`
   stays adjacent to the read across the redirect. ASK on the
-  read frame is surfaced rather than retried — would need a
-  three-frame `ASKING + CACHING YES + read` primitive (tracked
-  as a follow-up). Empirically validated against Valkey 9.0.3:
-  the OPTIN flag is consumed by exactly the next single command
-  on the wire (so a pipelined `CACHING YES + GET k1 + GET k2`
-  tracks `k1` only); a write before the read consumes the flag
-  too; MULTI/EXEC counts as one logical command for CACHING
-  purposes.
+  read frame goes through `Connection.request_triple`, which
+  sends `[CACHING YES; ASKING; read]` as one wire-adjacent
+  submit on the importing primary. Frame ordering is
+  load-bearing: `ASKING` is consumed by the very next command
+  on the connection regardless of what it is, so it must sit
+  immediately before the slot-keyed read; putting `ASKING`
+  first would let `CACHING YES` eat the flag and the read would
+  bounce as MOVED. Verified against a live `CLUSTER SETSLOT
+  MIGRATING/IMPORTING` window in
+  `test_csc_optin_migration.ml`. Empirically validated against
+  Valkey 9.0.3: the OPTIN flag is consumed by exactly the next
+  single command on the wire (so a pipelined `CACHING YES + GET
+  k1 + GET k2` tracks `k1` only); a write before the read
+  consumes the flag too; MULTI/EXEC counts as one logical
+  command for CACHING purposes.
 
 ### Fixed — cluster routing under topology change
 
@@ -89,6 +96,19 @@ shape so OPTIN/BCAST mismatches stop compiling.
   loop kept dispatching against the stale value. Both
   `handle_retries` and `make_pair` now accept an optional
   `?sync_ref` callback that runs before each (re-)dispatch.
+- **`handle_retries` ASK arm: atomic `[ASKING; cmd]` submit.**
+  Previously sent `ASKING` and the actual command as two
+  sequential `Connection.request` calls. The Valkey server
+  consumes the one-shot `ASKING` flag from the very next command
+  on the connection regardless of which fiber sent it, so under
+  concurrent fibers sharing a node connection, another fiber's
+  frame could interleave between `ASKING` and the retry on the
+  pool's connection — eating the flag and bouncing the actual
+  command as MOVED. Both wires are now pipelined through
+  `Connection.request_pair` as one indivisible submit. The
+  matching CSC OPTIN variant (`make_pair` ASK arm) is fixed in
+  the same shape via `Connection.request_triple`. Surfaced by a
+  new live-migration concurrent stress test.
 
 ### Added — OpenTelemetry tracing
 
