@@ -311,13 +311,18 @@ let make_pair ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
                    | Some conn ->
                        loop (attempt + 1) (send_on conn)))
          | Some { kind = Redirect.Ask; host; port; _ } ->
-             (* ASK retry: send [ASKING + CACHING YES + read] as
+             (* ASK retry: send [CACHING YES + ASKING + read] as
                 three wire-adjacent frames on the new owner.
-                ASKING primes the slot's per-key migration flag;
-                CACHING YES then arms tracking for the read. We
-                hide the ASKING reply (must be +OK) and return
-                only the CACHING + read replies, so the caller
-                still sees the pair shape. *)
+                Order is load-bearing — the server's [ASKING] flag
+                is consumed by the very next command on that
+                connection regardless of what it is, so [ASKING]
+                must sit immediately before the slot-keyed read.
+                Putting [ASKING] first would let [CACHING YES]
+                eat the flag, and the read would land on the
+                importing primary without ASKING and bounce as
+                MOVED. We hide the ASKING reply (must be +OK)
+                and return only the CACHING + read replies, so
+                the caller still sees the pair shape. *)
              (match
                 Topology.find_node_by_address !topology_ref ~host ~port
               with
@@ -328,19 +333,21 @@ let make_pair ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
                    | Some conn ->
                        let triple =
                          Connection.request_triple ?timeout conn
-                           [| "ASKING" |] args1 args2
+                           args1 [| "ASKING" |] args2
                        in
                        (match triple with
                         | Error e -> Error e
-                        | Ok (Error e, _, _) -> Error e
-                        | Ok (Ok (Resp3.Simple_string "OK"), caching, read) ->
-                            Ok (caching, read)
-                        | Ok (Ok unexpected, _, _) ->
-                            Error
-                              (Connection.Error.Protocol_violation
-                                 (Format.asprintf
-                                    "ASKING: unexpected reply %a"
-                                    Resp3.pp unexpected)))))
+                        | Ok (caching, asking, read) ->
+                            (match asking with
+                             | Ok (Resp3.Simple_string "OK") ->
+                                 Ok (caching, read)
+                             | Ok unexpected ->
+                                 Error
+                                   (Connection.Error.Protocol_violation
+                                      (Format.asprintf
+                                         "ASKING: unexpected reply %a"
+                                         Resp3.pp unexpected))
+                             | Error e -> Error e))))
          | None ->
              (match ve.code with
               | "CLUSTERDOWN" ->

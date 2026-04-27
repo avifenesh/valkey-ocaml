@@ -166,7 +166,7 @@ Requires `docker compose up -d` (standalone at `:6379`) and optionally
 `docker compose -f docker-compose.cluster.yml up -d` plus
 `bash scripts/cluster-hosts-setup.sh` (cluster at `:7000..:7005`).
 
-CSC-specific slice (35 tests, all green at the current commit):
+CSC-specific slice (37 tests, all green at the current commit):
 
 | File | Count | Scope |
 |------|------:|-------|
@@ -179,6 +179,7 @@ CSC-specific slice (35 tests, all green at the current commit):
 | `test_csc_bcast.ml` | 3 | `TRACKINGINFO` flags; in-prefix evict; out-of-prefix isolation |
 | `test_csc_optin.ml` | 6 | Populate-then-hit; external SET evicts; 50-fiber concurrent OPTIN tracking; CACHING-error path; read after `Client.close` returns transport error; tiny `max_queued_bytes` returns `Queue_full` |
 | `test_csc_optin_cluster.ml` | 3 | Two-shard populate + cross-shard evict; 25-fiber concurrent OPTIN across all 3 shards; MOVED-retry against wrong-target routing |
+| `test_csc_optin_migration.ml` | 2 | Live `CLUSTER SETSLOT MIGRATING/IMPORTING` window; ASK redirect retry single-key smoke; 25-fiber ASK retry under contention |
 
 CSC tests run against live Valkey 9.0.3 standalone **and** a
 live 6-node cluster with real primary promotion. OPTIN cluster
@@ -276,11 +277,20 @@ implementing.
 - [x] **OTel bridge for `cache_metrics`.** Shipped — see
       `Valkey.Observability.observe_cache_metrics`.
 - [x] **OPTIN ASK redirect retry.** Shipped — `Connection.request_triple`
-      drives `ASKING + CLIENT CACHING YES + read` as one wire-adjacent
-      submit; `Cluster_router.make_pair`'s ASK arm wires it.
-- [ ] **Slot-migration stress test.** Real `CLUSTER SETSLOT` migration
-      loop with concurrent cached reads, validates retry path under
-      contention. Will exercise the ASK-retry path empirically.
+      drives `CLIENT CACHING YES + ASKING + read` as one wire-adjacent
+      submit; `Cluster_router.make_pair`'s ASK arm wires it. Frame
+      ordering is load-bearing — the server's `ASKING` flag is
+      consumed by the very next command on the connection regardless
+      of what it is, so `ASKING` must sit immediately before the
+      slot-keyed read.
+- [x] **Slot-migration stress test.** Shipped —
+      `test/test_csc_optin_migration.ml` drives a real
+      `CLUSTER SETSLOT MIGRATING / IMPORTING` window, plants a key on
+      the importing target, and exercises the OPTIN ASK retry. The
+      25-fiber concurrent variant proves wire-adjacency under
+      contention. Cleanup unconditionally clears migration state via
+      `CLUSTER SETSLOT … STABLE` so partial runs can't leave the
+      cluster broken.
 
 ---
 

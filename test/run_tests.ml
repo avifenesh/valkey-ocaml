@@ -30,6 +30,8 @@ let () =
         Test_csc_optin.tests;
       "csc optin cluster (needs docker compose -f docker-compose.cluster.yml)",
         Test_csc_optin_cluster.tests;
+      "csc optin migration (needs docker compose -f docker-compose.cluster.yml)",
+        Test_csc_optin_migration.tests;
       "sorted set (needs docker valkey :6379)", Test_sorted_set.tests;
       "transaction (needs docker valkey :6379)", Test_transaction.tests;
       "pubsub (needs docker valkey :6379)", Test_pubsub.tests;

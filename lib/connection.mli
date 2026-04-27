@@ -126,11 +126,13 @@ val request_triple :
 (** Pipelined three-frame variant of {!request_pair}. Internal:
     used to recover OPTIN reads from an ASK redirect, where the
     server-side migration window requires
-    [ASKING + CLIENT CACHING YES + <read>] as three
-    wire-adjacent frames. ASK consumes the slot's in-progress
-    flag for the immediately-next command, [CACHING YES] then
-    arms tracking, and the read carries the actual key. Same
-    error semantics as {!request_pair}. *)
+    [CLIENT CACHING YES + ASKING + <read>] as three
+    wire-adjacent frames. [ASKING] is one-shot — the server
+    consumes the flag from the next command regardless of what
+    it is — so it must sit immediately before the slot-keyed
+    read. [CACHING YES] arms tracking for that read, and the
+    read carries the actual key. Same error semantics as
+    {!request_pair}. *)
 
 val send_fire_and_forget :
   t ->

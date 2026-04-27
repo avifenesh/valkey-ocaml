@@ -155,6 +155,16 @@ module Cluster_nodes = struct
         | _ -> None)
       parsed
 
+  (* Returns the (host, port) for [node_id], if known. *)
+  let addr_of_id env ~node_id =
+    let parsed = parse (text env) in
+    List.find_map
+      (fun fields ->
+        match fields with
+        | id :: addr :: _ when id = node_id -> parse_addr addr
+        | _ -> None)
+      parsed
+
   (* Pick the first replica of the master owning [slot]. *)
   let replica_of_slot_owner env ~slot =
     let parsed = parse (text env) in
