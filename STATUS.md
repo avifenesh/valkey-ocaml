@@ -142,7 +142,7 @@ Requires `docker compose up -d` (standalone at `:6379`) and optionally
 `docker compose -f docker-compose.cluster.yml up -d` plus
 `bash scripts/cluster-hosts-setup.sh` (cluster at `:7000..:7005`).
 
-CSC-specific slice (29 tests, all green at the current commit):
+CSC-specific slice (30 tests, all green at the current commit):
 
 | File | Count | Scope |
 |------|------:|-------|
@@ -153,11 +153,11 @@ CSC-specific slice (29 tests, all green at the current commit):
 | `test_csc_cluster.ml` | 2 | Two-shard invalidation; cluster-wide `FLUSHDB` |
 | `test_csc_lifecycle.ml` | 3 | Standalone reconnect flush; live `CLUSTER FAILOVER FORCE`; TTL expiry without invalidation |
 | `test_csc_bcast.ml` | 3 | `TRACKINGINFO` flags; in-prefix evict; out-of-prefix isolation |
-| `test_csc_optin.ml` | 3 | Populate-then-hit; external SET evicts; 50-fiber concurrent OPTIN tracking |
+| `test_csc_optin.ml` | 4 | Populate-then-hit; external SET evicts; 50-fiber concurrent OPTIN tracking; CACHING-error path |
 
 The 26 CSC tests pre-OPTIN are run against live Valkey 9.0.3
 standalone **and** a live 6-node cluster with real primary
-promotion. The 3 new `test_csc_optin.ml` cases are standalone-only
+promotion. The 4 new `test_csc_optin.ml` cases are standalone-only
 because cluster + OPTIN is gated until pair-aware redirect retry
 lands. Nothing skipped in standalone.
 
@@ -284,7 +284,8 @@ implementing.
 - CSC race-safe: `6d4f48c`.
 - CSC all commands: `6b19f1a`.
 - CSC cluster + lifecycle: `3ae246d` and `664187e`.
-- CSC close: `595b84a` (BCAST).
+- CSC BCAST landed: `595b84a`.
+- CSC OPTIN landed: `80563ec` (B2.5; standalone only, cluster gated).
 
 Use `git log --grep='Phase 8'` or `git log --grep='csc:'` to walk the
 series.

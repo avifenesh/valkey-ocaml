@@ -20,7 +20,15 @@ type mode =
       command on the same connection. Smaller server-side
       tracking table at the cost of one extra wire frame per
       cached read. Mutually exclusive with [Bcast] (the server
-      rejects [TRACKING ... BCAST OPTIN]). *)
+      rejects [TRACKING ... BCAST OPTIN]).
+
+      OPTIN reads always go to the primary, regardless of any
+      [~read_from] hint passed to [Client.get] / [mget] / etc.
+      Replicas don't run [CLIENT TRACKING], so a replica-side
+      [CACHING YES] would either error or silently fail to
+      register tracking — neither is acceptable for a
+      cache-correctness primitive. Use [Default] tracking if
+      replica reads are required. *)
   | Bcast of { prefixes : string list }
   (** Broadcast mode: server sends invalidations for any key
       whose prefix matches. No per-client tracking table;

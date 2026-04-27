@@ -896,19 +896,22 @@ let request_pair ?timeout t args1 args2 =
               Byte_sem.release t.budget total;
               Error e
           | `In_queue ->
-              let r1 =
+              (* Don't shadow the [r1] / [r2] resolver bindings
+                 captured in [e1.resolver] / [e2.resolver] — use
+                 distinct names for the awaited values. *)
+              let v1 =
                 try Eio.Promise.await p1
                 with exn ->
                   e1.abandoned <- true; e2.abandoned <- true;
                   raise exn
               in
-              let r2 =
+              let v2 =
                 try Eio.Promise.await p2
                 with exn ->
                   e2.abandoned <- true;
                   raise exn
               in
-              Ok (r1, r2)
+              Ok (v1, v2)
         in
         let result =
           match timeout with

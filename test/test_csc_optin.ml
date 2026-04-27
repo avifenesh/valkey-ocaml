@@ -24,6 +24,23 @@ let grace_s = 0.05
 let sleep_ms env ms =
   Eio.Time.sleep (Eio.Stdenv.clock env) (ms /. 1000.0)
 
+(* Poll [check] until it returns true or [deadline_s] elapses.
+   Returns the final value of [check]. Used in concurrency tests
+   so a slow runner doesn't fail on the worst-case grace window
+   while a fast runner still completes in tens of milliseconds. *)
+let wait_until env ~deadline_s ~step_ms check =
+  let clock = Eio.Stdenv.clock env in
+  let deadline = Eio.Time.now clock +. deadline_s in
+  let rec loop () =
+    if check () then true
+    else if Eio.Time.now clock >= deadline then false
+    else begin
+      Eio.Time.sleep clock (step_ms /. 1000.0);
+      loop ()
+    end
+  in
+  loop ()
+
 let with_optin_csc ~keys f =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -103,10 +120,72 @@ let test_concurrent_optin_tracking () =
     keys;
   Alcotest.(check int) "all keys cached" n (Cache.count cache);
   List.iter (fun k -> let _ = C.exec aux [| "SET"; k; "v1" |] in ()) keys;
-  sleep_ms env (grace_s *. 4.0 *. 1000.0);
-  Alcotest.(check int)
-    "every concurrent OPTIN entry was tracked and got invalidated"
-    0 (Cache.count cache)
+  let drained =
+    wait_until env ~deadline_s:2.0 ~step_ms:10.0
+      (fun () -> Cache.count cache = 0)
+  in
+  if not drained then
+    Alcotest.failf
+      "every concurrent OPTIN entry should have been tracked and \
+       invalidated; %d still cached after 2s"
+      (Cache.count cache)
+
+(* If tracking is somehow disabled on the OPTIN client (e.g. a user
+   issues [CLIENT TRACKING OFF] directly via [Client.exec]), the
+   server rejects [CLIENT CACHING YES] with [ERR ... only when the
+   client is in tracking mode with OPTIN or OPTOUT mode enabled].
+   That error must surface to the caller as [Server_error] from
+   [Client.get], not as a [Protocol_violation], not as a silent
+   miss-and-don't-cache, and must not poison the [Inflight] table
+   for future calls. *)
+let test_caching_yes_error_surfaces_cleanly () =
+  let k = "ocaml:csc:optin:err" in
+  with_optin_csc ~keys:[k] @@ fun _env client cache aux ->
+  let _ = C.exec aux [| "SET"; k; "v" |] in
+  (* Disable tracking on the client's own connection from the
+     inside; subsequent OPTIN reads should fail at the
+     [CACHING YES] frame. *)
+  (match C.exec client [| "CLIENT"; "TRACKING"; "OFF" |] with
+   | Ok (R.Simple_string "OK") -> ()
+   | other ->
+       Alcotest.failf "CLIENT TRACKING OFF setup: %s"
+         (match other with
+          | Ok v -> Format.asprintf "got %a" R.pp v
+          | Error e -> Format.asprintf "%a" E.pp e));
+  (match C.get client k with
+   | Error (E.Server_error ve) ->
+       Alcotest.(check string) "ERR code" "ERR" ve.code;
+       (* The exact message text is server-version-tied; just
+          assert it mentions OPTIN/tracking so a regression in
+          our error mapping (e.g. surfacing the wrong frame's
+          reply) would visibly fail. *)
+       let msg_lower = String.lowercase_ascii ve.message in
+       let mentions_tracking =
+         List.exists
+           (fun substr ->
+             let len_s = String.length substr in
+             let len_m = String.length msg_lower in
+             let rec scan i =
+               if i + len_s > len_m then false
+               else if String.sub msg_lower i len_s = substr then true
+               else scan (i + 1)
+             in
+             scan 0)
+           [ "optin"; "tracking" ]
+       in
+       Alcotest.(check bool)
+         "error message mentions tracking/OPTIN" true mentions_tracking
+   | other ->
+       Alcotest.failf
+         "OPTIN GET with tracking off should error with Server_error \
+          but got %s"
+         (match other with
+          | Ok None -> "Ok None"
+          | Ok (Some s) -> Printf.sprintf "Ok (Some %S)" s
+          | Error e -> Format.asprintf "Error %a" E.pp e));
+  Alcotest.(check (option reject))
+    "no entry cached for failed OPTIN read"
+    None (Cache.get cache k)
 
 let tests =
   [ Alcotest.test_case "OPTIN populates then hits" `Quick
@@ -115,4 +194,6 @@ let tests =
       test_external_set_evicts_optin_cache;
     Alcotest.test_case "OPTIN concurrent reads all get tracked" `Quick
       test_concurrent_optin_tracking;
+    Alcotest.test_case "OPTIN CACHING-error path surfaces cleanly" `Quick
+      test_caching_yes_error_surfaces_cleanly;
   ]
