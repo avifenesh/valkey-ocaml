@@ -81,6 +81,40 @@ Standard OpenTelemetry environment variables apply:
 - `OTEL_RESOURCE_ATTRIBUTES` — extra resource attributes
   (e.g. `deployment.environment=staging`).
 
+## Cache metrics (CSC)
+
+`Valkey.Observability.observe_cache_metrics` registers an
+OpenTelemetry meter callback that exposes the
+`Valkey.Cache.metrics` counters as cumulative monotonic sums.
+One call per CSC-enabled client at startup:
+
+```ocaml
+let client =
+  Valkey.Client.connect ~sw ~net ~clock ~config:cfg ~host ~port ()
+in
+Valkey.Observability.observe_cache_metrics
+  (fun () -> Valkey.Client.cache_metrics client)
+```
+
+Six metrics emit per collect tick, named `<prefix>.<counter>`
+(default prefix `valkey.cache`):
+
+| Metric                          | Counter                                 |
+|---------------------------------|-----------------------------------------|
+| `valkey.cache.hits`             | `Cache.metrics.hits`                    |
+| `valkey.cache.misses`           | `Cache.metrics.misses`                  |
+| `valkey.cache.evicts.budget`    | LRU evictions under byte-budget pressure |
+| `valkey.cache.evicts.ttl`       | TTL safety-net evictions                |
+| `valkey.cache.invalidations`    | Server-invalidation pushes               |
+| `valkey.cache.puts`             | Total `Cache.put` calls (incl. rejects)  |
+
+When `cache_metrics` returns `None` (CSC not configured for that
+client) the callback emits no metrics for that tick. With no
+exporter configured the cost is the OTel registry's no-op walk.
+
+Pass `~name:"my.client.cache"` to use a different prefix for
+multi-client deployments.
+
 ## Adding your own command-level spans
 
 If you want per-command tracing in your application, wrap the call:
