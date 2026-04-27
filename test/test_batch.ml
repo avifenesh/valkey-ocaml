@@ -58,7 +58,7 @@ let with_cluster_client f =
       let client = C.from_router ~config:C.Config.default router in
       Fun.protect ~finally:(fun () -> C.close client) @@ fun () -> f client
 
-let with_cluster_client_and_admin ~admin_host ~admin_port f =
+let with_cluster_client_and_admin ~admin_host:_ ~admin_port:_ f =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
   let net = Eio.Stdenv.net env in
@@ -70,13 +70,28 @@ let with_cluster_client_and_admin ~admin_host ~admin_port f =
   | Error m -> Alcotest.failf "Cluster_router.create: %s" m
   | Ok router ->
       let client = C.from_router ~config:C.Config.default router in
-      let admin =
-        C.connect ~sw ~net ~clock ~host:admin_host ~port:admin_port ()
-      in
-      Fun.protect
-        ~finally:(fun () -> C.close admin; C.close client)
-      @@ fun () ->
-      f ~clock client admin
+      (* Build admin as a cluster-aware client so [client_pause]
+         fans to every primary instead of pausing a single
+         hard-coded node. The pre-failover ~admin_host /
+         ~admin_port arguments named one specific primary
+         (valkey-c1), which works as long as that node is still
+         a primary. After any earlier-running test fires a
+         CLUSTER FAILOVER (e.g. csc lifecycle), c1 may be a
+         replica — pausing it then pauses the wrong server and
+         the timeout assertions don't fire. The arguments are
+         kept on the signature for callers' clarity but
+         intentionally ignored here. *)
+      (match
+         create_router_retry ~sw ~net ~clock
+           ~config:(CR.Config.default ~seeds)
+       with
+       | Error m -> Alcotest.failf "admin Cluster_router.create: %s" m
+       | Ok admin_router ->
+           let admin = C.from_router ~config:C.Config.default admin_router in
+           Fun.protect
+             ~finally:(fun () -> C.close admin; C.close client)
+           @@ fun () ->
+           f ~clock client admin)
 
 let err_pp = E.pp
 

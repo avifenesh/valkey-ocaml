@@ -115,94 +115,206 @@ let cluster_reachable () =
       true
     with _ -> false
 
-let skipped name =
-  Printf.printf "    [SKIP] %s (cluster not reachable)\n" name
-
-(* Trigger a topology change by forcing a failover on any one
-   shard. Returns once the cluster has accepted the promotion;
-   the CSC client's refresh fiber will pick up the new topology
-   asynchronously. *)
-let force_failover env =
-  (* Use a short-lived aux cluster client to orchestrate. *)
+(* Block until the cluster is fully bootstrapped. "Reachable" (a
+   single seed accepts a TCP connection) doesn't imply ready —
+   we've seen tests fail with "no topology agreement across
+   seeds" because the test ran during the gossip-settle window
+   right after `docker compose up`. Waits for: cluster_state:ok
+   on the first seed, all 16384 slots assigned and ok, AND
+   Discovery agreement across seeds (by calling
+   Discovery.discover_from_seeds). 30s deadline is generous;
+   typical settle is sub-second on loopback. *)
+let wait_cluster_ready env =
   Eio.Switch.run @@ fun sw ->
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
-  let aux_cfg = CR.Config.default ~seeds in
-  let aux_router =
-    match CR.create ~sw ~net ~clock ~config:aux_cfg () with
-    | Ok r -> r
-    | Error e -> Alcotest.failf "aux router: %s" e
-  in
-  let aux = C.from_router ~config:Cfg.default aux_router in
-  (* Find a replica and tell it to take over its shard. *)
-  let reply = C.exec aux [| "CLUSTER"; "NODES" |] in
-  C.close aux;
-  match reply with
-  | Error e -> Alcotest.failf "CLUSTER NODES: %a" E.pp e
-  | Ok (R.Bulk_string s | R.Simple_string s
-        | R.Verbatim_string { data = s; _ }) ->
-      (* Parse for a "replica" line's address. Format varies;
-         grab the first field with "slave" or "replica" role
-         and extract its host:port@bus from field 2. *)
-      let lines = String.split_on_char '\n' s in
-      let replica_ep =
-        List.find_map
-          (fun line ->
-            if String.length line = 0 then None
-            else
-              let fields = String.split_on_char ' ' line in
-              match fields with
-              | _id :: addr :: flags :: _ ->
-                  (* [flags] is comma-separated. [addr] is
-                     host:port@bus,hostname. Extract host + port
-                     from the [addr] field. *)
-                  let is_replica =
-                    List.exists
-                      (fun f -> f = "slave" || f = "replica")
-                      (String.split_on_char ',' flags)
-                  in
-                  if not is_replica then None
-                  else
-                    (* addr = "host:port@bus[,hostname]" *)
-                    let addr = List.hd (String.split_on_char ',' addr) in
-                    (match String.index_opt addr ':' with
-                     | None -> None
-                     | Some i ->
-                         let host = String.sub addr 0 i in
-                         let rest =
-                           String.sub addr (i + 1)
-                             (String.length addr - i - 1)
-                         in
-                         let port =
-                           let at =
-                             try String.index rest '@'
-                             with Not_found -> String.length rest
-                           in
-                           int_of_string (String.sub rest 0 at)
-                         in
-                         Some (host, port))
-              | _ -> None)
-          lines
+  let deadline = Eio.Time.now clock +. 30.0 in
+  let info_ok host port =
+    try
+      let conn =
+        Conn.connect ~sw ~net ~clock ~config:Conn.Config.default
+          ~host ~port ()
       in
-      (match replica_ep with
-       | None ->
-           Alcotest.fail "could not find a replica in CLUSTER NODES"
-       | Some (host, port) ->
-           (* Open a dedicated Connection to that replica and tell it
-              to promote with FORCE. *)
-           let conn =
-             Conn.connect ~sw ~net ~clock
-               ~config:Conn.Config.default ~host ~port ()
-           in
-           let _ = Conn.request conn [| "CLUSTER"; "FAILOVER"; "FORCE" |] in
-           Conn.close conn)
-  | Ok v -> Alcotest.failf "unexpected CLUSTER NODES reply %a" R.pp v
+      let r = Conn.request conn [| "CLUSTER"; "INFO" |] in
+      Conn.close conn;
+      match r with
+      | Ok (R.Bulk_string s | R.Verbatim_string { data = s; _ }
+            | R.Simple_string s) ->
+          let has line = String.length s >= String.length line
+                         && (let rec scan i =
+                               if i + String.length line > String.length s
+                               then false
+                               else if String.sub s i (String.length line) = line
+                               then true
+                               else scan (i + 1)
+                             in scan 0)
+          in
+          has "cluster_state:ok\r\n"
+          && has "cluster_slots_assigned:16384\r\n"
+          && has "cluster_slots_ok:16384\r\n"
+      | _ -> false
+    with _ -> false
+  in
+  let discovery_agrees () =
+    try
+      match
+        Valkey.Discovery.discover_from_seeds
+          ~sw ~net ~clock
+          ~connection_config:Conn.Config.default
+          ~agreement_ratio:1.0
+          ~min_nodes_for_quorum:(List.length seeds)
+          ~seeds ()
+      with
+      | Ok _ -> true
+      | Error _ -> false
+    with _ -> false
+  in
+  let rec wait () =
+    if List.for_all (fun (h, p) -> info_ok h p) seeds
+       && discovery_agrees ()
+    then ()
+    else if Eio.Time.now clock >= deadline then
+      Alcotest.fail
+        "cluster did not reach steady state within 30s — \
+         check `docker compose -f docker-compose.cluster.yml ps`"
+    else (Eio.Time.sleep clock 0.2; wait ())
+  in
+  wait ()
+
+let skipped name =
+  Printf.printf "    [SKIP] %s (cluster not reachable)\n" name
+
+(* Parsing helpers for CLUSTER NODES output.
+   Each line: <id> <host:port@bus[,hostname]> <flags>
+              <master-id-or--> <ping> <pong> <epoch> <link> [<slot-range> ...]
+   Replica lines have flags containing "slave" / "replica" and a
+   non-"-" master-id field. Slot ranges (e.g. "0-5460") only
+   appear on master lines. *)
+
+let parse_addr addr_field =
+  (* "host:port@bus[,hostname]" -> (host, port) using the first
+     comma-separated chunk only (the announced address). *)
+  let primary_chunk = List.hd (String.split_on_char ',' addr_field) in
+  match String.index_opt primary_chunk ':' with
+  | None -> None
+  | Some i ->
+      let host = String.sub primary_chunk 0 i in
+      let rest =
+        String.sub primary_chunk (i + 1) (String.length primary_chunk - i - 1)
+      in
+      let port =
+        let at = try String.index rest '@' with Not_found -> String.length rest in
+        int_of_string (String.sub rest 0 at)
+      in
+      Some (host, port)
+
+let line_is_replica flags =
+  List.exists (fun f -> f = "slave" || f = "replica")
+    (String.split_on_char ',' flags)
+
+let line_owns_slot fields slot =
+  (* Master lines list slot ranges as the trailing fields, e.g.
+     "0-5460" or "12345" (single). Skip first 8 fixed fields then
+     scan. *)
+  match fields with
+  | _id :: _addr :: _flags :: _master :: _ping :: _pong :: _epoch :: _link
+    :: ranges ->
+      List.exists
+        (fun r ->
+          match String.split_on_char '-' r with
+          | [ a ] ->
+              (try int_of_string a = slot with _ -> false)
+          | [ a; b ] ->
+              (try
+                 let lo = int_of_string a and hi = int_of_string b in
+                 lo <= slot && slot <= hi
+               with _ -> false)
+          | _ -> false)
+        ranges
+  | _ -> false
+
+let cluster_nodes_text env =
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let h, p = List.hd seeds in
+  let conn = Conn.connect ~sw ~net ~clock ~host:h ~port:p () in
+  let r = Conn.request conn [| "CLUSTER"; "NODES" |] in
+  Conn.close conn;
+  match r with
+  | Ok (R.Bulk_string s | R.Simple_string s
+        | R.Verbatim_string { data = s; _ }) -> s
+  | Ok v -> Alcotest.failf "CLUSTER NODES unexpected: %a" R.pp v
+  | Error e -> Alcotest.failf "CLUSTER NODES: %a" E.pp e
+
+(* Trigger a topology change by forcing a failover on the shard
+   that owns [slot]. Picks the first replica of that slot's
+   primary and sends CLUSTER FAILOVER FORCE to it. Returns once
+   the cluster has accepted the promotion; gossip + topology
+   refresh on the test client are async, so the caller still
+   needs a poll loop / sleep before assertions.
+   Targeting a SPECIFIC shard (rather than "any first replica")
+   is what makes the post-failover MOVED probe deterministic —
+   otherwise force_failover may hit a shard that owns neither
+   test key and the probes never see MOVED. *)
+let force_failover_for_slot env ~slot =
+  let nodes = cluster_nodes_text env in
+  let lines =
+    List.filter (fun l -> String.length l > 0)
+      (String.split_on_char '\n' nodes)
+  in
+  let parsed =
+    List.map (fun l -> l, String.split_on_char ' ' l) lines
+  in
+  let owner_id =
+    List.find_map
+      (fun (_l, fields) ->
+        match fields with
+        | id :: _addr :: flags :: _ when not (line_is_replica flags)
+                                          && line_owns_slot fields slot ->
+            Some id
+        | _ -> None)
+      parsed
+  in
+  let owner_id =
+    match owner_id with
+    | Some id -> id
+    | None -> Alcotest.failf "no master owns slot %d" slot
+  in
+  let replica_ep =
+    List.find_map
+      (fun (_l, fields) ->
+        match fields with
+        | _id :: addr :: flags :: master :: _
+          when line_is_replica flags && master = owner_id ->
+            parse_addr addr
+        | _ -> None)
+      parsed
+  in
+  match replica_ep with
+  | None ->
+      Alcotest.failf
+        "no replica found for shard owning slot %d (master id %s)"
+        slot owner_id
+  | Some (host, port) ->
+      Eio.Switch.run @@ fun sw ->
+      let net = Eio.Stdenv.net env in
+      let clock = Eio.Stdenv.clock env in
+      let conn =
+        Conn.connect ~sw ~net ~clock ~config:Conn.Config.default
+          ~host ~port ()
+      in
+      let _ =
+        Conn.request conn [| "CLUSTER"; "FAILOVER"; "FORCE" |]
+      in
+      Conn.close conn
 
 let test_cluster_failover_flushes_cache () =
   if not (cluster_reachable ()) then
     skipped "cluster failover flushes cache"
   else
     Eio_main.run @@ fun env ->
+    wait_cluster_ready env;
     Eio.Switch.run @@ fun sw ->
     let net = Eio.Stdenv.net env in
     let clock = Eio.Stdenv.clock env in
@@ -244,10 +356,38 @@ let test_cluster_failover_flushes_cache () =
         let _ = C.get client k_b in
         Alcotest.(check int) "cache populated before failover" 2
           (Cache.count cache);
-        force_failover env;
-        (* Give the refresh fiber + reconnect fibers a couple of
-           seconds to notice and reset. *)
-        sleep_ms env 3000.0;
+        (* Target the failover at k_a's shard so the post-failover
+           probe is guaranteed to land on a now-demoted node and
+           surface MOVED. *)
+        force_failover_for_slot env ~slot:(Valkey.Slot.of_key k_a);
+        (* CLUSTER FAILOVER FORCE returns OK immediately, but the
+           actual promotion + slot-ownership gossip is async and
+           empirically takes 100 ms to several seconds on Linux +
+           Docker Engine. Empirically (Valkey 9), the demoted
+           primary does NOT drop existing client connections, so
+           the per-connection reconnect-flush path doesn't fire
+           and the periodic topology-refresh fiber is on a 15 s
+           interval. We elicit the topology-change detection the
+           way a real workload does: poke each key with a raw
+           [exec] (so cached_read can't short-circuit on the hot
+           cache); when one of those reads lands on the
+           failed-over shard, the OCaml client receives MOVED,
+           [trigger_refresh] fires, and the CSC cache is cleared
+           eagerly. Loop with a deadline because failover timing
+           varies — a single fixed sleep is flaky. *)
+        let deadline = Eio.Time.now (Eio.Stdenv.clock env) +. 5.0 in
+        let rec poll () =
+          (* Per-probe timeout: post-failover the OCaml client may
+             still be talking to a node whose reply path stalled
+             during the demotion handshake; without an explicit
+             timeout, [C.exec] would block indefinitely. *)
+          let _ = C.exec ~timeout:0.5 client [| "GET"; k_a |] in
+          let _ = C.exec ~timeout:0.5 client [| "GET"; k_b |] in
+          if Cache.count cache = 0 then ()
+          else if Eio.Time.now (Eio.Stdenv.clock env) >= deadline then ()
+          else (sleep_ms env 100.0; poll ())
+        in
+        poll ();
         Alcotest.(check int) "cache cleared after failover"
           0 (Cache.count cache);
         (* Failback: promote a replica back? Leave cluster in its

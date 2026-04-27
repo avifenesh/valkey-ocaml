@@ -171,22 +171,55 @@ let handle_retries ~pool ~topology_ref ~clock ~max_redirects ~trigger_refresh
     | Error (Connection.Error.Server_error ve)
       when attempt < max_redirects ->
         (match Redirect.of_valkey_error ve with
-         | Some { kind; host; port; _ } ->
+         | Some { kind; slot; host; port } ->
              (match
                 Topology.find_node_by_address !topology_ref ~host ~port
               with
               | None ->
                   (* Unknown address: wake the refresh fiber so the next
                      call sees the new layout. Surface this attempt's
-                     error now rather than blocking on the refresh. *)
+                     error now rather than blocking on the refresh.
+                     trigger_refresh's eager Cache.clear is appropriate
+                     here — an unknown destination is unambiguous
+                     evidence the topology has shifted. *)
                   trigger_refresh ();
                   result
               | Some node ->
+                  (* For MOVED, additionally check whether our cached
+                     topology already agrees that [node] owns [slot].
+                     If yes, this is a benign in-flight redirect (the
+                     client's sender used a stale slot map but the
+                     atomic topology is fresh) and we just retry. If
+                     no, the topology IS stale — trigger_refresh and
+                     drop the CSC cache, otherwise other reads on
+                     this shard would silently serve unbacked
+                     entries. ASK is per-key, in-progress migration —
+                     doesn't imply ownership change, never refreshes. *)
+                  (match kind with
+                   | Redirect.Ask -> ()
+                   | Redirect.Moved ->
+                       let topology_agrees =
+                         match Topology.shard_for_slot !topology_ref slot with
+                         | Some shard -> shard.primary.id = node.id
+                         | None -> false
+                       in
+                       if not topology_agrees then trigger_refresh ());
                   (match Node_pool.get pool node.id with
-                   | None -> result
+                   | None ->
+                       (* Topology knows this node but the pool
+                          doesn't — race during pool diff after a
+                          topology refresh, OR an in-flight refresh
+                          hasn't yet added the new shard's primary
+                          connection. Trigger a refresh so the next
+                          attempt has the connection, and surface the
+                          error to the caller (this attempt). Without
+                          this, the redirect would silently fail
+                          forever for clients with traffic only on
+                          this slot, since the [None] short-circuit
+                          previously skipped trigger_refresh entirely. *)
+                       trigger_refresh ();
+                       result
                    | Some conn ->
-                       (* For ASK, send ASKING before the original. For
-                          MOVED, just retry on the new node. *)
                        (match kind with
                         | Redirect.Ask ->
                             (match send_once ?timeout conn [| "ASKING" |] with
@@ -537,7 +570,24 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
           refresh_loop ~sw ~net ~clock ?domain_mgr ~cfg ~pool
             ~topology_atomic ~refresh_signal ~refresh_mutex ~closing ());
       let topology_ref = ref topology in
-      let trigger_refresh () = Eio.Condition.broadcast refresh_signal in
+      (* trigger_refresh fires when MOVED / ASK / CLUSTERDOWN /
+         connection-loss is observed by a request — i.e. the
+         caller saw evidence the topology might have shifted.
+         Eagerly drop the CSC cache here in addition to the
+         refresh loop's own clear-on-sha-change: refresh runs
+         async (its CLUSTER SHARDS round-trip can take 100s of
+         ms even on loopback), so without an eager clear a
+         second cached read on a different key from the same
+         migrated shard could serve a stale value before
+         refresh completes. Same conservative whole-cache
+         clear policy used by [apply_new_topology] and the
+         per-connection reconnect path. *)
+      let trigger_refresh () =
+        Eio.Condition.broadcast refresh_signal;
+        match cfg.connection.client_cache with
+        | None -> ()
+        | Some ccfg -> Cache.clear ccfg.Client_cache.cache
+      in
       let sync_ref () = topology_ref := Atomic.get topology_atomic in
       let exec ?timeout target rf args =
         (* Thread the atomic's latest value through the existing ref-based
