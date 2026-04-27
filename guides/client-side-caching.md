@@ -441,10 +441,21 @@ match ccfg.Client_cache.mode with
     exec ?timeout ?read_from t cmd
 ```
 
-`exec_optin_pair` looks up the standalone primary connection
-directly (the cluster gate enforces standalone for OPTIN),
-calls `Connection.request_pair conn ["CLIENT";"CACHING";"YES"] cmd`,
-and:
+`exec_optin_pair` resolves the slot from the read's args via
+`Command_spec.target_and_rf` (forcing `Read_from.Primary` —
+replicas don't run CLIENT TRACKING) and calls
+`Router.pair t.router target Primary ["CLIENT";"CACHING";"YES"] cmd`.
+The router's `pair` closure dispatches to the slot's primary
+connection and handles MOVED on the read frame by
+re-submitting the WHOLE pair (`CACHING YES + read`) on the new
+owner — frame 1 stays adjacent to frame 2 across the redirect,
+so the new owner registers tracking correctly. ASK redirects
+are surfaced as `Server_error` (rare; would need a 3-frame
+`ASKING + CACHING YES + read` primitive). Standalone routers
+collapse to a direct `Connection.request_pair` on the single
+primary; the same code path serves both.
+
+The reply is run through `map_optin_pair_reply`:
 
 - maps the CACHING reply: `Simple_string "OK"` lets the read
   reply through unchanged; anything else surfaces as a
@@ -454,12 +465,10 @@ and:
   machinery treats the result the same way as it would for a
   default-tracking miss.
 
-Cluster + OPTIN with redirect-aware pair retry is a separate
-step; today, constructing a `Client.t` from a non-standalone
-router with `mode = Optin` raises `Invalid_argument` at
-`from_router`.
+#### Integration tests
 
-#### Integration tests (`test/test_csc_optin.ml`)
+`test/test_csc_optin.ml` (standalone) and
+`test/test_csc_optin_cluster.ml` (cluster):
 
 - **Populates then hits.** Cold OPTIN GET round-trips and
   caches; second GET serves from cache.
@@ -467,6 +476,16 @@ router with `mode = Optin` raises `Invalid_argument` at
   write must produce an invalidation push, which only happens
   if the wire-pair was actually adjacent and the server
   actually started tracking the key.
+- **Cluster two-shard populate + cross-shard evict.** Verifies
+  the per-shard tracking + shared-cache invariants apply to
+  OPTIN-armed reads too: each shard's primary registers
+  tracking via its own `CACHING YES + read`, both shards'
+  invalidation pushes drain into the one `Cache.t`.
+- **Cluster 25-fiber concurrent OPTIN.** N fibers reading
+  hashtag-keyed values across all 3 shards, then aux mutates
+  every key, every entry must be evicted within the grace
+  window. Detects any wire-pair atomicity break under
+  concurrent per-shard enqueueing.
 - **50-fiber concurrency.** N fibers each issue an OPTIN read
   on a distinct key; aux mutates every key; every cache entry
   must be invalidated. Detects any wire-pair atomicity break
