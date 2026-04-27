@@ -80,6 +80,7 @@ Shipped pieces:
 | B9 | TTL safety net + `Flush_all` race-close | `5f4bfce` |
 | B10a | Cache metrics (atomic counters) | `04acdc2` |
 | B10b | BCAST mode | `595b84a` |
+| B2.5 | OPTIN — pipelined per-read tracking | (this commit) |
 
 Behavioural summary, honest:
 
@@ -88,10 +89,14 @@ Behavioural summary, honest:
   needed; redis-py shipped it with a field-collision bug — #3612),
   `EXISTS` / `STRLEN` / `TYPE` (low value; covered by the GET-shaped
   entry for the same key in practice).
-- **`optin = false`** is the default and recommended mode.
-  **`optin = true`** currently raises `Invalid_argument` at connect; the
-  pipelined `CLIENT CACHING YES + GET` path (step "B2.5") is not
-  implemented.
+- **`mode = Default`** is the default and recommended mode for
+  standalone and cluster. **`mode = Optin`** is supported for
+  standalone (cluster + OPTIN with redirect-aware pair retry is
+  a separate step); the read path pipelines `CLIENT CACHING
+  YES + read` as one wire-atomic submit via the new internal
+  `Connection.request_pair`. The previous `optin : bool` field
+  is folded into the `mode` variant so OPTIN/BCAST mutual
+  exclusion is encoded in the type.
 - Per-shard tracking on cluster happens automatically via the single
   `Client_cache.t` threaded into every shard `Connection.Config`.
 - **Flush on topology refresh** and **flush on every per-connection
@@ -137,7 +142,7 @@ Requires `docker compose up -d` (standalone at `:6379`) and optionally
 `docker compose -f docker-compose.cluster.yml up -d` plus
 `bash scripts/cluster-hosts-setup.sh` (cluster at `:7000..:7005`).
 
-CSC-specific slice (26 tests, all green at the current commit):
+CSC-specific slice (29 tests, all green at the current commit):
 
 | File | Count | Scope |
 |------|------:|-------|
@@ -148,9 +153,13 @@ CSC-specific slice (26 tests, all green at the current commit):
 | `test_csc_cluster.ml` | 2 | Two-shard invalidation; cluster-wide `FLUSHDB` |
 | `test_csc_lifecycle.ml` | 3 | Standalone reconnect flush; live `CLUSTER FAILOVER FORCE`; TTL expiry without invalidation |
 | `test_csc_bcast.ml` | 3 | `TRACKINGINFO` flags; in-prefix evict; out-of-prefix isolation |
+| `test_csc_optin.ml` | 3 | Populate-then-hit; external SET evicts; 50-fiber concurrent OPTIN tracking |
 
-All 26 CSC tests were run against live Valkey 9.0.3 standalone **and** a
-live 6-node cluster with real primary promotion. Nothing skipped.
+The 26 CSC tests pre-OPTIN are run against live Valkey 9.0.3
+standalone **and** a live 6-node cluster with real primary
+promotion. The 3 new `test_csc_optin.ml` cases are standalone-only
+because cluster + OPTIN is gated until pair-aware redirect retry
+lands. Nothing skipped in standalone.
 
 ---
 
@@ -192,12 +201,16 @@ First-run sanity steps on Ubuntu:
 
 These are documented here rather than as stub code or dead TODOs:
 
-1. **`optin = true` path.** Current code raises `Invalid_argument` at
-   connect. The planned shape was a connection-local mutex serialising a
-   `CLIENT CACHING YES` + target-command pair (following the `Batch`
-   pattern) — two round-trips per cached read, trading latency for a
-   smaller server-side tracking table. Field-default is `optin = false`
-   and nobody has asked for OPTIN yet; deferred.
+1. **Cluster + OPTIN with redirect-aware pair retry.** OPTIN is
+   wired for standalone via `Connection.request_pair`. In cluster
+   mode, a slot-migration MOVED/ASK on the read frame would today
+   surface as a `Server_error` to the user instead of being
+   transparently retried (as `exec` does for non-OPTIN reads).
+   `Client.from_router` raises `Invalid_argument` for `mode =
+   Optin` on a non-standalone router until this is wired. Plumbing
+   shape is a `dispatch_pair` closure on `Router.t` mirroring
+   `exec`'s closure, with the existing `handle_retries` adapted
+   to retry the whole pair on the new connection.
 2. **Per-key TTL refresh on hit.** Right now a cached entry's TTL
    counts from its last `put`, not its last `get`. Some users expect
    sliding-window TTL; we don't do that. If wanted: add an
@@ -254,8 +267,9 @@ implementing.
 
 - [ ] **OTel bridge for `cache_metrics`.** Meter + exporter callback.
       ~30 LOC + a docs note.
-- [ ] **`optin = true` path.** If a user asks or a fleet-scale deployment
-      motivates it.
+- [ ] **Cluster + OPTIN with redirect-aware pair retry.** Standalone
+      OPTIN is shipped (B2.5); cluster gate raises until the pair is
+      wired into `handle_retries`.
 - [ ] **Slot-migration stress test.** When there's a real incident
       report to defend against.
 

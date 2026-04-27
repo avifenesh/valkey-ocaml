@@ -26,7 +26,6 @@ let bcast_ccfg ~cache ~prefixes =
   { CC.cache;
     inflight = Valkey.Inflight.create ();
     mode = CC.Bcast { prefixes };
-    optin = false;
     noloop = false;
     entry_ttl_ms = None }
 

@@ -47,8 +47,8 @@ module Config : sig
     client_cache : Client_cache.t option;
     (** Client-side caching (Phase 8). When [Some], [CLIENT
         TRACKING ON ...] is issued after every (re)connect per
-        [mode]/[optin]/[noloop]. When [None], tracking is not
-        enabled and the cache is unused. *)
+        [mode]/[noloop]. When [None], tracking is not enabled
+        and the cache is unused. *)
   }
   val default : t
 end
@@ -89,6 +89,30 @@ val request :
   t ->
   string array ->
   (Resp3.t, Error.t) result
+
+val request_pair :
+  ?timeout:float ->
+  t ->
+  string array ->
+  string array ->
+  ( (Resp3.t, Error.t) result * (Resp3.t, Error.t) result
+  , Error.t) result
+(** Pipelined two-frame submit. Both wires are concatenated
+    and enqueued as a single indivisible unit, so no other
+    fiber's command can appear between them on the wire.
+    Internal: used by the OPTIN client-side-caching read path
+    (where the spec requires [CLIENT CACHING YES] to be sent
+    immediately before the tracked read). Not intended for
+    general use — the matching-FIFO contract assumes exactly
+    two replies arrive in order.
+
+    The outer [Error.t] covers failures that prevented the
+    submit (Closed, Circuit_open, Queue_full). The inner pair
+    carries the two frames' independent replies; either may
+    be a [Server_error] without the other failing.
+
+    [timeout] applies as a single wall-clock deadline to the
+    whole pair. *)
 
 val send_fire_and_forget :
   t ->

@@ -220,7 +220,7 @@ module Config = struct
     client_cache : Client_cache.t option;
     (** Client-side caching (Phase 8). [None] disables; [Some cfg]
         issues [CLIENT TRACKING ON ...] after each (re)connect per
-        [cfg.mode], [cfg.optin], [cfg.noloop]. Storage is
+        [cfg.mode], [cfg.noloop]. Storage is
         [cfg.cache]; later steps wire the invalidator fiber and
         race-safe GET path. *)
   }
@@ -259,11 +259,17 @@ type entry = {
 }
 
 type queued = {
-  entry : entry option;
-  (* [None] = fire-and-forget (no reply expected). Used by
+  entries : entry list;
+  (* [[]] = fire-and-forget (no reply expected). Used by
      [send_fire_and_forget] for subscribe-mode commands; the
-     entry is skipped at both out_pump push-to-sent time and
-     drain time. *)
+     entries are skipped at both out_pump push-to-sent time
+     and drain time.
+     A non-empty list of length > 1 represents a pipelined
+     atomic submit (e.g. [CLIENT CACHING YES] + read for OPTIN
+     CSC). The wire is the concatenation of the per-entry
+     frames in order; entries are pushed to [sent] under a
+     single mutex acquire so the matching FIFO stays
+     adjacent. *)
   wire : Cstruct.t;
 }
 
@@ -377,8 +383,8 @@ let client_tracking_args (cfg : Client_cache.t) : string array =
   let base = [ "CLIENT"; "TRACKING"; "ON" ] in
   let with_mode =
     match cfg.mode with
-    | Client_cache.Default ->
-        if cfg.optin then base @ [ "OPTIN" ] else base
+    | Client_cache.Default -> base
+    | Client_cache.Optin -> base @ [ "OPTIN" ]
     | Client_cache.Bcast { prefixes } ->
         let prefix_flags =
           List.concat_map (fun p -> [ "PREFIX"; p ]) prefixes
@@ -543,17 +549,12 @@ let drain_unsent t (result : (Resp3.t, Error.t) result) =
   | None -> ()
   | Some q ->
       t.unsent <- None;
-      (match q.entry with
-       | Some e -> resolve_entry t e result
-       | None -> ())
+      List.iter (fun e -> resolve_entry t e result) q.entries
 
 let drain_cmd_queue t (result : (Resp3.t, Error.t) result) =
   let leftovers = Chan.drain t.cmd_queue in
   Queue.iter
-    (fun q ->
-      match q.entry with
-      | Some e -> resolve_entry t e result
-      | None -> ())
+    (fun q -> List.iter (fun e -> resolve_entry t e result) q.entries)
     leftovers
 
 let jittered_backoff (policy : Reconnect.t) attempts =
@@ -585,11 +586,11 @@ let out_pump (t : t) (sock : socket) : unit =
           t.unsent <- Some q
           (* leave loop; raise disconnect by returning *)
       | Ok () ->
-          (match q.entry with
-           | Some e ->
+          (match q.entries with
+           | [] -> ()
+           | es ->
                Eio.Mutex.use_rw ~protect:true t.sent_mutex (fun () ->
-                   Queue.push e t.sent)
-           | None -> ());
+                   List.iter (fun e -> Queue.push e t.sent) es));
           loop ()
     end
   in
@@ -790,7 +791,7 @@ let request ?timeout t args =
           Byte_sem.acquire t.budget size;
           let promise, resolver = Eio.Promise.create () in
           let entry = { resolver; size; abandoned = false } in
-          match try_enqueue t { entry = Some entry; wire } with
+          match try_enqueue t { entries = [ entry ]; wire } with
           | `Dead e ->
               Byte_sem.release t.budget size;
               Error e
@@ -830,7 +831,7 @@ let send_fire_and_forget t args =
     | `Reject -> Error Error.Circuit_open
     | `Allow | `Allow_probe ->
         Byte_sem.acquire t.budget size;
-        match try_enqueue t { entry = None; wire } with
+        match try_enqueue t { entries = []; wire } with
         | `Dead e ->
             Byte_sem.release t.budget size;
             Error e
@@ -839,6 +840,101 @@ let send_fire_and_forget t args =
                reply that would free it via resolve_entry. *)
             Byte_sem.release t.budget size;
             Ok ()
+
+(* Pipelined atomic two-frame submit. Builds two wire frames,
+   concatenates them into a single [queued] entry with two
+   matching-queue resolvers, and enqueues as one indivisible
+   unit. The writer flushes both frames back-to-back; the
+   parser pulls two replies in order and resolves both
+   promises FIFO.
+
+   Used for OPTIN CSC where the spec requires
+   [CLIENT CACHING YES] to be sent immediately before the
+   tracked read with no other command between them on the
+   wire (verified empirically: the flag is consumed by exactly
+   the next single command). A pair of separate [request]
+   calls would NOT satisfy this — another fiber's enqueue can
+   land between them.
+
+   The outer [Error.t] reports failures that prevented the
+   submit (Closed, Circuit_open, Queue_full). The inner pair
+   carries each frame's reply independently — frame 1 may
+   succeed (Simple_string "OK") while frame 2 errors
+   (WRONGTYPE etc.), or either may fail with transport
+   errors if the connection drops mid-submit. *)
+let request_pair ?timeout t args1 args2 =
+  let timeout =
+    match timeout with
+    | Some _ as v -> v
+    | None -> t.config.command_timeout
+  in
+  let wire1 = Resp3_writer.command_to_cstruct args1 in
+  let wire2 = Resp3_writer.command_to_cstruct args2 in
+  let size1 = Cstruct.length wire1 in
+  let size2 = Cstruct.length wire2 in
+  let total = size1 + size2 in
+  if total > t.config.max_queued_bytes then Error Error.Queue_full
+  else
+    let cb_decision =
+      match t.cb with
+      | None -> `Allow
+      | Some cb -> Circuit_breaker.on_entry cb (t.now ())
+    in
+    match cb_decision with
+    | `Reject -> Error Error.Circuit_open
+    | (`Allow | `Allow_probe) as decision ->
+        let was_probe = decision = `Allow_probe in
+        let run () =
+          Byte_sem.acquire t.budget total;
+          let p1, r1 = Eio.Promise.create () in
+          let p2, r2 = Eio.Promise.create () in
+          let e1 = { resolver = r1; size = size1; abandoned = false } in
+          let e2 = { resolver = r2; size = size2; abandoned = false } in
+          let wire = Cstruct.append wire1 wire2 in
+          match try_enqueue t { entries = [ e1; e2 ]; wire } with
+          | `Dead e ->
+              Byte_sem.release t.budget total;
+              Error e
+          | `In_queue ->
+              let r1 =
+                try Eio.Promise.await p1
+                with exn ->
+                  e1.abandoned <- true; e2.abandoned <- true;
+                  raise exn
+              in
+              let r2 =
+                try Eio.Promise.await p2
+                with exn ->
+                  e2.abandoned <- true;
+                  raise exn
+              in
+              Ok (r1, r2)
+        in
+        let result =
+          match timeout with
+          | None -> run ()
+          | Some secs ->
+              (match t.with_timeout secs run with
+               | Ok v -> v
+               | Error `Timeout -> Error Error.Timeout)
+        in
+        (* Trip the breaker only on transport-level outcomes, the
+           same rule [request] applies. A successful submit where
+           one inner frame returned Server_error counts as
+           transport-success. *)
+        let transport_outcome =
+          match result with
+          | Error e -> Error e
+          | Ok ((Error e), _) -> Error e
+          | Ok (_, (Error e)) -> Error e
+          | Ok (Ok _, Ok _) -> Ok Resp3.Null  (* shape-irrelevant *)
+        in
+        (match t.cb with
+         | None -> ()
+         | Some cb ->
+             Circuit_breaker.on_result cb ~was_probe (t.now ())
+               transport_outcome);
+        result
 
 let keepalive_loop t interval =
   let rec loop () =

@@ -27,11 +27,6 @@ let resolve_connection_config (cfg : Config.t) : Connection.Config.t =
         "Client.connect: set client_cache on Config.t OR on \
          Config.t.connection, not both"
   | Some cc, None ->
-      if cc.Client_cache.optin then
-        invalid_arg
-          "Client.Config.client_cache: optin=true is not yet \
-           supported (planned for Phase 8 step B2.5); use \
-           optin=false for now";
       { cfg.connection with client_cache = Some cc }
 
 type t = {
@@ -72,6 +67,14 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
 
 let from_router ~config router =
   let conn_cfg = resolve_connection_config config in
+  (match conn_cfg.Connection.Config.client_cache with
+   | Some cc when cc.Client_cache.mode = Client_cache.Optin
+              && not (Router.is_standalone router) ->
+       invalid_arg
+         "Client.from_router: client_cache mode=Optin is only \
+          supported on standalone routers in this release; \
+          cluster + OPTIN is planned but not yet wired."
+   | _ -> ());
   { router; config;
     client_cache = conn_cfg.Connection.Config.client_cache;
     loaded_shas = Hashtbl.create 16;
@@ -115,6 +118,30 @@ let exec ?timeout ?target ?read_from t args =
               a random node. This preserves pre-spec behavior; callers
               who want true fan-out should use [exec_multi]. *)
            Router.exec ?timeout t.router Target.Random user_rf args)
+
+(* OPTIN-armed read: pipeline [CLIENT CACHING YES] + [args] as one
+   wire-atomic submit on the standalone primary connection. The
+   from_router / connect gate guarantees standalone here, so we
+   look up the single primary directly and bypass slot routing —
+   OPTIN cluster support adds redirect-aware retry around the
+   pair, which is a separate step. *)
+let exec_optin_pair ?timeout t args =
+  match Router.primary_connection t.router with
+  | None -> Error Connection.Error.Closed
+  | Some conn ->
+      (match
+         Connection.request_pair ?timeout conn
+           [| "CLIENT"; "CACHING"; "YES" |] args
+       with
+       | Error e -> Error e
+       | Ok (Error e, _) -> Error e
+       | Ok (Ok (Resp3.Simple_string "OK"), second) -> second
+       | Ok (Ok other, _) ->
+           Error
+             (Connection.Error.Protocol_violation
+                (Format.asprintf
+                   "CLIENT CACHING YES: unexpected reply %a"
+                   Resp3.pp other)))
 
 let exec_multi ?timeout ?fan t args =
   let fan =
@@ -222,7 +249,12 @@ let cached_read t ccfg key ?timeout ?read_from
   let miss () =
     match Inflight.begin_fetch ccfg.Client_cache.inflight key with
     | Inflight.Fresh resolver ->
-        let result = exec ?timeout ?read_from t cmd in
+        let result =
+          match ccfg.Client_cache.mode with
+          | Client_cache.Optin -> exec_optin_pair ?timeout t cmd
+          | Client_cache.Default | Client_cache.Bcast _ ->
+              exec ?timeout ?read_from t cmd
+        in
         let completion =
           match result with
           | Ok _ -> Inflight.complete ccfg.inflight key

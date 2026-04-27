@@ -54,7 +54,7 @@ the budget is rejected (`put` is a no-op).
 Connection config gains a `client_cache : Client_cache.t option`.
 When `Some cfg`, `full_handshake` issues `CLIENT TRACKING ON
 [OPTIN] [BCAST PREFIX …] [NOLOOP]` after `HELLO`/`SELECT`, per
-`cfg.mode`, `cfg.optin`, `cfg.noloop`. The existing `on_connected`
+`cfg.mode` and `cfg.noloop`. The existing `on_connected`
 hook re-issues the same sequence after every reconnect, matching
 the pubsub-resubscribe pattern.
 
@@ -97,7 +97,7 @@ behaviour is unit-tested directly against `Cache.t`.
 
 Nothing populates the cache yet — that's step 4.
 
-### ✅ 4. Read-path caching (`optin=false`)
+### ✅ 4. Read-path caching (default tracking)
 
 `Client.Config.t` gains a `client_cache : Client_cache.t option`
 field. When set, `Client.connect` propagates it into the inner
@@ -115,9 +115,9 @@ hits. `Null` (missing key) is intentionally not cached — a
 later external SET would have no entry to evict via the
 invalidation path, so a negative cache could stay stale forever.
 
-`optin=true` is planned for a later step (`B2.5`, pipelined
-`CLIENT CACHING YES` + read). Setting `optin=true` on the config
-today raises `Invalid_argument` at connect time.
+OPTIN-armed reads (one extra wire frame per cached read in
+exchange for a smaller server-side tracking table) land in
+step B2.5 below.
 
 Single-flight dedup and in-flight/invalidation race handling
 land in step 5.
@@ -373,3 +373,103 @@ Integration tests (`test/test_csc_bcast.ml`):
   TRACKINGINFO`.
 - External SET on a prefix-match key evicts our cached entry.
 - External SET on a key *outside* the prefix does not evict.
+
+### ✅ B2.5. OPTIN — pipelined per-read tracking
+
+Default and BCAST tell the server to track everything we read
+(or everything matching a prefix). OPTIN is the third option:
+the server tracks **only** the keys we explicitly opt in for,
+read by read. Smaller server-side tracking table at the cost
+of one extra wire frame per cached read.
+
+Configured via `Client_cache.t.mode = Optin`. The handshake
+emits `CLIENT TRACKING ON OPTIN` (instead of plain `ON` for
+default or `ON BCAST PREFIX ...` for BCAST). Mutually exclusive
+with BCAST — encoded directly in the `mode` variant so
+ill-formed combinations don't compile.
+
+#### Wire shape
+
+The server consumes the OPTIN flag from a `CLIENT CACHING YES`
+command and applies it to **exactly the next single command on
+the wire**. Verified empirically against Valkey 9.0.3:
+
+- A pipelined `CACHING YES + GET k1 + GET k2` tracks `k1` only.
+- A `CACHING YES + SET kw + GET kw` tracks nothing (the SET
+  consumes the flag).
+- A `CACHING YES + PING + GET k` tracks nothing.
+- A `CACHING YES + MULTI + GET k + EXEC` does track `k` —
+  MULTI/EXEC counts as one logical command.
+- `CACHING YES` outside OPTIN/OPTOUT mode returns `ERR`.
+- Double-armed `CACHING YES + CACHING YES + GET k` is benign;
+  flag stays set.
+
+Implication: each cached OPTIN read must be a wire-atomic pair
+of exactly two frames — `CLIENT CACHING YES` then the read.
+Two separate `Connection.request` calls are insufficient,
+because another fiber's enqueue can land between them.
+
+#### Atomicity primitive — `Connection.request_pair`
+
+`lib/connection.ml` adds an internal `request_pair` that takes
+two arg arrays, builds both wire frames, concatenates them
+into a single `queued` entry with two ordered FIFO matching
+slots, and enqueues as one indivisible unit. The writer
+flushes both frames back-to-back; the parser pulls two replies
+in order and resolves both promises. No new mutex — the queue
+is already the per-connection serialization point. Generalises
+the existing per-`queued` `entry option` to an `entry list` so
+that `send_fire_and_forget` (`[]`), normal `request`
+(`[ entry ]`), and `request_pair` (`[ e1; e2 ]`) all share one
+code path.
+
+The outer `Error.t` covers submit failures (`Closed`,
+`Circuit_open`, `Queue_full`). The inner pair carries each
+frame's reply independently — frame 1 may succeed
+(`Simple_string "OK"`) while frame 2 errors (`WRONGTYPE`),
+without either failing the other.
+
+#### Read-path integration
+
+`Client.cached_read`'s miss branch now dispatches on
+`ccfg.mode`:
+
+```ocaml
+match ccfg.Client_cache.mode with
+| Client_cache.Optin -> exec_optin_pair ?timeout t cmd
+| Client_cache.Default | Client_cache.Bcast _ ->
+    exec ?timeout ?read_from t cmd
+```
+
+`exec_optin_pair` looks up the standalone primary connection
+directly (the cluster gate enforces standalone for OPTIN),
+calls `Connection.request_pair conn ["CLIENT";"CACHING";"YES"] cmd`,
+and:
+
+- maps the CACHING reply: `Simple_string "OK"` lets the read
+  reply through unchanged; anything else surfaces as a
+  `Protocol_violation`,
+- propagates transport errors from either frame as an `Error`,
+- never poisons `Inflight` — the existing single-flight
+  machinery treats the result the same way as it would for a
+  default-tracking miss.
+
+Cluster + OPTIN with redirect-aware pair retry is a separate
+step; today, constructing a `Client.t` from a non-standalone
+router with `mode = Optin` raises `Invalid_argument` at
+`from_router`.
+
+#### Integration tests (`test/test_csc_optin.ml`)
+
+- **Populates then hits.** Cold OPTIN GET round-trips and
+  caches; second GET serves from cache.
+- **External SET evicts.** The load-bearing test: an external
+  write must produce an invalidation push, which only happens
+  if the wire-pair was actually adjacent and the server
+  actually started tracking the key.
+- **50-fiber concurrency.** N fibers each issue an OPTIN read
+  on a distinct key; aux mutates every key; every cache entry
+  must be invalidated. Detects any wire-pair atomicity break
+  under concurrent enqueue (a broken pair would leave one
+  fiber's read untracked, no invalidation, that entry stays
+  cached, count > 0).

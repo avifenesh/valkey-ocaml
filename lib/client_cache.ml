@@ -14,11 +14,18 @@ type mode =
       connection read and only sends invalidations for those.
       Default and strongly consistent at the cost of
       server-side per-client tracking table memory. *)
+  | Optin
+  (** Per-client tracking, opt-in per read: server only tracks
+      keys read immediately after a [CLIENT CACHING YES] arming
+      command on the same connection. Smaller server-side
+      tracking table at the cost of one extra wire frame per
+      cached read. Mutually exclusive with [Bcast] (the server
+      rejects [TRACKING ... BCAST OPTIN]). *)
   | Bcast of { prefixes : string list }
   (** Broadcast mode: server sends invalidations for any key
       whose prefix matches. No per-client tracking table;
-      scales to huge client counts. Not yet implemented —
-      present in the type so callers can be future-proof. *)
+      scales to huge client counts. Mutually exclusive with
+      [Optin]. *)
 
 (* The value in flight is the full result of [Connection.request]
    so the owner can resolve joined fibers with the server error
@@ -38,11 +45,6 @@ type t = {
       touched by the invalidator fiber via [Inflight.mark_dirty]
       before it evicts from [cache]. *)
   mode : mode;
-  optin : bool;
-  (** [true] → send [CLIENT TRACKING ... OPTIN] and pipeline
-      [CLIENT CACHING YES] before each cached read. Keeps
-      server-side tracking table small. [false] → track every
-      readonly command automatically (OPTOUT-style). *)
   noloop : bool;
   (** [true] → ask server not to echo our own writes back as
       invalidations. Requires us to evict locally on our own
@@ -59,11 +61,10 @@ type t = {
 (** Convenience constructor that initialises [inflight] to a
     fresh empty table. Use this in preference to a literal record
     so the storage layer's housekeeping stays internal. *)
-let make ~cache ?(mode = Default) ?(optin = false) ?(noloop = false)
+let make ~cache ?(mode = Default) ?(noloop = false)
     ?entry_ttl_ms () =
   { cache;
     inflight = Inflight.create ();
     mode;
-    optin;
     noloop;
     entry_ttl_ms }
