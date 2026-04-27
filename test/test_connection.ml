@@ -313,6 +313,77 @@ let test_tls_system_cas_rejects_self_signed () =
   | C.Handshake_failed e ->
       Alcotest.failf "expected Tls_failed, got %a" C.Error.pp e
 
+(* On reconnect, the handshake must replay AUTH or the next command
+   sees NOAUTH. Sets up an ACL user out-of-band, opens an
+   authenticated connection, force-kills it from another connection,
+   waits for auto-reconnect, then issues a command that requires
+   authentication. If AUTH wasn't replayed the request would fail
+   with [Server_error] code "NOAUTH". *)
+let test_auth_replayed_on_reconnect () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  (* Use a unique user name so parallel test runs don't collide. *)
+  let user =
+    Printf.sprintf "ocaml_valkey_test_%d" (Random.int 1_000_000)
+  in
+  let pw = "p4ssw0rd" in
+  let admin = C.connect ~sw ~net ~clock ~host ~port () in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ = C.request admin [| "ACL"; "DELUSER"; user |] in
+      C.close admin)
+  @@ fun () ->
+  (match
+     C.request admin
+       [| "ACL"; "SETUSER"; user; "ON";
+          ">" ^ pw; "+@all"; "~*"; "&*" |]
+   with
+   | Ok (R.Simple_string "OK") -> ()
+   | Ok v -> Alcotest.failf "ACL SETUSER: unexpected %a" R.pp v
+   | Error e -> Alcotest.failf "ACL SETUSER: %a" C.Error.pp e);
+  let cfg : C.Config.t =
+    { C.Config.default with
+      handshake = { C.Handshake.default with auth = Some (user, pw) } }
+  in
+  let auth_conn =
+    C.connect ~sw ~net ~clock ~config:cfg ~host ~port ()
+  in
+  Fun.protect ~finally:(fun () -> C.close auth_conn) @@ fun () ->
+  (* Sanity: the handshake authenticated. *)
+  expect_simple_eq ~ctx:"PING pre-kill" ~expected:"PONG"
+    (C.request auth_conn [| "PING" |]);
+  let auth_id = client_id auth_conn in
+  (match C.request admin [| "CLIENT"; "KILL"; "ID"; auth_id |] with
+   | Ok _ -> ()
+   | Error e -> Alcotest.failf "CLIENT KILL: %a" C.Error.pp e);
+  wait_for_alive ~clock ~deadline:3.0 auth_conn;
+  (* Real assertion: a command after the kill+reconnect must
+     succeed. If AUTH wasn't replayed, the server would respond
+     with [Server_error { code = "NOAUTH"; ... }] on the very
+     first request after the recovery handshake — provably
+     because that request still hits the same TCP-level
+     reauth-required state. *)
+  (match C.request auth_conn [| "PING" |] with
+   | Ok (R.Simple_string "PONG") -> ()
+   | Ok v ->
+       Alcotest.failf
+         "PING after reconnect: unexpected %a (handshake didn't \
+          replay AUTH cleanly)" R.pp v
+   | Error (C.Error.Server_error { code = "NOAUTH"; message }) ->
+       Alcotest.failf
+         "PING after reconnect returned NOAUTH (%s) — AUTH was \
+          NOT replayed during reconnect handshake" message
+   | Error e ->
+       Alcotest.failf
+         "PING after reconnect: %a" C.Error.pp e);
+  (* Second command exercises the post-recovery state past the
+     first round-trip; catches a "first PING happens to slip
+     through but auth is broken longer-term" foot-gun. *)
+  expect_simple_eq ~ctx:"PING #2 after recovery" ~expected:"PONG"
+    (C.request auth_conn [| "PING" |])
+
 (* Second connection kills first's socket; first should recover + serve. *)
 let test_recovery_client_kill () =
   Eio_main.run @@ fun env ->
@@ -416,4 +487,6 @@ let tests =
       test_circuit_breaker;
     Alcotest.test_case "domain_mgr (IO on separate domain)" `Quick
       test_with_domain_mgr;
+    Alcotest.test_case "AUTH is replayed on reconnect" `Quick
+      test_auth_replayed_on_reconnect;
   ]

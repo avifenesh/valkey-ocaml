@@ -8,6 +8,7 @@ module CR = Valkey.Cluster_router
 module B = Valkey.Batch
 module E = Valkey.Connection.Error
 module Conn = Valkey.Connection
+module R = Valkey.Resp3
 
 let seeds = [ "valkey-c1", 7000; "valkey-c2", 7001; "valkey-c3", 7002 ]
 
@@ -602,6 +603,153 @@ let skip_placeholder name () =
     "[skipped] %s (cluster unreachable; docker-compose.cluster.yml)\n%!"
     name
 
+(* Minimal CLUSTER NODES parser: extract (host, port) of the first
+   replica. Format: "<id> <host>:<port>@<bus>[,hostname] <flags>
+   ...". Used to find a replica we can force-promote. *)
+let pick_a_replica nodes_text =
+  let lines = String.split_on_char '\n' nodes_text in
+  List.find_map
+    (fun line ->
+      if String.length line = 0 then None
+      else
+        match String.split_on_char ' ' line with
+        | _id :: addr :: flags :: _ ->
+            let is_replica =
+              List.exists (fun f -> f = "slave" || f = "replica")
+                (String.split_on_char ',' flags)
+            in
+            if not is_replica then None
+            else
+              let addr = List.hd (String.split_on_char ',' addr) in
+              (match String.index_opt addr ':' with
+               | None -> None
+               | Some i ->
+                   let host = String.sub addr 0 i in
+                   let rest =
+                     String.sub addr (i + 1) (String.length addr - i - 1)
+                   in
+                   let port =
+                     let at =
+                       try String.index rest '@'
+                       with Not_found -> String.length rest
+                     in
+                     int_of_string (String.sub rest 0 at)
+                   in
+                   Some (host, port))
+        | _ -> None)
+    lines
+
+(* WATCH guard + topology change mid-flight.
+   Opens a WATCH guard on a key, force-promotes a replica to flip
+   the cluster's primary set, then attempts run_with_guard. The
+   connection holding the guard is now talking to a former primary
+   (now a replica), so EXEC must fail in some bounded way: either
+   [Ok None] (treated as a WATCH abort, caller retries) or
+   [Ok (Some _)] (transparent retry on the new primary succeeded).
+   The tested wire-level invariant: a slot ownership change between
+   WATCH and EXEC must NOT leak as [Error (Server_error MOVED)] to
+   the caller — that's a foot-gun the user can't realistically
+   distinguish from a "real" server error.
+   STATUS.md previously deferred this scenario as "slot-migration
+   under load"; it's exercised here. *)
+(* Snapshot of (node-id, role) tuples from CLUSTER NODES, used to
+   verify the failover actually flipped a primary↔replica. *)
+let role_set nodes_text =
+  String.split_on_char '\n' nodes_text
+  |> List.filter_map (fun line ->
+       if String.length line = 0 then None
+       else match String.split_on_char ' ' line with
+         | id :: _addr :: flags :: _ ->
+             let role =
+               if List.exists (fun f -> f = "master")
+                    (String.split_on_char ',' flags)
+               then "master"
+               else if List.exists
+                         (fun f -> f = "slave" || f = "replica")
+                         (String.split_on_char ',' flags)
+               then "replica"
+               else "other"
+             in
+             Some (id, role)
+         | _ -> None)
+  |> List.sort compare
+
+let test_watch_guard_under_failover () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    { (CR.Config.default ~seeds) with prefer_hostname = true }
+  in
+  match create_router_retry ~sw ~net ~clock ~config with
+  | Error m -> Alcotest.failf "Cluster_router.create: %s" m
+  | Ok router ->
+      let client = C.from_router ~config:C.Config.default router in
+      Fun.protect ~finally:(fun () -> C.close client) @@ fun () ->
+      let cluster_nodes_text () =
+        let (h, p) = List.hd seeds in
+        let conn =
+          Conn.connect ~sw ~net ~clock ~config:Conn.Config.default
+            ~host:h ~port:p ()
+        in
+        let r = Conn.request conn [| "CLUSTER"; "NODES" |] in
+        Conn.close conn;
+        match r with
+        | Ok (R.Bulk_string s | R.Simple_string s
+              | R.Verbatim_string { data = s; _ }) -> s
+        | _ -> Alcotest.fail "CLUSTER NODES failed"
+      in
+      let roles_before = role_set (cluster_nodes_text ()) in
+      let k = "wg:failover:{wgf}" in
+      let _ = C.set client k "v0" in
+      let outcome =
+        B.with_watch client [ k ] (fun guard ->
+          (* Force topology change mid-guard. Issue CLUSTER FAILOVER
+             FORCE on a replica (only replicas accept it). *)
+          (match pick_a_replica (cluster_nodes_text ()) with
+           | None -> Alcotest.fail "no replica found in CLUSTER NODES"
+           | Some (host, port) ->
+               let replica_conn =
+                 Conn.connect ~sw ~net ~clock
+                   ~config:Conn.Config.default ~host ~port ()
+               in
+               let _ =
+                 Conn.request replica_conn
+                   [| "CLUSTER"; "FAILOVER"; "FORCE" |]
+               in
+               Conn.close replica_conn);
+          (* Failover takes ~50–500ms; sleep so the EXEC inside
+             run_with_guard hits the post-failover state. *)
+          Eio.Time.sleep clock 0.5;
+          let b = B.create ~atomic:true ~hint_key:k () in
+          let _ = B.queue b [| "SET"; k; "v-after-failover" |] in
+          B.run_with_guard b guard)
+      in
+      (* Verify the failover actually happened — without this, a
+         silent FAILOVER no-op (e.g. replica already primary, or
+         cluster busy) would let the test pass on stale topology
+         and prove nothing about WATCH+EXEC under flip. *)
+      let roles_after = role_set (cluster_nodes_text ()) in
+      if roles_before = roles_after then
+        Alcotest.fail
+          "CLUSTER FAILOVER FORCE produced no role change; test ran \
+           on unchanged topology and proves nothing — investigate \
+           cluster state, not the test failure";
+      (match outcome with
+       | Ok (Ok None) -> ()                       (* WATCH abort: clean *)
+       | Ok (Ok (Some _)) -> ()                   (* transparent retry *)
+       | Ok (Error e) ->
+           Alcotest.failf
+             "WATCH+EXEC under failover leaked transport error: %a"
+             err_pp e
+       | Error e ->
+           Alcotest.failf
+             "with_watch under failover failed at setup: %a"
+             err_pp e);
+      let _ = C.del client [ k ] in
+      ()
+
 let tests =
   let reachable = cluster_reachable () in
   let tc name f =
@@ -640,4 +788,8 @@ let tests =
       test_pfcount_cluster_crossslot;
     tc "pfcount_cluster all-missing returns 0"
       test_pfcount_cluster_missing_keys_ok;
+    (* Forces a CLUSTER FAILOVER mid-WATCH; runs last among cluster
+       tests so its topology change doesn't perturb sibling tests. *)
+    tc "watch guard: topology change between WATCH and EXEC"
+      test_watch_guard_under_failover;
   ]

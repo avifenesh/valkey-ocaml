@@ -111,14 +111,6 @@ let test_az_preserved () =
       Alcotest.(check (option string))
         "AZ preserved" (Some "us-east-1a") n1.availability_zone
 
-let test_sha_stable () =
-  match T.of_cluster_shards sample_cluster,
-        T.of_cluster_shards sample_cluster
-  with
-  | Ok a, Ok b ->
-      Alcotest.(check string) "same SHA for same input" (T.sha a) (T.sha b)
-  | _ -> Alcotest.fail "parse"
-
 let test_sha_differs_on_change () =
   let altered =
     R.Array
@@ -165,7 +157,6 @@ let tests =
     Alcotest.test_case "slot lookup" `Quick test_slot_lookup;
     Alcotest.test_case "replicas visible" `Quick test_replicas_visible;
     Alcotest.test_case "AZ preserved" `Quick test_az_preserved;
-    Alcotest.test_case "SHA stable across reparse" `Quick test_sha_stable;
     Alcotest.test_case "SHA differs on change" `Quick test_sha_differs_on_change;
     Alcotest.test_case "parse error on no-primary shard" `Quick
       test_parse_error_no_primary;

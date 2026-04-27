@@ -902,6 +902,35 @@ let tests =
        | Ok None -> ()
        | Ok (Some (_, _)) -> Alcotest.fail "BLPOP should have timed out"
        | Error e -> Alcotest.failf "BLPOP: %a" E.pp e));
+    Alcotest.test_case "blocking: BLMOVE timeout on empty source" `Quick (fun () ->
+      with_client @@ fun c ->
+      let src = "ocaml:c:blmove:empty:src" in
+      let dst = "ocaml:c:blmove:empty:dst" in
+      let _ = C.del c [ src; dst ] in
+      (* Empty source list, server should park us for ~block_seconds
+         and return Null on timeout. Asserting Ok None proves the
+         block-then-timeout wire path: a late reply arriving after
+         the OCaml-side timeout would either deliver a stale
+         Bulk_string (incorrect) or corrupt the matching FIFO
+         (would manifest as a Protocol_violation on a subsequent
+         command). The trailing PING confirms the connection is
+         still in a coherent state. *)
+      (match
+         C.blmove c ~source:src ~destination:dst
+           ~from:Left ~to_:Right ~block_seconds:0.1
+       with
+       | Ok None -> ()
+       | Ok (Some s) ->
+           Alcotest.failf "BLMOVE on empty src: expected timeout, got Some %S" s
+       | Error e -> Alcotest.failf "BLMOVE: %a" E.pp e);
+      (match C.exec c [| "PING" |] with
+       | Ok (R.Simple_string "PONG") -> ()
+       | other ->
+           Alcotest.failf
+             "post-timeout PING should be PONG (matching FIFO healthy); got %s"
+             (match other with
+              | Ok v -> Format.asprintf "%a" R.pp v
+              | Error e -> Format.asprintf "Error %a" E.pp e)));
     Alcotest.test_case "LMOVE / BLMOVE with data" `Quick (fun () ->
       with_client @@ fun c ->
       let src = "ocaml:c:src" in
@@ -944,6 +973,65 @@ let tests =
        | Ok [] -> ()
        | Ok _ -> Alcotest.fail "XREAD BLOCK should have timed out"
        | Error e -> Alcotest.failf "XREAD BLOCK: %a" E.pp e));
+    Alcotest.test_case "XREADGROUP BLOCK timeout leaves consumer state intact"
+      `Quick (fun () ->
+      with_client @@ fun c ->
+      let key = "ocaml:c:xrg:block" in
+      let group = "g1" in
+      let consumer = "c1" in
+      let _ = C.del c [ key ] in
+      (match
+         C.xgroup_create c key ~group ~id:"0" ~opts:[ Xgroup_mkstream ]
+       with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "XGROUP CREATE: %a" E.pp e);
+      (* No new messages; ">" id, BLOCK 100ms. Server returns nil
+         (Ok []) on timeout. The load-bearing assertion: a real
+         server-side group entry exists for [consumer] AFTER the
+         block times out — i.e. registering the consumer didn't
+         depend on returning a message, and timing out didn't tear
+         the group state down. A failure mode where the client
+         abandons the in-flight reply but the server still
+         registered + then expired the consumer would surface as
+         an empty XINFO CONSUMERS list. *)
+      (match
+         C.xreadgroup_block c ~block_ms:100 ~group ~consumer
+           ~streams:[ key, ">" ]
+       with
+       | Ok [] -> ()
+       | Ok _ ->
+           Alcotest.fail "XREADGROUP BLOCK should have timed out (no new messages)"
+       | Error e -> Alcotest.failf "XREADGROUP BLOCK: %a" E.pp e);
+      (match C.xinfo_consumers c key ~group with
+       | Ok xs ->
+           let extract_name = function
+             | R.Map kvs ->
+                 List.find_map
+                   (fun (k, v) -> match k, v with
+                      | R.Bulk_string "name", R.Bulk_string n -> Some n
+                      | _ -> None)
+                   kvs
+             | _ -> None
+           in
+           let names = List.filter_map extract_name xs in
+           if not (List.mem consumer names) then
+             Alcotest.failf
+               "consumer %S not in group after BLOCK timeout (got [%s])"
+               consumer (String.concat ", " names)
+       | Error e -> Alcotest.failf "XINFO CONSUMERS: %a" E.pp e);
+      (* Matching FIFO sanity: a subsequent command must return
+         its own reply, not a stale reply from the timed-out
+         BLOCK. *)
+      (match C.exec c [| "PING" |] with
+       | Ok (R.Simple_string "PONG") -> ()
+       | other ->
+           Alcotest.failf
+             "post-timeout PING expected PONG, got %s"
+             (match other with
+              | Ok v -> Format.asprintf "%a" R.pp v
+              | Error e -> Format.asprintf "Error %a" E.pp e));
+      let _ = C.del c [ key ] in
+      ());
     Alcotest.test_case "HINCRBY" `Quick (fun () ->
       with_client @@ fun c ->
       let key = "ocaml:c:h4" in

@@ -176,27 +176,49 @@ let request_ok ?timeout conn args =
               (if Array.length args > 0 then args.(0) else "?")
               Resp3.pp v))
 
-(* Send the queued commands back to back (each reply should be
-   +QUEUED), but don't fast-fail on a single bad-arity error — the
-   server will EXECABORT at EXEC time. Transport / timeout /
-   protocol errors mean the connection state is no longer
-   trustworthy, so bail out and let the caller reconnect. *)
+(* Outcome of [queue_all] inside a MULTI block.
+   - [All_queued]: every command got a +QUEUED back; safe to EXEC.
+   - [Topology_changed]: the server returned MOVED or ASK while
+     we were filling the multi-queue. The slot moved underneath
+     us between [WATCH]/[MULTI] and [queue_all]. The MULTI block
+     is now in an unknown state on the server (Valkey will
+     EXECABORT on EXEC). The caller should DISCARD and treat
+     this as a WATCH abort so its retry loop re-routes against
+     the fresh topology. Without this signal, the EXECABORT
+     leaks to the user as [Server_error] and they can't tell
+     "topology moved" from "I sent a malformed command."
+   - [Transport_error]: timeout / Closed / Protocol_violation
+     on the wire — bail out and let the caller reconnect. *)
+type queue_outcome =
+  | All_queued
+  | Topology_changed
+  | Transport_error of Connection.Error.t
+
 let queue_all ~deadline conn queued =
   let rec loop = function
-    | [] -> Ok ()
+    | [] -> All_queued
     | q :: rest ->
         let per_timeout = remaining_window ~deadline in
         (match Connection.request ?timeout:per_timeout conn q.args with
          | Ok (Resp3.Simple_string "QUEUED") -> loop rest
          | Ok v ->
-             Error
+             Transport_error
                (Connection.Error.Protocol_violation
                   (Format.asprintf
                      "queue inside MULTI: unexpected reply %a"
                      Resp3.pp v))
+         | Error
+             (Connection.Error.Server_error
+                { code = "MOVED" | "ASK"; _ }) ->
+             Topology_changed
          | Error (Connection.Error.Server_error _) ->
+             (* Bad-arity / unknown command etc. — leave it to the
+                server's EXECABORT path. The transaction array's
+                per-command slot will carry the error; if every
+                queued command failed, EXEC returns EXECABORT and
+                we surface it through [decode_exec_reply]. *)
              loop rest
-         | Error e -> Error e)
+         | Error e -> Transport_error e)
   in
   loop queued
 
@@ -271,13 +293,28 @@ let run_atomic ?timeout client t =
                            | Error e -> fail e
                            | Ok () ->
                                (match queue_all ~deadline conn queued with
-                                | Error e -> fail e
-                                | Ok () ->
+                                | Transport_error e -> fail e
+                                | Topology_changed ->
+                                    (* Slot moved during queueing.
+                                       Drop the connection so the
+                                       supervisor reconnects and
+                                       rediscovers the topology;
+                                       surface as a WATCH-abort so
+                                       the caller's retry loop runs
+                                       on the fresh primary. *)
+                                    close_connection conn;
+                                    Ok None
+                                | All_queued ->
                                     (match
                                        Connection.request
                                          ?timeout:(remaining_window ~deadline)
                                          conn [| "EXEC" |]
                                      with
+                                     | Error
+                                         (Connection.Error.Server_error
+                                            { code = "MOVED" | "ASK"; _ }) ->
+                                         close_connection conn;
+                                         Ok None
                                      | Error e -> fail e
                                      | Ok v ->
                                          (match
@@ -441,13 +478,21 @@ let run_with_guard ?timeout t g =
                 | Error e -> fail e
                 | Ok () ->
                     (match queue_all ~deadline conn queued with
-                     | Error e -> fail e
-                     | Ok () ->
+                     | Transport_error e -> fail e
+                     | Topology_changed ->
+                         close_connection conn;
+                         Ok None
+                     | All_queued ->
                          (match
                             Connection.request
                               ?timeout:(remaining_window ~deadline)
                               conn [| "EXEC" |]
                           with
+                          | Error
+                              (Connection.Error.Server_error
+                                 { code = "MOVED" | "ASK"; _ }) ->
+                              close_connection conn;
+                              Ok None
                           | Error e -> fail e
                           | Ok v ->
                               (match decode_exec_reply ~expected_n v with

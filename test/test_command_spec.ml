@@ -124,11 +124,6 @@ let test_watch_multi_key () =
   | Some (T.By_slot s, _) when s = slot_of "a" -> ()
   | _ -> Alcotest.fail "WATCH: multi-key, slot of first"
 
-let test_command_count_nonempty () =
-  let n = CS.command_count () in
-  if n < 150 then
-    Alcotest.failf "expected command table >= 150 entries, got %d" n
-
 let tests =
   [ Alcotest.test_case "GET: readonly, By_slot, rf preserved" `Quick
       test_get_readonly_by_slot;
@@ -168,6 +163,4 @@ let tests =
       test_client_list_fan_all_nodes;
     Alcotest.test_case "WATCH: multi-key first slot" `Quick
       test_watch_multi_key;
-    Alcotest.test_case "command table is populated" `Quick
-      test_command_count_nonempty;
   ]

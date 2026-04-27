@@ -56,6 +56,26 @@ What's in 0.2.0, from [CHANGELOG.md](CHANGELOG.md):
   [docs/observability.md](docs/observability.md).
 - **Dependency**: `opentelemetry >= 0.90`.
 
+### `Batch.run_atomic` / `run_with_guard` — MOVED/ASK on EXEC = WATCH abort
+
+Discovered while writing the WATCH+topology-change integration
+test (formerly deferred): a slot move between WATCH and EXEC was
+leaking as `Error (Server_error EXECABORT)` to the caller, who
+couldn't distinguish "topology moved, please retry" from "you
+sent a malformed transaction." Fixed:
+
+- `queue_all` now classifies its outcome (`All_queued |
+  Topology_changed | Transport_error`); a MOVED/ASK during the
+  fill-in-MULTI phase short-circuits with `Topology_changed`.
+- Both `run_atomic` and `run_with_guard` map `Topology_changed`
+  (and a MOVED/ASK on the EXEC frame itself) to `Ok None`,
+  mirroring the WATCH-abort path. The connection is dropped so
+  the supervisor reconnects against the fresh topology.
+
+Caller's contract for `Ok None` is unchanged: "retry the
+read-modify-write loop." Bad-arity / WRONGTYPE EXECABORTs still
+flow through the existing per-command-result array path.
+
 ### Phase 8 Branch B — Client-side caching (commits `a28f8a3..595b84a`)
 
 Full server-invalidated client-side caching, standalone and cluster, with
@@ -119,7 +139,7 @@ full step-by-step.
 
 Two targets, both green at the current commit:
 
-### Pure-unit — `dune build @runtest` — **148 tests**
+### Pure-unit — `dune build @runtest` — **146 tests**
 
 Opam-CI clean. No server dependency. Runs in ~5s.
 
@@ -230,10 +250,7 @@ These are documented here rather than as stub code or dead TODOs:
    are discarded. That matches the expected `Client.mget` contract
    (all-or-nothing). If someone wants partial-result semantics we'd
    need a new API.
-6. **Slot-migration-under-load stress test.** Would orchestrate a live
-   `CLUSTER SETSLOT` loop while cached reads run. Deferred until an
-   incident report asks for it.
-7. **OOM stress harness.** Deliberately long-running, not worth the
+6. **OOM stress harness.** Deliberately long-running, not worth the
    CI budget until we have a user report.
 
 ---
