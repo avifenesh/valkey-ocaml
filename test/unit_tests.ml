@@ -18,4 +18,5 @@ let () =
       "invalidation parser", Test_invalidation.tests;
       "inflight", Test_inflight.tests;
       "csc optin (pure)", Test_csc_optin_unit.tests;
+      "observability (pure)", Test_observability.tests;
     ]

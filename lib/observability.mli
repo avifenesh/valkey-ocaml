@@ -38,3 +38,32 @@ val record_discovery_outcome :
   Opentelemetry.Span.t ->
   [< `Agreed | `Agreed_fallback | `No_agreement ] ->
   unit
+
+(** Register a meter callback that exposes the CSC cache counters
+    as OpenTelemetry cumulative monotonic sums.
+
+    [metrics_fn] is a 0-argument closure that reads the current
+    counters; the typical caller passes [(fun () -> Client.cache_metrics c)].
+    Returning [None] (CSC not configured for that client) emits no
+    metrics for that tick.
+
+    Six metrics are emitted per tick, named [<name>.<counter>]:
+    {ul
+    {- [hits], [misses] — read accounting.}
+    {- [evicts.budget] — entries pushed out by byte-budget pressure.}
+    {- [evicts.ttl] — entries pushed out by TTL safety net.}
+    {- [invalidations] — entries removed by server-invalidation pushes.}
+    {- [puts] — total [Cache.put] calls (incl. oversize-rejects).}}
+
+    Default [name] is ["valkey.cache"]. With no exporter
+    configured the cost is the OTel registry's no-op path
+    (a list-of-callbacks walk on collect, each of which is a
+    cheap atomic read).
+
+    Idempotent at the OTel layer: each call adds another
+    callback. Don't call this twice for the same client unless
+    you want duplicate metrics. *)
+val observe_cache_metrics :
+  ?name:string ->
+  (unit -> Cache.metrics option) ->
+  unit

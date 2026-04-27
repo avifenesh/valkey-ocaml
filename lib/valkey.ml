@@ -24,3 +24,4 @@ module Cache = Cache
 module Client_cache = Client_cache
 module Invalidation = Invalidation
 module Inflight = Inflight
+module Observability = Observability

@@ -61,3 +61,31 @@ let record_discovery_outcome span outcome =
     | `No_agreement -> "no_agreement"
   in
   Otel.Span.add_attrs span [ "valkey.cluster.outcome", `String v ]
+
+(** Bridge [Cache.metrics] counters to OpenTelemetry as cumulative
+    monotonic sums. Each counter (hits, misses, evicts.budget,
+    evicts.ttl, invalidations, puts) becomes a metric named
+    [<prefix>.<counter>] (default prefix [valkey.cache]). The
+    callback runs at every meter collect; with no exporter
+    configured, the cost is the OTel registry's no-op path.
+    No-op when [metrics_fn] returns [None] (CSC not configured). *)
+let observe_cache_metrics ?(name = "valkey.cache")
+    (metrics_fn : unit -> Cache.metrics option) =
+  let start_ns = Otel.Clock.now_main () in
+  Otel.Meter.add_cb (fun ~clock:_ () ->
+      match metrics_fn () with
+      | None -> []
+      | Some (m : Cache.metrics) ->
+          let now = Otel.Clock.now_main () in
+          let mk suffix v =
+            Otel.Metrics.sum
+              ~name:(name ^ "." ^ suffix)
+              ~is_monotonic:true
+              [ Otel.Metrics.int ~start_time_unix_nano:start_ns ~now v ]
+          in
+          [ mk "hits" m.hits;
+            mk "misses" m.misses;
+            mk "evicts.budget" m.evicts_budget;
+            mk "evicts.ttl" m.evicts_ttl;
+            mk "invalidations" m.invalidations;
+            mk "puts" m.puts ])

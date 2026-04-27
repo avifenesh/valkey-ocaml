@@ -17,8 +17,9 @@
           test_cache
           test_invalidation
           test_inflight
-          test_csc_optin_unit)
- (libraries valkey alcotest eio_main))
+          test_csc_optin_unit
+          test_observability)
+ (libraries valkey alcotest eio_main opentelemetry))
 
 ; Integration tests — need a live Valkey / cluster. Built as a
 ; plain executable so [@runtest] does not invoke them in the opam
