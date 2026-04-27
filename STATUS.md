@@ -1,11 +1,12 @@
 # Project status and next steps
 
-**Snapshot taken:** 2026-04-26, branch `main` at commit `595b84a` (pushed to origin).
+**Snapshot taken:** 2026-04-27, branch `main` at commit `6cb6efe` (pushed to origin).
 
-This document is a handoff/continuation note written at the point where the
-dev environment is about to move from Windows+WSL to Ubuntu. It captures
-what's shipped, what's immediately runnable, the known-good test posture,
-and what's queued next so the next session starts without re-discovery.
+This document captures what's shipped on `main`, what's immediately
+runnable, the test posture, and what's queued next. Phase 8
+(client-side caching) is now fully shipped — Default, BCAST, and
+OPTIN modes work on standalone and cluster. No 0.3.0 release yet;
+all of §2 lives unreleased on `main`.
 
 Canonical references this complements — not replaces:
 - [README.md](README.md) — user-facing surface.
@@ -165,7 +166,7 @@ Requires `docker compose up -d` (standalone at `:6379`) and optionally
 `docker compose -f docker-compose.cluster.yml up -d` plus
 `bash scripts/cluster-hosts-setup.sh` (cluster at `:7000..:7005`).
 
-CSC-specific slice (32 tests, all green at the current commit):
+CSC-specific slice (35 tests, all green at the current commit):
 
 | File | Count | Scope |
 |------|------:|-------|
@@ -177,7 +178,7 @@ CSC-specific slice (32 tests, all green at the current commit):
 | `test_csc_lifecycle.ml` | 3 | Standalone reconnect flush; live `CLUSTER FAILOVER FORCE`; TTL expiry without invalidation |
 | `test_csc_bcast.ml` | 3 | `TRACKINGINFO` flags; in-prefix evict; out-of-prefix isolation |
 | `test_csc_optin.ml` | 6 | Populate-then-hit; external SET evicts; 50-fiber concurrent OPTIN tracking; CACHING-error path; read after `Client.close` returns transport error; tiny `max_queued_bytes` returns `Queue_full` |
-| `test_csc_optin_cluster.ml` | 2 | Two-shard populate + cross-shard evict; 25-fiber concurrent OPTIN across all 3 shards |
+| `test_csc_optin_cluster.ml` | 3 | Two-shard populate + cross-shard evict; 25-fiber concurrent OPTIN across all 3 shards; MOVED-retry against wrong-target routing |
 
 CSC tests run against live Valkey 9.0.3 standalone **and** a
 live 6-node cluster with real primary promotion. OPTIN cluster
@@ -301,7 +302,13 @@ implementing.
 - CSC all commands: `6b19f1a`.
 - CSC cluster + lifecycle: `3ae246d` and `664187e`.
 - CSC BCAST landed: `595b84a`.
-- CSC OPTIN landed: `80563ec` (B2.5 standalone) and (this commit) (B2.5 cluster).
+- CSC OPTIN standalone: `80563ec` (B2.5).
+- CSC OPTIN cluster: `d16e0dd` (Router.pair + redirect-aware retry).
+- Cluster-router topology-stale-on-MOVED + WATCH+EXEC fixes:
+  `a7e8912`, `9cc5c63`.
+- Simplify pass on Phase 8: `6cb6efe` (topology stale-ref bug,
+  drop dead `Read_from`, tighten OPTIN target fallback,
+  `client_caching_yes` constant, comment trim).
 
 Use `git log --grep='Phase 8'` or `git log --grep='csc:'` to walk the
 series.

@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Phase 8: client-side caching (CSC)
+
+Full server-invalidated client-side caching, on standalone **and**
+cluster, in all three tracking modes Valkey supports. Configured
+via the new `Client_cache.mode` variant — type-level mutual
+exclusion replaces the old `optin : bool + mode = Default | Bcast`
+shape so OPTIN/BCAST mismatches stop compiling.
+
+- **Bounded LRU cache primitive** (`Valkey.Cache`) — byte budget,
+  per-entry overhead accounting, optional TTL safety net,
+  atomic-counter metrics (`hits`, `misses`, `evicts_budget`,
+  `evicts_ttl`, `invalidations`, `puts`).
+- **`CLIENT TRACKING` handshake** on every (re)connect, fail-closed
+  if the server rejects the mode (no silent drop to unconfigured
+  cache).
+- **Invalidation parser + invalidator fiber** — RESP3
+  `>2 ["invalidate", [keys...]]` push frames are routed onto a
+  dedicated stream so the invalidator drains them without racing
+  pubsub consumers.
+- **Read-path coverage**: `Client.get`, `Client.mget` (scatter-
+  gather over hit/batch/joining groups), `Client.hgetall`,
+  `Client.smembers`. `Null` (missing-key) responses are
+  intentionally not cached.
+- **Single-flight + invalidation-race safety** — `Inflight`
+  table dedups concurrent fetches; an invalidation that arrives
+  during the fetch flips a dirty flag so the post-fetch put is
+  skipped.
+- **Cluster integration** — one shared `Cache.t` across every
+  shard connection; per-shard tracking happens automatically;
+  flush on every per-connection reconnect AND on topology refresh.
+- **`mode = Bcast { prefixes }`** — server-side prefix-broadcast
+  tracking. `TRACKINGINFO` flag visibility, in-prefix evict, and
+  out-of-prefix isolation all verified end-to-end.
+- **`mode = Optin`** — pipelined per-read tracking via the new
+  internal `Connection.request_pair` (two-frame indivisible
+  submit) and `Router.pair` dispatch closure. On cluster, MOVED
+  on the read frame triggers a redirect-aware retry that re-
+  submits the **whole** pair on the new owner so `CACHING YES`
+  stays adjacent to the read across the redirect. ASK on the
+  read frame is surfaced rather than retried — would need a
+  three-frame `ASKING + CACHING YES + read` primitive (tracked
+  as a follow-up). Empirically validated against Valkey 9.0.3:
+  the OPTIN flag is consumed by exactly the next single command
+  on the wire (so a pipelined `CACHING YES + GET k1 + GET k2`
+  tracks `k1` only); a write before the read consumes the flag
+  too; MULTI/EXEC counts as one logical command for CACHING
+  purposes.
+
+### Fixed — cluster routing under topology change
+
+- **`Batch.run_atomic` / `run_with_guard` no longer leak
+  EXECABORT or MOVED on slot-move.** A slot ownership change
+  between WATCH/MULTI and EXEC was surfacing to callers as
+  `Server_error EXECABORT` (or `MOVED` directly on the EXEC
+  frame). Both paths now map to `Ok None` — the same WATCH-abort
+  outcome the caller's retry loop already handles. Only
+  topology-induced redirects map this way; bad-arity / WRONGTYPE
+  EXECABORTs still flow through the per-command-result array
+  unchanged.
+- **`Cluster_router` MOVED triggers topology refresh + eager
+  cache clear when the cached slot owner disagrees.** Previously
+  `handle_retries` only fired `trigger_refresh` on unknown
+  redirect targets; a MOVED to a known node (the common case
+  during failover) silently retried with no refresh, leaving the
+  CSC cache stale until the next periodic refresh (15 s). Now
+  refreshes whenever the cached topology disagrees with the
+  redirect's destination, and `trigger_refresh` synchronously
+  clears the CSC cache (closes the window between MOVED and
+  async refresh-completion).
+- **Pool-race fix on MOVED.** When the redirect target is in the
+  topology but not yet in `Node_pool` (race between refresh
+  completing and pool-diff applying), `handle_retries` previously
+  short-circuited and returned the original error without
+  triggering refresh. Now triggers refresh so the next attempt
+  finds the connection.
+- **Topology stale-ref bug in retry loops.** `topology_ref` was
+  only re-synced from `topology_atomic` at the outer call
+  boundary; CLUSTERDOWN/TRYAGAIN backoffs (100–1600 ms) could
+  let the refresh fiber commit a fresh topology while the retry
+  loop kept dispatching against the stale value. Both
+  `handle_retries` and `make_pair` now accept an optional
+  `?sync_ref` callback that runs before each (re-)dispatch.
+
 ### Added — OpenTelemetry tracing
 
 - Library emits OpenTelemetry spans for the bounded operations

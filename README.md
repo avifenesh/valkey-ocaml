@@ -5,8 +5,10 @@ A modern Valkey client for OCaml 5 + [Eio](https://github.com/ocaml-multicore/ei
 **Status: alpha.** v0.2.0 is live on opam (0.1.0 was superseded
 after `@runtest` hit a server that doesn't exist in the opam
 sandbox). Full core + cluster + batch (incl. WATCH guards +
-cross-slot `pfcount_cluster`) + fuzz + CI + docs. Phases 0–7
-closed; Phase 8 (client-side caching) next.
+cross-slot `pfcount_cluster`) + client-side caching (Default /
+BCAST / OPTIN, standalone and cluster) + fuzz + CI + docs.
+Phases 0–8 closed on `main`; Phase 9 (connection pool) next.
+No 0.3.0 release yet — accumulated improvements live on `main`.
 
 ## Why
 
@@ -33,6 +35,9 @@ No Lwt compat layer. No legacy Redis support.
   - [docs/batch.md](docs/batch.md) — scatter-gather and atomic
     batches, `mget_cluster` / `mset_cluster` / etc., timeout
     semantics.
+  - [docs/client-side-caching.md](docs/client-side-caching.md) —
+    `CLIENT TRACKING` modes (Default / BCAST / OPTIN), wire shape,
+    invalidation pipeline, cluster behaviour.
   - [docs/transactions.md](docs/transactions.md) — MULTI/EXEC,
     WATCH, when *not* to use transactions.
   - [docs/pubsub.md](docs/pubsub.md) — regular + sharded pub/sub,
@@ -165,6 +170,49 @@ See [docs/batch.md](docs/batch.md).
 - `exec` returns `(Resp3.t list option, Error.t) result` —
   `Ok None` on WATCH abort; a fresh retry loop is the expected
   response.
+
+### Client-side caching
+
+Server-invalidated CSC, on standalone **and** cluster, in all
+three tracking modes Valkey supports. Configure via a
+`Client_cache.t` on the connection config:
+
+```ocaml
+let cache = Valkey.Cache.create ~byte_budget:(64 * 1024 * 1024) in
+let ccfg = Valkey.Client_cache.make ~cache ~mode:Default () in
+let cfg =
+  { Valkey.Client.Config.default with
+    connection =
+      { Valkey.Client.Config.default.connection with
+        client_cache = Some ccfg } }
+in
+let client = Valkey.Client.connect ~sw ~net ~clock ~config:cfg ~host ~port () in
+match Valkey.Client.get client "user:42" with ...
+```
+
+- **`mode = Default`** (recommended) — server-side per-connection
+  tracking table; `Client.get` / `mget` / `hgetall` / `smembers`
+  populate the cache on miss, return from cache on hit, evict
+  on the server's invalidation push.
+- **`mode = Bcast { prefixes }`** — prefix-broadcast tracking.
+  Smaller server-side state at the cost of broader invalidation
+  fan-in.
+- **`mode = Optin`** — pipelined per-read tracking
+  (`CLIENT CACHING YES` + read as one wire-atomic submit). Even
+  smaller server-side table; one extra wire frame per cached
+  read. On cluster, the pair retries the whole submit on the
+  new owner across MOVED.
+
+Invalidations land on a dedicated RESP3 push stream; an
+invalidator fiber drains them per-connection. Single-flight
+dedups concurrent fetches; an in-flight invalidation flips a
+dirty flag so the post-fetch put is skipped. Cache flushes on
+every per-connection reconnect AND on topology refresh
+(coarse but correct, matches redis-py).
+
+See [docs/client-side-caching.md](docs/client-side-caching.md)
+for the wire-level shape, edge-case behaviour, and the empirical
+findings against Valkey 9 that the implementation is grounded in.
 
 ### Pub/sub
 
@@ -479,7 +527,8 @@ state:
 - ✅ Phase 6 — publishing (v0.2.0 live on opam)
 - ✅ Phase 7 — Batch primitive (atomic + scatter-gather + WATCH
   guards + cross-slot `pfcount_cluster`) + cluster typed helpers
-- ⏳ Phase 8 — client-side caching (`CLIENT TRACKING` + LRU)
+- ✅ Phase 8 — client-side caching (`CLIENT TRACKING` + LRU,
+  Default / BCAST / OPTIN, standalone + cluster, server-invalidated)
 - ⏳ Phase 9 — connection pool + blocking pool
 - ⏳ Phase 10 — IAM + mTLS + secret-hygiene audit
 - ⏳ Phase 11 — module support (valkey-json / -search / -bloom)
