@@ -242,11 +242,14 @@ module Config = struct
 end
 
 type socket = {
-  write : Cstruct.t -> unit;
-  (* One allocation + blit per command; [Eio.Flow.write] uses
-     scatter-gather when the transport supports it. Replaces the
-     previous [string -> unit] which forced a Buffer.contents copy
-     of the whole command. *)
+  write : Cstruct.t list -> unit;
+  (* List shape so a multi-frame submit (e.g. OPTIN's
+     [CLIENT CACHING YES + read]) goes through [Eio.Flow.write]'s
+     scatter-gather path without a per-pair [Cstruct.append]
+     allocation + memcpy. The underlying flow either writes
+     everything or raises — no partial-write exposure to the
+     caller. Replaced the previous [string -> unit] which forced
+     a [Buffer.contents] copy. *)
   reader : Eio.Buf_read.t;              (* only used during handshake *)
   read_into : Cstruct.t -> int;         (* used by in_pump post-handshake *)
   close : unit -> unit;
@@ -266,11 +269,13 @@ type queued = {
      and drain time.
      A non-empty list of length > 1 represents a pipelined
      atomic submit (e.g. [CLIENT CACHING YES] + read for OPTIN
-     CSC). The wire is the concatenation of the per-entry
-     frames in order; entries are pushed to [sent] under a
-     single mutex acquire so the matching FIFO stays
-     adjacent. *)
-  wire : Cstruct.t;
+     CSC). [wires] holds the per-frame [Cstruct.t]s in submit
+     order; the writer flushes the whole list through
+     [Eio.Flow.write]'s scatter-gather path so the frames are
+     wire-adjacent without an intermediate [Cstruct.append].
+     Entries are pushed to [sent] under a single mutex acquire
+     so the matching FIFO stays adjacent. *)
+  wires : Cstruct.t list;
 }
 
 type state =
@@ -351,7 +356,7 @@ let extract_string_field key = function
   | _ -> None
 
 let run_hello (sock : socket) (hs : Handshake.t) : (Resp3.t, Error.t) result =
-  sock.write (Resp3_writer.command_to_cstruct (hello_args hs));
+  sock.write [ Resp3_writer.command_to_cstruct (hello_args hs) ];
   match Resp3_parser.read (Resp3_parser.of_buf_read sock.reader) with
   | Map _ as m -> Ok m
   | Simple_error s | Bulk_error s ->
@@ -365,7 +370,7 @@ let run_hello (sock : socket) (hs : Handshake.t) : (Resp3.t, Error.t) result =
 
 let run_select (sock : socket) db : (unit, Error.t) result =
   sock.write
-    (Resp3_writer.command_to_cstruct [| "SELECT"; string_of_int db |]);
+    [ Resp3_writer.command_to_cstruct [| "SELECT"; string_of_int db |] ];
   match Resp3_parser.read (Resp3_parser.of_buf_read sock.reader) with
   | Simple_string "OK" -> Ok ()
   | Simple_error s | Bulk_error s ->
@@ -402,7 +407,7 @@ let client_tracking_args (cfg : Client_cache.t) : string array =
    an unconfigured cache. *)
 let run_client_tracking (sock : socket) (cfg : Client_cache.t) :
     (unit, Error.t) result =
-  sock.write (Resp3_writer.command_to_cstruct (client_tracking_args cfg));
+  sock.write [ Resp3_writer.command_to_cstruct (client_tracking_args cfg) ];
   match Resp3_parser.read (Resp3_parser.of_buf_read sock.reader) with
   | Simple_string "OK" -> Ok ()
   | Simple_error s | Bulk_error s ->
@@ -486,7 +491,7 @@ let make_tcp_connector ~sw ~net ~host ~port ~tls =
                let reader =
                  Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) tcp
                in
-               let write cs = Eio.Flow.write tcp [ cs ] in
+               let write = Eio.Flow.write tcp in
                let read_into buf = Eio.Flow.single_read tcp buf in
                let close () = try Eio.Resource.close tcp
                with Eio.Io _ | End_of_file | Invalid_argument _
@@ -503,7 +508,7 @@ let make_tcp_connector ~sw ~net ~host ~port ~tls =
                     let reader =
                       Eio.Buf_read.of_flow ~max_size:(16 * 1024 * 1024) flow
                     in
-                    let write cs = Eio.Flow.write flow [ cs ] in
+                    let write = Eio.Flow.write flow in
                     let read_into buf = Eio.Flow.single_read flow buf in
                     let close () =
                       try Eio.Resource.close flow
@@ -578,7 +583,7 @@ let out_pump (t : t) (sock : socket) : unit =
              with Chan.Closed -> raise Exit)
       in
       let write_result =
-        try Ok (sock.write q.wire)
+        try Ok (sock.write q.wires)
         with exn -> Error exn
       in
       match write_result with
@@ -791,7 +796,7 @@ let request ?timeout t args =
           Byte_sem.acquire t.budget size;
           let promise, resolver = Eio.Promise.create () in
           let entry = { resolver; size; abandoned = false } in
-          match try_enqueue t { entries = [ entry ]; wire } with
+          match try_enqueue t { entries = [ entry ]; wires = [ wire ] } with
           | `Dead e ->
               Byte_sem.release t.budget size;
               Error e
@@ -831,7 +836,7 @@ let send_fire_and_forget t args =
     | `Reject -> Error Error.Circuit_open
     | `Allow | `Allow_probe ->
         Byte_sem.acquire t.budget size;
-        match try_enqueue t { entries = []; wire } with
+        match try_enqueue t { entries = []; wires = [ wire ] } with
         | `Dead e ->
             Byte_sem.release t.budget size;
             Error e
@@ -890,8 +895,9 @@ let request_pair ?timeout t args1 args2 =
           let p2, r2 = Eio.Promise.create () in
           let e1 = { resolver = r1; size = size1; abandoned = false } in
           let e2 = { resolver = r2; size = size2; abandoned = false } in
-          let wire = Cstruct.append wire1 wire2 in
-          match try_enqueue t { entries = [ e1; e2 ]; wire } with
+          match try_enqueue t
+                  { entries = [ e1; e2 ]; wires = [ wire1; wire2 ] }
+          with
           | `Dead e ->
               Byte_sem.release t.budget total;
               Error e
