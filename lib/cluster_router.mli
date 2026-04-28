@@ -6,6 +6,25 @@
     land in follow-up commits. *)
 
 module Config : sig
+  type topology_hooks = {
+    on_node_removed : node_id:string -> unit;
+    on_node_refreshed : node_id:string -> unit;
+  }
+  (** Callbacks fired from the topology refresh path when a node
+      disappears ([on_node_removed]) or keeps its id but changes
+      endpoint / role ([on_node_refreshed]). Default hooks are
+      no-ops; [Client] threads these through to
+      [Blocking_pool.drain_node] / [Blocking_pool.refresh_node]
+      when a pool is configured, so pool buckets for removed
+      nodes close their idle conns and mark in-flight leases
+      dirty. Invoked AFTER the [Node_pool] bundle has been
+      removed, so the Router's own topology view is consistent
+      when the hook runs. *)
+
+  val ignore_hooks : topology_hooks
+  (** No-op pair. Use as the default when no blocking pool is
+      wired. *)
+
   type t = {
     seeds : (string * int) list;
     connection : Connection.Config.t;
@@ -20,6 +39,8 @@ module Config : sig
     (** Multiplexed connections per cluster node. Default [1].
         See [Client.Config.connections_per_node] for the full
         rationale. Must be [>= 1]. *)
+    topology_hooks : topology_hooks;
+    (** Default: [ignore_hooks]. *)
   }
   val default : seeds:(string * int) list -> t
 end

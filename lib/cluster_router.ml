@@ -1,4 +1,21 @@
 module Config = struct
+  type topology_hooks = {
+    on_node_removed : node_id:string -> unit;
+    on_node_refreshed : node_id:string -> unit;
+  }
+  (** Callbacks fired from the topology refresh path when a
+      node disappears ([on_node_removed]) or keeps its id but
+      changes endpoint / role ([on_node_refreshed]).
+      Default hooks are no-ops; [Client] threads these through
+      to [Blocking_pool.drain_node] / [refresh_node] when a
+      pool is configured, so pool buckets for removed nodes
+      close their idle conns and mark in-flight leases dirty. *)
+
+  let ignore_hooks = {
+    on_node_removed = (fun ~node_id:_ -> ());
+    on_node_refreshed = (fun ~node_id:_ -> ());
+  }
+
   type t = {
     seeds : (string * int) list;
     connection : Connection.Config.t;
@@ -9,6 +26,7 @@ module Config = struct
     refresh_interval : float;
     refresh_jitter : float;
     connections_per_node : int;
+    topology_hooks : topology_hooks;
   }
 
   let default ~seeds = {
@@ -21,6 +39,7 @@ module Config = struct
     refresh_interval = 15.0;
     refresh_jitter = 15.0;
     connections_per_node = 1;
+    topology_hooks = ignore_hooks;
   }
 end
 
@@ -645,25 +664,33 @@ let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
 (* ---------- refresh fiber ---------- *)
 
 let diff_pool ~sw ~net ~clock ?domain_mgr ~connection_config
-    ~connections_per_node ~prefer_hostname ~pool ~new_topology () =
+    ~connections_per_node ~prefer_hostname ~topology_hooks
+    ~pool ~new_topology () =
   let new_nodes = Topology.all_nodes new_topology in
   let new_ids =
     List.map (fun (n : Topology.Node.t) -> n.id) new_nodes
   in
   let old_ids = Node_pool.node_ids pool in
-  (* Close removed *)
+  (* Close removed, then fire [on_node_removed] so the
+     Blocking_pool (if any) drops idle conns and marks
+     in-flight leases dirty. Callback fires AFTER the bundle
+     is gone so the pool's view of the Router-visible
+     topology is consistent when it drains. *)
   List.iter
     (fun id ->
-      if not (List.mem id new_ids) then
-        match Node_pool.remove_bundle pool ~node_id:id with
-        | Some arr ->
-            Array.iter
-              (fun c ->
-                try Connection.close c
-                with Eio.Io _ | End_of_file | Invalid_argument _
-                   | Unix.Unix_error _ -> ())
-              arr
-        | None -> ())
+      if not (List.mem id new_ids) then begin
+        (match Node_pool.remove_bundle pool ~node_id:id with
+         | Some arr ->
+             Array.iter
+               (fun c ->
+                 try Connection.close c
+                 with Eio.Io _ | End_of_file | Invalid_argument _
+                    | Unix.Unix_error _ -> ())
+               arr
+         | None -> ());
+        (try topology_hooks.Config.on_node_removed ~node_id:id
+         with _ -> ())
+      end)
     old_ids;
   (* Add new (online nodes only) *)
   let tls_enabled = connection_config.Connection.Config.tls <> None in
@@ -706,6 +733,7 @@ let apply_new_topology ~sw ~net ~clock ?domain_mgr ~cfg ~pool
       ~connection_config:cfg.Config.connection
       ~connections_per_node:cfg.Config.connections_per_node
       ~prefer_hostname:cfg.Config.prefer_hostname
+      ~topology_hooks:cfg.Config.topology_hooks
       ~pool ~new_topology:new_topo ();
     Atomic.set topology_atomic new_topo;
     (* Topology changed — slot ownership may have shifted, failover

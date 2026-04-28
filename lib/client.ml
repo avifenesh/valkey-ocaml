@@ -100,6 +100,26 @@ let build_blocking_pool ~sw ~net ~clock ?domain_mgr
          ~connection_config:config.connection
          ~endpoint_for_node ())
 
+(* Build topology hooks for [Cluster_router.Config] that close
+   over a [Blocking_pool.t option ref]. [Client] fills the ref
+   after pool construction; the hooks read it on every
+   topology-diff event. This resolves the chicken-and-egg
+   problem (Cluster_router.Config wants hooks before the
+   Client/pool exists). *)
+let topology_hooks_for_pool_ref
+    (pool_ref : Blocking_pool.t option ref) :
+    Cluster_router.Config.topology_hooks =
+  { on_node_removed =
+      (fun ~node_id ->
+        match !pool_ref with
+        | None -> ()
+        | Some pool -> Blocking_pool.drain_node pool ~node_id);
+    on_node_refreshed =
+      (fun ~node_id ->
+        match !pool_ref with
+        | None -> ()
+        | Some pool -> Blocking_pool.refresh_node pool ~node_id) }
+
 let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port () =
   (* Standalone is a degenerate one-shard cluster: synthesise a topology,
      stash a bundle of N Connections in the Node_pool, and dispatch
@@ -3084,4 +3104,5 @@ let memory_purge ?timeout t =
 
 module For_testing = struct
   let map_optin_pair_reply = map_optin_pair_reply
+  let blocking_pool t = t.blocking_pool
 end

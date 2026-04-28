@@ -91,6 +91,38 @@ val connect :
   unit ->
   t
 
+val topology_hooks_for_pool_ref :
+  Blocking_pool.t option ref -> Cluster_router.Config.topology_hooks
+(** Build a [Cluster_router.Config.topology_hooks] that closes
+    over [pool_ref] and calls [Blocking_pool.drain_node] /
+    [Blocking_pool.refresh_node] when a pool is present.
+
+    Resolves the chicken-and-egg problem for cluster-mode
+    users of {!from_router}: they must supply a
+    [Cluster_router.Config] before the [Blocking_pool.t]
+    exists. Pattern:
+
+    {[
+      let pool_ref = ref None in
+      let cfg = {
+        (Cluster_router.Config.default ~seeds) with
+        topology_hooks = Client.topology_hooks_for_pool_ref pool_ref;
+        connection = conn_cfg;
+      } in
+      match Cluster_router.create ~sw ~net ~clock ~config:cfg () with
+      | Error e -> ...
+      | Ok router ->
+          let client =
+            Client.from_router ~sw ~net ~clock ~config:client_cfg router
+          in
+          pool_ref := Client.For_testing.blocking_pool client;
+          client
+    ]}
+
+    [from_router] does NOT fill the ref for you — you do it
+    after the call to wire the pool into the already-running
+    refresh loop's hook callbacks. *)
+
 val from_router :
   ?sw:Eio.Switch.t ->
   ?net:[> [> `Generic | `Unix ] Eio.Net.ty ] Eio.Resource.t ->
@@ -1686,4 +1718,11 @@ module For_testing : sig
       [Protocol_violation] case (server replies non-OK to
       [CLIENT CACHING YES]) and the frame-1 transport-error case
       — is covered by pure unit tests. *)
+
+  val blocking_pool : t -> Blocking_pool.t option
+  (** Returns the client's blocking pool if one was constructed
+      at [connect] / [from_router] time, or [None] if the
+      feature is disabled. Used by integration tests to drive
+      [Blocking_pool.drain_node] directly and assert the
+      resulting [Node_gone] path. *)
 end
