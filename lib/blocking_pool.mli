@@ -131,8 +131,9 @@ val create :
   unit ->
   t
 (** [connection_config] is used for fresh-conn handshakes.
-    The pool internally strips [client_cache] from it — pool
-    conns never track.
+    [connection_config.client_cache] must be [None] — pool
+    conns never enable CLIENT TRACKING. [create] raises
+    [Invalid_argument] otherwise.
 
     [endpoint_for_node] is supplied by the Router. It returns
     the current [(host, port)] for [node_id], or [None] if

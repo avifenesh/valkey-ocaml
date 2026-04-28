@@ -93,11 +93,18 @@ let build_blocking_pool ~sw ~net ~clock ?domain_mgr
     let endpoint_for_node ~node_id =
       Router.endpoint_for_node router ~node_id
     in
+    (* Pool conns never track. [Blocking_pool.create] enforces
+       the [client_cache = None] invariant; we strip here so
+       the user-supplied [config.connection] can still carry a
+       cache for the multiplexed side. *)
+    let pool_conn_cfg =
+      { config.connection with client_cache = None }
+    in
     Some
       (Blocking_pool.create
          ~sw ~net ~clock ?domain_mgr
          ~config:config.blocking_pool
-         ~connection_config:config.connection
+         ~connection_config:pool_conn_cfg
          ~endpoint_for_node ())
 
 (* Build topology hooks for [Cluster_router.Config] that close
@@ -2113,23 +2120,42 @@ let xinfo_consumers ?timeout ?read_from t key ~group =
    [WAIT] / [WAITAOF] do NOT route through the pool.
    See {!with_dedicated_conn} and {!wait_replicas_on}. *)
 
+type wait_kind =
+  | Wait
+  | Wait_fan
+  | Wait_min
+  | Wait_sum
+  | Waitaof
+
+let wait_kind_label = function
+  | Wait -> "WAIT"
+  | Wait_fan -> "WAIT (fan across primaries)"
+  | Wait_min -> "WAIT (min across primaries)"
+  | Wait_sum -> "WAIT (sum across primaries)"
+  | Waitaof -> "WAITAOF"
+
 type blocking_error =
   | Pool of Blocking_pool.borrow_error
   | Exec of Connection.Error.t
+  | No_primary_for_slot of int
   | Cross_slot of { command : string; slots : int list }
-  | Wait_needs_dedicated_conn of string
+  | Wait_needs_dedicated_conn of wait_kind
 
 let pp_blocking_error fmt = function
   | Pool e -> Blocking_pool.pp_borrow_error fmt e
   | Exec e ->
       Format.fprintf fmt "Blocking command: %a" Connection.Error.pp e
+  | No_primary_for_slot slot ->
+      Format.fprintf fmt
+        "No primary for slot %d in the current cluster topology"
+        slot
   | Cross_slot { command; slots } ->
       Format.fprintf fmt
         "Blocking command %s: keys span slots [%s] \
          (cluster requires single slot for multi-key blocking ops)"
         command
         (String.concat "; " (List.map string_of_int slots))
-  | Wait_needs_dedicated_conn cmd ->
+  | Wait_needs_dedicated_conn kind ->
       Format.fprintf fmt
         "%s requires a dedicated connection: use \
          [Client.with_dedicated_conn] and [wait_replicas_on] / \
@@ -2137,7 +2163,7 @@ let pp_blocking_error fmt = function
          a multiplexed client has either head-of-line blocking \
          (on the shared conn) or meaningless results (on a \
          leased pool conn that never issued the preceding write)."
-        cmd
+        (wait_kind_label kind)
 
 (* Enforce that every key in [keys] hashes to the same slot.
    Returns the shared slot on success, or a [Cross_slot] error
@@ -2168,28 +2194,27 @@ let single_slot_of_keys ~cmd ~(t : t) keys :
                (Cross_slot
                   { command = cmd; slots = s1 :: List.rev bad }))
 
-(* Dispatch a blocking command through the pool. Resolves [slot]'s
-   primary, leases a conn for that node, runs [args] on it. *)
-let run_blocking ?(timeout : float option) t ~slot args :
-    (Resp3.t, blocking_error) result =
-  let _ = timeout in
+(* Lease a pool conn for [node_id], run [f] on it, map the
+   result to [blocking_error]. Shared by [run_blocking] and
+   [with_dedicated_conn]. *)
+let with_pool_conn t ~node_id f : ('a, blocking_error) result =
   match t.blocking_pool with
   | None -> Error (Pool Blocking_pool.Pool_not_configured)
   | Some pool ->
-      (match Router.endpoint_for_slot t.router slot with
-       | None ->
-           Error
-             (Exec
-                (Connection.Error.Terminal
-                   (Printf.sprintf "no primary for slot %d" slot)))
-       | Some (node_id, _host, _port) ->
-           (match
-              Blocking_pool.with_borrowed pool ~node_id (fun conn ->
-                  Connection.request conn args)
-            with
-            | Ok v -> Ok v
-            | Error (`Borrow e) -> Error (Pool e)
-            | Error (`Exec e) -> Error (Exec e)))
+      (match Blocking_pool.with_borrowed pool ~node_id f with
+       | Ok v -> Ok v
+       | Error (`Borrow e) -> Error (Pool e)
+       | Error (`Exec e) -> Error (Exec e))
+
+(* Dispatch a blocking command through the pool. Resolves
+   [slot]'s primary via the router, then leases a conn for
+   that node and runs [args] on it. *)
+let run_blocking t ~slot args : (Resp3.t, blocking_error) result =
+  match Router.endpoint_for_slot t.router slot with
+  | None -> Error (No_primary_for_slot slot)
+  | Some (node_id, _host, _port) ->
+      with_pool_conn t ~node_id (fun conn ->
+          Connection.request conn args)
 
 type list_side = Left | Right
 let string_of_side = function Left -> "LEFT" | Right -> "RIGHT"
@@ -2213,76 +2238,68 @@ let parse_blpop_reply cmd = function
        | Error e, _ | _, Error e -> Error e)
   | v -> Error (protocol_violation cmd v)
 
-let blpop_like cmd ?timeout t ~keys ~block_seconds =
+(* Shared scaffold for every retargeted blocking wrapper:
+   validate single-slot, dispatch through the pool, pipe the
+   reply through a per-command parser, translate
+   [Connection.Error.t] from the parser into [Exec]. *)
+let blocking_call ~cmd ~t ~keys ~build_args ~parse :
+    ('a, blocking_error) result =
   match single_slot_of_keys ~cmd ~t keys with
   | Error e -> Error e
   | Ok slot ->
-      let args =
-        Array.of_list
-          (cmd :: keys @ [ Printf.sprintf "%g" block_seconds ])
-      in
-      (match run_blocking ?timeout t ~slot args with
-       | Error e -> Error e
+      (match run_blocking t ~slot (build_args ()) with
+       | Error _ as e -> e
        | Ok v ->
-           (match parse_blpop_reply cmd v with
+           (match parse v with
             | Ok r -> Ok r
             | Error e -> Error (Exec e)))
 
-let blpop ?timeout t ~keys ~block_seconds =
-  blpop_like "BLPOP" ?timeout t ~keys ~block_seconds
+let parse_blmove_reply = function
+  | Resp3.Null -> Ok None
+  | Resp3.Bulk_string s -> Ok (Some s)
+  | v -> Error (protocol_violation "BLMOVE" v)
 
-let brpop ?timeout t ~keys ~block_seconds =
-  blpop_like "BRPOP" ?timeout t ~keys ~block_seconds
+let blpop_like cmd t ~keys ~block_seconds =
+  blocking_call ~cmd ~t ~keys
+    ~build_args:(fun () ->
+      Array.of_list
+        (cmd :: keys @ [ Printf.sprintf "%g" block_seconds ]))
+    ~parse:(parse_blpop_reply cmd)
 
-let blmove ?timeout t ~source ~destination ~from ~to_ ~block_seconds =
-  match single_slot_of_keys ~cmd:"BLMOVE" ~t [ source; destination ] with
-  | Error e -> Error e
-  | Ok slot ->
-      let args =
-        [| "BLMOVE"; source; destination;
-           string_of_side from; string_of_side to_;
-           Printf.sprintf "%g" block_seconds |]
-      in
-      (match run_blocking ?timeout t ~slot args with
-       | Error _ as e -> e
-       | Ok Resp3.Null -> Ok None
-       | Ok (Resp3.Bulk_string s) -> Ok (Some s)
-       | Ok v -> Error (Exec (protocol_violation "BLMOVE" v)))
+let blpop t ~keys ~block_seconds =
+  blpop_like "BLPOP" t ~keys ~block_seconds
 
-(* WAIT semantics diverge between standalone and cluster:
+let brpop t ~keys ~block_seconds =
+  blpop_like "BRPOP" t ~keys ~block_seconds
 
-   - Standalone: a single primary acks; [wait_replicas] returns the
-     count of its replicas that replied.
-   - Cluster: each primary has its own replicas. A WAIT on one
-     connection only says something about one shard's durability.
+let blmove t ~source ~destination ~from ~to_ ~block_seconds =
+  blocking_call ~cmd:"BLMOVE" ~t ~keys:[ source; destination ]
+    ~build_args:(fun () ->
+      [| "BLMOVE"; source; destination;
+         string_of_side from; string_of_side to_;
+         Printf.sprintf "%g" block_seconds |])
+    ~parse:parse_blmove_reply
 
-   We expose the full per-primary view ([wait_replicas_all]) and
-   two standard aggregations ([wait_replicas_min],
-   [wait_replicas_sum]) so the API makes the choice explicit
-   instead of hiding a policy inside one function.
+(* WAIT / WAITAOF require a dedicated connection; see
+   {!with_dedicated_conn} and {!wait_replicas_on} /
+   {!wait_aof_on}. Running WAIT on a multiplexed client has
+   either head-of-line blocking (on the shared conn) or
+   meaningless results (on a leased pool conn that never
+   issued the preceding write). *)
+let wait_replicas _t ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn Wait)
 
-   "Wait for the first primary to reach [num_replicas] and cancel
-   the rest" is a separate shape — it needs fiber cancellation in
-   exec_multi. Deferred. *)
+let wait_replicas_all _t ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn Wait_fan)
 
-(* All WAIT variants require a dedicated connection; see
-   [with_dedicated_conn] and [wait_replicas_on] / [wait_aof_on].
-   WAIT measures acks against writes sent on the current
-   connection — running it on a multiplexed client has either
-   head-of-line blocking (on the shared conn) or meaningless
-   results (on a freshly-leased pool conn that never issued
-   the preceding write). *)
-let wait_replicas ?timeout:_ _t ~num_replicas:_ ~block_ms:_ =
-  Error (Wait_needs_dedicated_conn "WAIT")
+let wait_replicas_min _t ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn Wait_min)
 
-let wait_replicas_all ?timeout:_ _t ~num_replicas:_ ~block_ms:_ =
-  Error (Wait_needs_dedicated_conn "WAIT (fan across primaries)")
+let wait_replicas_sum _t ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn Wait_sum)
 
-let wait_replicas_min ?timeout:_ _t ~num_replicas:_ ~block_ms:_ =
-  Error (Wait_needs_dedicated_conn "WAIT (min across primaries)")
-
-let wait_replicas_sum ?timeout:_ _t ~num_replicas:_ ~block_ms:_ =
-  Error (Wait_needs_dedicated_conn "WAIT (sum across primaries)")
+let wait_aof _t ~num_local:_ ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn Waitaof)
 
 (* ---------- pub/sub produce side ---------- *)
 
@@ -2303,57 +2320,39 @@ let spublish ?timeout t ~channel ~message =
   | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
   | Ok v -> Error (protocol_violation "SPUBLISH" v)
 
-let xread_block ?timeout ?read_from:_ ?count t ~block_ms ~streams =
+let xread_block ?count t ~block_ms ~streams =
   let keys = List.map fst streams in
-  match single_slot_of_keys ~cmd:"XREAD BLOCK" ~t keys with
-  | Error e -> Error e
-  | Ok slot ->
+  let ids = List.map snd streams in
+  blocking_call ~cmd:"XREAD BLOCK" ~t ~keys
+    ~build_args:(fun () ->
       let count_a = match count with
         | None -> []
         | Some n -> [ "COUNT"; string_of_int n ]
       in
-      let ids = List.map snd streams in
-      let args =
-        Array.of_list (
-          [ "XREAD" ] @ count_a
-          @ [ "BLOCK"; string_of_int block_ms ]
-          @ [ "STREAMS" ] @ keys @ ids
-        )
-      in
-      (match run_blocking ?timeout t ~slot args with
-       | Error _ as e -> e
-       | Ok v ->
-           (match parse_streams_reply "XREAD BLOCK" v with
-            | Ok r -> Ok r
-            | Error e -> Error (Exec e)))
+      Array.of_list (
+        [ "XREAD" ] @ count_a
+        @ [ "BLOCK"; string_of_int block_ms ]
+        @ [ "STREAMS" ] @ keys @ ids))
+    ~parse:(parse_streams_reply "XREAD BLOCK")
 
-let xreadgroup_block ?timeout ?count ?(noack = false) t
+let xreadgroup_block ?count ?(noack = false) t
     ~block_ms ~group ~consumer ~streams =
   let keys = List.map fst streams in
-  match single_slot_of_keys ~cmd:"XREADGROUP BLOCK" ~t keys with
-  | Error e -> Error e
-  | Ok slot ->
+  let ids = List.map snd streams in
+  blocking_call ~cmd:"XREADGROUP BLOCK" ~t ~keys
+    ~build_args:(fun () ->
       let count_a = match count with
         | None -> []
         | Some n -> [ "COUNT"; string_of_int n ]
       in
       let noack_a = if noack then [ "NOACK" ] else [] in
-      let ids = List.map snd streams in
-      let args =
-        Array.of_list (
-          [ "XREADGROUP"; "GROUP"; group; consumer ]
-          @ count_a
-          @ [ "BLOCK"; string_of_int block_ms ]
-          @ noack_a
-          @ [ "STREAMS" ] @ keys @ ids
-        )
-      in
-      (match run_blocking ?timeout t ~slot args with
-       | Error _ as e -> e
-       | Ok v ->
-           (match parse_streams_reply "XREADGROUP BLOCK" v with
-            | Ok r -> Ok r
-            | Error e -> Error (Exec e)))
+      Array.of_list (
+        [ "XREADGROUP"; "GROUP"; group; consumer ]
+        @ count_a
+        @ [ "BLOCK"; string_of_int block_ms ]
+        @ noack_a
+        @ [ "STREAMS" ] @ keys @ ids))
+    ~parse:(parse_streams_reply "XREADGROUP BLOCK")
 
 (* ---------- dedicated-connection escape hatch ----------
 
@@ -2369,41 +2368,64 @@ let xreadgroup_block ?timeout ?count ?(noack = false) t
    write, which means the caller must own that connection for
    the duration of both. *)
 
-let with_dedicated_conn ?slot t f =
-  match t.blocking_pool with
-  | None -> Error (Pool Blocking_pool.Pool_not_configured)
-  | Some pool ->
-      let node_id =
-        match slot with
-        | Some s ->
-            (match Router.endpoint_for_slot t.router s with
-             | Some (id, _, _) -> Some id
-             | None -> None)
-        | None ->
-            (* No slot specified: pick a primary — slot 0's
-               owner in cluster, the synthetic standalone id
-               in standalone. *)
-            if Router.is_standalone t.router then
-              Some Topology.standalone_node_id
-            else
-              (match Router.endpoint_for_slot t.router 0 with
-               | Some (id, _, _) -> Some id
-               | None -> None)
-      in
-      (match node_id with
-       | None ->
+(* Resolve [?slot] to a node_id. On standalone the single
+   synthetic node; in cluster, the primary that owns [slot]
+   (or slot 0 when [?slot] is omitted). Returns None if the
+   router can't resolve a primary. *)
+let resolve_dedicated_node t ~slot =
+  if Router.is_standalone t.router then
+    Some Topology.standalone_node_id
+  else
+    let slot = Option.value slot ~default:0 in
+    match Router.endpoint_for_slot t.router slot with
+    | Some (id, _, _) -> Some id
+    | None -> None
+
+(* Reverse any sticky per-connection state the user callback
+   may have set (SELECT, CLIENT TRACKING, SUBSCRIBE, WATCH,
+   MULTI, AUTH, CLIENT NO-EVICT, CLIENT REPLY, ...) before
+   re-idling the conn. Valkey's RESET command (6.2+; we
+   target 7.2+) is documented to revert the connection to a
+   clean state atomically. If RESET itself fails we surface
+   the error — [with_borrowed]'s dirty-close-on-error logic
+   closes the conn rather than re-idling it, which is the
+   safe fallback.
+
+   The alternative — unconditionally closing the conn — costs
+   one handshake per [with_dedicated_conn] call. RESET is one
+   round-trip, and keeps the conn warm for the next lease. *)
+let reset_conn_on_return conn =
+  match Connection.request conn [| "RESET"; |] with
+  | Ok (Resp3.Simple_string _) -> Ok ()
+  | Ok _ | Error _ as e ->
+      (match e with
+       | Ok other ->
            Error
-             (Exec
-                (Connection.Error.Terminal
-                   "with_dedicated_conn: no primary available"))
-       | Some node_id ->
-           (match
-              Blocking_pool.with_borrowed pool ~node_id (fun conn ->
-                  f conn)
-            with
-            | Ok v -> Ok v
-            | Error (`Borrow e) -> Error (Pool e)
-            | Error (`Exec e) -> Error (Exec e)))
+             (Connection.Error.Protocol_violation
+                (Format.asprintf "RESET: unexpected reply %a"
+                   Resp3.pp other))
+       | Error e -> Error e)
+
+let with_dedicated_conn ?slot t f =
+  match resolve_dedicated_node t ~slot with
+  | None ->
+      (* Slot resolution failed. Report it as
+         No_primary_for_slot; the default slot when [?slot]
+         is omitted is 0, and "no primary for slot 0" is
+         functionally "cluster has no primaries right now". *)
+      Error (No_primary_for_slot (Option.value slot ~default:0))
+  | Some node_id ->
+      with_pool_conn t ~node_id (fun conn ->
+          match f conn with
+          | Error _ as e -> e
+          | Ok v ->
+              (* Clean return: issue RESET so the next
+                 borrower doesn't inherit sticky state.
+                 RESET failure → surface the error; the
+                 pool closes the conn rather than re-idling. *)
+              (match reset_conn_on_return conn with
+               | Ok () -> Ok v
+               | Error e -> Error e))
 
 (* WAIT / WAITAOF on an explicit Connection.t. Callers obtain
    the conn via [with_dedicated_conn]. Running WAIT on the
@@ -2421,6 +2443,8 @@ let wait_replicas_on conn ~num_replicas ~block_ms =
   | Ok v -> Error (protocol_violation "WAIT" v)
 
 let wait_aof_on conn ~num_local ~num_replicas ~block_ms =
+  (* WAITAOF reply is [numlocal, numreplicas] — a 2-element
+     integer array (verified against Valkey 9.0.3). *)
   match
     Connection.request conn
       [| "WAITAOF";
@@ -2429,11 +2453,6 @@ let wait_aof_on conn ~num_local ~num_replicas ~block_ms =
          string_of_int block_ms |]
   with
   | Error e -> Error e
-  | Ok (Resp3.Array [
-      Resp3.Integer local;
-      Resp3.Integer replicas_cnt;
-      Resp3.Integer _padded ]) ->
-      Ok (Int64.to_int local, Int64.to_int replicas_cnt)
   | Ok (Resp3.Array [
       Resp3.Integer local;
       Resp3.Integer replicas_cnt ]) ->

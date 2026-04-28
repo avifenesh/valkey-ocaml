@@ -665,12 +665,18 @@ let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
 
 let diff_pool ~sw ~net ~clock ?domain_mgr ~connection_config
     ~connections_per_node ~prefer_hostname ~topology_hooks
-    ~pool ~new_topology () =
+    ~pool ~old_topology ~new_topology () =
   let new_nodes = Topology.all_nodes new_topology in
   let new_ids =
     List.map (fun (n : Topology.Node.t) -> n.id) new_nodes
   in
+  let old_nodes = Topology.all_nodes old_topology in
   let old_ids = Node_pool.node_ids pool in
+  let tls_enabled = connection_config.Connection.Config.tls <> None in
+  let endpoint (n : Topology.Node.t) =
+    address_of_node ~prefer_hostname n,
+    port_of_node ~tls:tls_enabled n
+  in
   (* Close removed, then fire [on_node_removed] so the
      Blocking_pool (if any) drops idle conns and marks
      in-flight leases dirty. Callback fires AFTER the bundle
@@ -692,16 +698,30 @@ let diff_pool ~sw ~net ~clock ?domain_mgr ~connection_config
          with _ -> ())
       end)
     old_ids;
+  (* For same-id nodes that moved to a different endpoint
+     (failover, readdressing), fire [on_node_refreshed] so
+     the Blocking_pool drops stale idle conns tagged with
+     the pre-refresh endpoint. The multiplexed [Node_pool]
+     doesn't need this — its per-connection supervisor will
+     detect the Closed socket and reconnect via the fresh
+     endpoint on its own path. *)
+  List.iter
+    (fun (old : Topology.Node.t) ->
+      if List.mem old.id new_ids then
+        match List.find_opt (fun n -> n.Topology.Node.id = old.id)
+                new_nodes with
+        | Some fresh when endpoint fresh <> endpoint old ->
+            (try
+               topology_hooks.Config.on_node_refreshed ~node_id:old.id
+             with _ -> ())
+        | _ -> ())
+    old_nodes;
   (* Add new (online nodes only) *)
-  let tls_enabled = connection_config.Connection.Config.tls <> None in
   Eio.Fiber.List.iter
     (fun (n : Topology.Node.t) ->
       if not (List.mem n.id old_ids) && n.health = Topology.Node.Online
       then
-        match
-          address_of_node ~prefer_hostname n,
-          port_of_node ~tls:tls_enabled n
-        with
+        match endpoint n with
         | Some host, Some port ->
             (match
                connect_bundle ~sw ~net ~clock ?domain_mgr
@@ -734,7 +754,7 @@ let apply_new_topology ~sw ~net ~clock ?domain_mgr ~cfg ~pool
       ~connections_per_node:cfg.Config.connections_per_node
       ~prefer_hostname:cfg.Config.prefer_hostname
       ~topology_hooks:cfg.Config.topology_hooks
-      ~pool ~new_topology:new_topo ();
+      ~pool ~old_topology:current ~new_topology:new_topo ();
     Atomic.set topology_atomic new_topo;
     (* Topology changed — slot ownership may have shifted, failover
        may have rotated primaries. The server on any reconnected

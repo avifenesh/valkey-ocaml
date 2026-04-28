@@ -1030,6 +1030,18 @@ val lmove :
 (** Atomic non-blocking LMOVE. Included alongside [blmove] since they
     share [list_side]. *)
 
+(** Which WAIT-family command returned [Wait_needs_dedicated_conn].
+    Typed to avoid stringly-typed error messages on the five
+    fixed call sites ({!wait_replicas} / {!wait_replicas_all}
+    / {!wait_replicas_min} / {!wait_replicas_sum} /
+    {!wait_aof}). *)
+type wait_kind =
+  | Wait
+  | Wait_fan
+  | Wait_min
+  | Wait_sum
+  | Waitaof
+
 type blocking_error =
   | Pool of Blocking_pool.borrow_error
     (** Lease itself failed; the command was never sent. *)
@@ -1037,6 +1049,12 @@ type blocking_error =
     (** A conn was leased and the command reached the wire but
         returned an error (WRONGTYPE, Server_error, Closed,
         Protocol_violation, ...). *)
+  | No_primary_for_slot of int
+    (** Router could not resolve a primary for the slot's
+        owner (e.g. topology just lost the shard). Distinct
+        from [Exec Connection.Error.Terminal _] so callers can
+        retry on topology refresh without pattern-matching
+        strings. *)
   | Cross_slot of { command : string; slots : int list }
     (** Multi-key blocking command where keys span shards in a
         cluster. Server would return [CROSSSLOT] at parse
@@ -1044,7 +1062,7 @@ type blocking_error =
         error so callers don't need to parse [Connection.Error]
         strings. [slots] lists the distinct slots observed in
         first-occurrence order. *)
-  | Wait_needs_dedicated_conn of string
+  | Wait_needs_dedicated_conn of wait_kind
     (** [WAIT] / [WAITAOF] fundamentally can't be correct on a
         multiplexed Client.t. Use [Client.with_dedicated_conn]
         to lease an exclusive conn, issue the preceding write
@@ -1054,12 +1072,11 @@ type blocking_error =
 val pp_blocking_error : Format.formatter -> blocking_error -> unit
 
 val blpop :
-  ?timeout:float ->
   t -> keys:string list -> block_seconds:float ->
   ((string * string) option, blocking_error) result
 (** [Some (key, value)] or [None] on server-side timeout.
-    [block_seconds = 0.] blocks indefinitely — in that case
-    set [?timeout] or cancel the Client's switch to get out.
+    [block_seconds = 0.] blocks indefinitely; cancel the
+    Client's switch to get out.
 
     Leases one connection from the [Blocking_pool] for the slot
     that owns the first key, so the call never freezes the
@@ -1070,12 +1087,10 @@ val blpop :
     slot, or the call returns [Error (Cross_slot _)]. *)
 
 val brpop :
-  ?timeout:float ->
   t -> keys:string list -> block_seconds:float ->
   ((string * string) option, blocking_error) result
 
 val blmove :
-  ?timeout:float ->
   t -> source:string -> destination:string ->
   from:list_side -> to_:list_side -> block_seconds:float ->
   (string option, blocking_error) result
@@ -1083,34 +1098,42 @@ val blmove :
     slot. *)
 
 val wait_replicas :
-  ?timeout:float ->
   t -> num_replicas:int -> block_ms:int ->
   (int, blocking_error) result
-(** Always returns [Error (Wait_needs_dedicated_conn ...)].
+(** Always returns [Error (Wait_needs_dedicated_conn Wait)].
     [WAIT] is per-connection and cannot be run correctly on a
     multiplexed client. Use {!with_dedicated_conn} +
     {!wait_replicas_on}. *)
 
 val wait_replicas_all :
-  ?timeout:float ->
   t -> num_replicas:int -> block_ms:int ->
   ((string * int) list, blocking_error) result
-(** Always returns [Error (Wait_needs_dedicated_conn ...)].
+(** Always returns
+    [Error (Wait_needs_dedicated_conn Wait_fan)].
     See {!wait_replicas}. *)
 
 val wait_replicas_min :
-  ?timeout:float ->
   t -> num_replicas:int -> block_ms:int ->
   (int, blocking_error) result
-(** Always returns [Error (Wait_needs_dedicated_conn ...)].
+(** Always returns
+    [Error (Wait_needs_dedicated_conn Wait_min)].
     See {!wait_replicas}. *)
 
 val wait_replicas_sum :
-  ?timeout:float ->
   t -> num_replicas:int -> block_ms:int ->
   (int, blocking_error) result
-(** Always returns [Error (Wait_needs_dedicated_conn ...)].
+(** Always returns
+    [Error (Wait_needs_dedicated_conn Wait_sum)].
     See {!wait_replicas}. *)
+
+val wait_aof :
+  t -> num_local:int -> num_replicas:int -> block_ms:int ->
+  (int * int, blocking_error) result
+(** Always returns
+    [Error (Wait_needs_dedicated_conn Waitaof)].
+    See {!wait_replicas}. [WAITAOF] is per-connection for the
+    same reason [WAIT] is; use {!with_dedicated_conn} +
+    {!wait_aof_on}. *)
 
 (** {1 Pub/sub (publish side)} *)
 
@@ -1133,8 +1156,6 @@ val spublish :
     primary (see {!Pubsub} and {!Cluster_pubsub}). *)
 
 val xread_block :
-  ?timeout:float ->
-  ?read_from:Read_from.t ->
   ?count:int ->
   t -> block_ms:int ->
   streams:(string * string) list ->
@@ -1144,12 +1165,9 @@ val xread_block :
     the multiplexed FIFO.
 
     Cluster: every stream key must hash to the same slot, or
-    the call returns [Error (Cross_slot _)]. [?read_from] is
-    accepted for signature compatibility but ignored — pool
-    conns always target the slot's primary. *)
+    the call returns [Error (Cross_slot _)]. *)
 
 val xreadgroup_block :
-  ?timeout:float ->
   ?count:int ->
   ?noack:bool ->
   t -> block_ms:int -> group:string -> consumer:string ->

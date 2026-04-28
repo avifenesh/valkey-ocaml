@@ -161,21 +161,30 @@ type t = {
   config : Config.t;
   connection_config : Connection.Config.t;
   (* Pool conns MUST NOT enable CLIENT TRACKING — they never
-     receive CSC-tracked reads. [create] strips the cache
-     setting from the supplied connection_config so a caller
-     who builds a config from their Client.Config.t can't
-     accidentally plumb tracking through. *)
+     receive CSC-tracked reads. [create] rejects any config
+     with [client_cache <> None] at construction time so a
+     caller who builds a config from their Client.Config.t
+     can't accidentally plumb tracking through. *)
   endpoint_for_node : node_id:string -> (string * int) option;
   buckets : (string, bucket) Hashtbl.t;
   buckets_mutex : Eio.Mutex.t;
   mutable closed : bool;
 }
 
-let strip_client_cache (cfg : Connection.Config.t) =
-  { cfg with client_cache = None }
-
 let create ~sw ~net ~clock ?domain_mgr ~config ~connection_config
     ~endpoint_for_node () =
+  (* Fail-closed on a config that tries to enable CSC on the
+     pool: the module's whole invariant is "pool conns never
+     track". Silently stripping the setting would hide a
+     configuration bug — raise so the user notices at
+     [create] time rather than wondering later why their
+     blocking commands never produce invalidation pushes. *)
+  (match connection_config.Connection.Config.client_cache with
+   | None -> ()
+   | Some _ ->
+       invalid_arg
+         "Blocking_pool.create: connection_config.client_cache must be None \
+          — pool conns never enable CLIENT TRACKING");
   let net =
     (net :> [ `Generic | `Unix ] Eio.Net.ty Eio.Resource.t)
   in
@@ -193,7 +202,7 @@ let create ~sw ~net ~clock ?domain_mgr ~config ~connection_config
     clock;
     domain_mgr;
     config;
-    connection_config = strip_client_cache connection_config;
+    connection_config;
     endpoint_for_node;
     buckets = Hashtbl.create 16;
     buckets_mutex = Eio.Mutex.create ();
@@ -233,11 +242,15 @@ let open_fresh_conn t node_id :
            Error (Connect_failed
                     (Terminal (Printexc.to_string e))))
 
-(* Try to pull a live idle conn out of the bucket's queue. Close
-   and skip anything stale-by-age or stale-by-generation. *)
-let rec take_live_idle t b now current_gen =
+(* Pull the next live idle conn out of the bucket's queue.
+   Stale entries (too-old-by-age or generation-bumped) are
+   dequeued and returned in [to_close] so the caller closes
+   them OUTSIDE the bucket lock — [Connection.close] involves
+   socket teardown and would serialise other fibers parked on
+   the bucket's lock if done in here. *)
+let rec take_live_idle t b now current_gen to_close =
   match Queue.take_opt b.idle with
-  | None -> None
+  | None -> None, to_close
   | Some entry ->
       let too_old =
         match t.config.max_idle_age with
@@ -247,11 +260,10 @@ let rec take_live_idle t b now current_gen =
       in
       let stale_gen = entry.generation <> current_gen in
       if too_old || stale_gen then begin
-        close_quietly entry.conn;
         b.total_closed_dirty <- b.total_closed_dirty + 1;
-        take_live_idle t b now current_gen
+        take_live_idle t b now current_gen (entry.conn :: to_close)
       end
-      else Some entry.conn
+      else Some entry.conn, to_close
 
 let acquire_semaphore ~clock ~config sem =
   match config.Config.on_exhaustion with
@@ -317,10 +329,11 @@ let borrow t ~node_id :
           end
           else
             let gen = Atomic.get b.generation in
-            let idle_conn =
+            let idle_conn, stale =
               Eio.Mutex.use_rw ~protect:true b.lock (fun () ->
-                  take_live_idle t b (Unix.gettimeofday ()) gen)
+                  take_live_idle t b (Unix.gettimeofday ()) gen [])
             in
+            List.iter close_quietly stale;
             (match idle_conn with
              | Some c ->
                  Eio.Mutex.use_rw ~protect:true b.lock (fun () ->
@@ -413,59 +426,43 @@ let stats_by_node t =
         (fun k b acc -> (k, snapshot_bucket_stats b) :: acc)
         t.buckets [])
 
-let drain_node t ~node_id =
+(* Bump [b]'s generation, drain its idle queue into a fresh
+   queue, optionally flip [b.state] to Drained, and return
+   the drained queue so the caller closes the conns OUTSIDE
+   the lock. Shared by drain_node / refresh_node / close. *)
+let flush_bucket_locked b ~drain =
+  Eio.Mutex.use_rw ~protect:true b.lock (fun () ->
+      if drain then b.state <- `Drained;
+      ignore (Atomic.fetch_and_add b.generation 1 : int);
+      let drained = Queue.create () in
+      Queue.transfer b.idle drained;
+      drained)
+
+let close_idle_queue q =
+  Queue.iter (fun e -> close_quietly e.conn) q
+
+let with_bucket t ~node_id f =
   match
     Eio.Mutex.use_rw ~protect:true t.buckets_mutex (fun () ->
         Hashtbl.find_opt t.buckets node_id)
   with
   | None -> ()
-  | Some b ->
-      let to_close =
-        Eio.Mutex.use_rw ~protect:true b.lock (fun () ->
-            b.state <- `Drained;
-            (* Bump generation so every in-flight lease
-               returns dirty. *)
-            ignore (Atomic.fetch_and_add b.generation 1 : int);
-            let drained = Queue.create () in
-            Queue.iter (fun e -> Queue.push e drained) b.idle;
-            Queue.clear b.idle;
-            drained)
-      in
-      Queue.iter (fun e -> close_quietly e.conn) to_close
+  | Some b -> f b
+
+let drain_node t ~node_id =
+  with_bucket t ~node_id (fun b ->
+      close_idle_queue (flush_bucket_locked b ~drain:true))
 
 let refresh_node t ~node_id =
-  match
-    Eio.Mutex.use_rw ~protect:true t.buckets_mutex (fun () ->
-        Hashtbl.find_opt t.buckets node_id)
-  with
-  | None -> ()
-  | Some b ->
-      let to_close =
-        Eio.Mutex.use_rw ~protect:true b.lock (fun () ->
-            ignore (Atomic.fetch_and_add b.generation 1 : int);
-            let drained = Queue.create () in
-            Queue.iter (fun e -> Queue.push e drained) b.idle;
-            Queue.clear b.idle;
-            drained)
-      in
-      Queue.iter (fun e -> close_quietly e.conn) to_close
+  with_bucket t ~node_id (fun b ->
+      close_idle_queue (flush_bucket_locked b ~drain:false))
 
 let close t =
-  Eio.Mutex.use_rw ~protect:true t.buckets_mutex (fun () ->
-      t.closed <- true);
   let all_buckets =
     Eio.Mutex.use_rw ~protect:true t.buckets_mutex (fun () ->
+        t.closed <- true;
         Hashtbl.fold (fun _ b acc -> b :: acc) t.buckets [])
   in
   List.iter
-    (fun b ->
-      let to_close =
-        Eio.Mutex.use_rw ~protect:true b.lock (fun () ->
-            b.state <- `Drained;
-            let drained = Queue.create () in
-            Queue.iter (fun e -> Queue.push e drained) b.idle;
-            Queue.clear b.idle;
-            drained)
-      in
-      Queue.iter (fun e -> close_quietly e.conn) to_close)
+    (fun b -> close_idle_queue (flush_bucket_locked b ~drain:true))
     all_buckets
