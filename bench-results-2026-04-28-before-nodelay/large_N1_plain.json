@@ -1,0 +1,13 @@
+{
+  "conns": 1,
+  "tls": false,
+  "scenario_set": "large",
+  "scenarios": [
+    { "name": "GET               size=1024    conc=50", "count": 30000, "ops_per_sec": 112400.82, "avg_ms": 0.445, "p50_ms": 0.365, "p90_ms": 0.647, "p99_ms": 1.224, "p999_ms": 1.764, "max_ms": 2.113 },
+    { "name": "GET               size=65536   conc=50", "count": 30000, "ops_per_sec": 121188.10, "avg_ms": 0.412, "p50_ms": 0.351, "p90_ms": 0.612, "p99_ms": 0.872, "p999_ms": 1.883, "max_ms": 1.896 },
+    { "name": "GET               size=262144  conc=50", "count": 30000, "ops_per_sec": 117443.42, "avg_ms": 0.425, "p50_ms": 0.360, "p90_ms": 0.638, "p99_ms": 1.021, "p999_ms": 1.536, "max_ms": 1.572 },
+    { "name": "GET               size=1048576 conc=20", "count": 30000, "ops_per_sec": 124202.44, "avg_ms": 0.161, "p50_ms": 0.127, "p90_ms": 0.279, "p99_ms": 0.506, "p999_ms": 0.844, "max_ms": 1.632 },
+    { "name": "MIX_S_L(1L/16S)   size=262144  conc=50", "count": 30000, "ops_per_sec": 82462.88, "avg_ms": 0.606, "p50_ms": 0.548, "p90_ms": 0.986, "p99_ms": 1.565, "p999_ms": 2.643, "max_ms": 3.024 },
+    { "name": "MIX_S_L(1L/32S)   size=1048576 conc=50", "count": 30000, "ops_per_sec": 56802.81, "avg_ms": 0.879, "p50_ms": 0.821, "p90_ms": 1.633, "p99_ms": 2.470, "p999_ms": 3.190, "max_ms": 3.621 }
+  ]
+}

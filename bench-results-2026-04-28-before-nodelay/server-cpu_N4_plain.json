@@ -1,0 +1,11 @@
+{
+  "conns": 4,
+  "tls": false,
+  "scenario_set": "server-cpu",
+  "scenarios": [
+    { "name": "EVAL_SPIN(100)    size=0       conc=50", "count": 30000, "ops_per_sec": 152854.57, "avg_ms": 0.327, "p50_ms": 0.290, "p90_ms": 0.554, "p99_ms": 0.981, "p999_ms": 1.743, "max_ms": 1.905 },
+    { "name": "EVAL_SPIN(1000)   size=0       conc=50", "count": 30000, "ops_per_sec": 183081.96, "avg_ms": 0.273, "p50_ms": 0.248, "p90_ms": 0.402, "p99_ms": 0.751, "p999_ms": 1.121, "max_ms": 1.371 },
+    { "name": "EVAL_SPIN(10000)  size=0       conc=50", "count": 30000, "ops_per_sec": 38286.94, "avg_ms": 1.305, "p50_ms": 1.302, "p90_ms": 1.589, "p99_ms": 2.222, "p999_ms": 2.555, "max_ms": 2.761 },
+    { "name": "SORT_RO           size=0       conc=50", "count": 30000, "ops_per_sec": 12969.54, "avg_ms": 3.852, "p50_ms": 3.732, "p90_ms": 4.748, "p99_ms": 6.181, "p999_ms": 6.877, "max_ms": 8.342 }
+  ]
+}
