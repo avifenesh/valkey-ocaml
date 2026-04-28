@@ -6,11 +6,17 @@
      - the block_seconds timeout fires (server-side)
      - the per-call ?timeout fires (client-side, raises Timeout)
 
-   The exclusive-connection rule: a client whose connection is
-   blocked inside BLPOP can't service other commands. Open a
-   dedicated Client.t for the worker. *)
+   This client routes blocking commands through
+   [Client.Config.blocking_pool] so one Client.t can serve both
+   blocking workers and regular traffic concurrently — the pool
+   leases a dedicated connection for each blocking call while
+   the multiplexed conn keeps serving every other fiber. Opt
+   in with [blocking_pool.max_per_node >= 1]; the default is
+   disabled and blocking commands return
+   [Error (Pool Pool_not_configured)]. *)
 
 module C = Valkey.Client
+module BP = Valkey.Blocking_pool
 module E = Valkey.Connection.Error
 
 let queue = "demo:blocking"
@@ -40,7 +46,7 @@ let worker ~client =
           Printf.printf "[worker] BRPOP server-side timeout, retrying\n%!";
           loop seen
       | Error e ->
-          Format.eprintf "[worker] BRPOP: %a@." E.pp e
+          Format.eprintf "[worker] BRPOP: %a@." C.pp_blocking_error e
   in
   loop 0
 
@@ -49,20 +55,22 @@ let () =
   Eio.Switch.run @@ fun sw ->
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
-  let make () =
-    C.connect ~sw ~net ~clock ~host:"localhost" ~port:6379 ()
+  let config = {
+    C.Config.default with
+    blocking_pool = {
+      BP.Config.default with
+      (* One blocking connection is enough for this demo; raise
+         if you run many concurrent workers. *)
+      max_per_node = 2;
+      on_exhaustion = `Block;
+      borrow_timeout = Some 5.0;
+    };
+  } in
+  let client =
+    C.connect ~sw ~net ~clock ~config ~host:"localhost" ~port:6379 ()
   in
-
-  let setup = make () in
-  let _ = C.del setup [ queue ] in
-  C.close setup;
-
-  (* Two clients — the worker's connection will be tied up inside
-     BRPOP, so the producer needs its own. *)
-  let producer_client = make () in
-  let worker_client = make () in
+  let _ = C.del client [ queue ] in
   Eio.Fiber.both
-    (fun () -> producer ~client:producer_client ~clock)
-    (fun () -> worker ~client:worker_client);
-  C.close producer_client;
-  C.close worker_client
+    (fun () -> producer ~client ~clock)
+    (fun () -> worker ~client);
+  C.close client

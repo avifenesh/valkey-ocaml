@@ -1,10 +1,12 @@
 module C = Valkey.Client
 module E = Valkey.Connection.Error
 module R = Valkey.Resp3
+module BP = Valkey.Blocking_pool
 
 let host = "localhost"
 let port = 6379
 
+(* Client for non-blocking tests. *)
 let with_client f =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -14,6 +16,32 @@ let with_client f =
   let r = f c in
   C.close c;
   r
+
+(* Client for blocking tests: enables the Blocking_pool with a
+   small per-node capacity so BLPOP/BRPOP/BLMOVE/XREAD BLOCK
+   have a lease bucket. *)
+let with_blocking_client f =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  let config = {
+    C.Config.default with
+    blocking_pool = {
+      BP.Config.default with
+      max_per_node = 2;
+      on_exhaustion = `Block;
+      borrow_timeout = Some 2.0;
+    };
+  } in
+  let c = C.connect ~sw ~net ~clock ~config ~host ~port () in
+  let r = f c in
+  C.close c;
+  r
+
+let blocking_err_str = function
+  | Ok _ -> "Ok _"
+  | Error e -> Format.asprintf "Error %a" C.pp_blocking_error e
 
 let result_str = function
   | Ok v -> Format.asprintf "Ok %a" R.pp v
@@ -876,7 +904,7 @@ let tests =
       ());
     Alcotest.test_case "blocking: BLPOP / BRPOP with data ready" `Quick
       (fun () ->
-      with_client @@ fun c ->
+      with_blocking_client @@ fun c ->
       let key = "ocaml:c:block:l" in
       let _ = C.del c [ key ] in
       ignore (C.rpush c key [ "a"; "b"; "c" ]);
@@ -885,36 +913,37 @@ let tests =
            Alcotest.(check string) "key" key k;
            Alcotest.(check string) "popped left" "a" v
        | Ok None -> Alcotest.fail "BLPOP unexpectedly timed out"
-       | Error e -> Alcotest.failf "BLPOP: %a" E.pp e);
+       | Error e ->
+           Alcotest.failf "BLPOP: %a" C.pp_blocking_error e);
       (match C.brpop c ~keys:[ key ] ~block_seconds:0.1 with
        | Ok (Some (k, v)) ->
            Alcotest.(check string) "key" key k;
            Alcotest.(check string) "popped right" "c" v
        | Ok None -> Alcotest.fail "BRPOP unexpectedly timed out"
-       | Error e -> Alcotest.failf "BRPOP: %a" E.pp e);
+       | Error e ->
+           Alcotest.failf "BRPOP: %a" C.pp_blocking_error e);
       let _ = C.del c [ key ] in
       ());
     Alcotest.test_case "blocking: BLPOP timeout on empty" `Quick (fun () ->
-      with_client @@ fun c ->
+      with_blocking_client @@ fun c ->
       let key = "ocaml:c:block:empty" in
       let _ = C.del c [ key ] in
       (match C.blpop c ~keys:[ key ] ~block_seconds:0.1 with
        | Ok None -> ()
        | Ok (Some (_, _)) -> Alcotest.fail "BLPOP should have timed out"
-       | Error e -> Alcotest.failf "BLPOP: %a" E.pp e));
+       | Error e ->
+           Alcotest.failf "BLPOP: %a" C.pp_blocking_error e));
     Alcotest.test_case "blocking: BLMOVE timeout on empty source" `Quick (fun () ->
-      with_client @@ fun c ->
+      with_blocking_client @@ fun c ->
       let src = "ocaml:c:blmove:empty:src" in
       let dst = "ocaml:c:blmove:empty:dst" in
       let _ = C.del c [ src; dst ] in
-      (* Empty source list, server should park us for ~block_seconds
-         and return Null on timeout. Asserting Ok None proves the
-         block-then-timeout wire path: a late reply arriving after
-         the OCaml-side timeout would either deliver a stale
-         Bulk_string (incorrect) or corrupt the matching FIFO
-         (would manifest as a Protocol_violation on a subsequent
-         command). The trailing PING confirms the connection is
-         still in a coherent state. *)
+      (* Empty source list, server parks us for ~block_seconds
+         and returns Null on timeout. Routed through the
+         Blocking_pool so the lease-conn carries this wait
+         instead of the multiplexed conn — the trailing PING
+         (on the multiplexed path) confirms other fibers were
+         never blocked. *)
       (match
          C.blmove c ~source:src ~destination:dst
            ~from:Left ~to_:Right ~block_seconds:0.1
@@ -922,17 +951,18 @@ let tests =
        | Ok None -> ()
        | Ok (Some s) ->
            Alcotest.failf "BLMOVE on empty src: expected timeout, got Some %S" s
-       | Error e -> Alcotest.failf "BLMOVE: %a" E.pp e);
+       | Error e ->
+           Alcotest.failf "BLMOVE: %a" C.pp_blocking_error e);
       (match C.exec c [| "PING" |] with
        | Ok (R.Simple_string "PONG") -> ()
        | other ->
            Alcotest.failf
-             "post-timeout PING should be PONG (matching FIFO healthy); got %s"
+             "post-timeout PING should be PONG (multiplexed conn healthy); got %s"
              (match other with
               | Ok v -> Format.asprintf "%a" R.pp v
               | Error e -> Format.asprintf "Error %a" E.pp e)));
     Alcotest.test_case "LMOVE / BLMOVE with data" `Quick (fun () ->
-      with_client @@ fun c ->
+      with_blocking_client @@ fun c ->
       let src = "ocaml:c:src" in
       let dst = "ocaml:c:dst" in
       let _ = C.del c [ src; dst ] in
@@ -949,22 +979,24 @@ let tests =
            ~from:Right ~to_:Left ~block_seconds:0.1
        with
        | Ok (Some "z") -> ()
-       | other -> Alcotest.failf "BLMOVE: %s"
-           (match other with
-            | Ok None -> "None"
-            | Ok (Some s) -> Printf.sprintf "Some %S" s
-            | Error e -> Format.asprintf "Error %a" E.pp e));
+       | other -> Alcotest.failf "BLMOVE: %s" (blocking_err_str other));
       let _ = C.del c [ src; dst ] in
       ());
-    Alcotest.test_case "WAIT (no replicas)" `Quick (fun () ->
-      with_client @@ fun c ->
-      (* With no configured replicas, WAIT 0 0 returns 0 instantly. *)
+    Alcotest.test_case "WAIT returns Wait_needs_dedicated_conn" `Quick (fun () ->
+      with_blocking_client @@ fun c ->
+      (* WAIT can't be run correctly on a multiplexed client.
+         The typed error directs users to the dedicated-conn
+         escape hatch (Commit 4). *)
       (match C.wait_replicas c ~num_replicas:0 ~block_ms:100 with
-       | Ok 0 -> ()
-       | Ok n -> Alcotest.failf "WAIT: expected 0, got %d" n
-       | Error e -> Alcotest.failf "WAIT: %a" E.pp e));
+       | Error (C.Wait_needs_dedicated_conn _) -> ()
+       | Ok n ->
+           Alcotest.failf
+             "WAIT: expected Wait_needs_dedicated_conn, got Ok %d" n
+       | Error e ->
+           Alcotest.failf "WAIT: expected Wait_needs_dedicated_conn, got %a"
+             C.pp_blocking_error e));
     Alcotest.test_case "XREAD BLOCK timeout on empty stream" `Quick (fun () ->
-      with_client @@ fun c ->
+      with_blocking_client @@ fun c ->
       let key = "ocaml:c:xread:empty" in
       let _ = C.del c [ key ] in
       (match
@@ -972,10 +1004,11 @@ let tests =
        with
        | Ok [] -> ()
        | Ok _ -> Alcotest.fail "XREAD BLOCK should have timed out"
-       | Error e -> Alcotest.failf "XREAD BLOCK: %a" E.pp e));
+       | Error e ->
+           Alcotest.failf "XREAD BLOCK: %a" C.pp_blocking_error e));
     Alcotest.test_case "XREADGROUP BLOCK timeout leaves consumer state intact"
       `Quick (fun () ->
-      with_client @@ fun c ->
+      with_blocking_client @@ fun c ->
       let key = "ocaml:c:xrg:block" in
       let group = "g1" in
       let consumer = "c1" in
@@ -1001,7 +1034,8 @@ let tests =
        | Ok [] -> ()
        | Ok _ ->
            Alcotest.fail "XREADGROUP BLOCK should have timed out (no new messages)"
-       | Error e -> Alcotest.failf "XREADGROUP BLOCK: %a" E.pp e);
+       | Error e ->
+           Alcotest.failf "XREADGROUP BLOCK: %a" C.pp_blocking_error e);
       (match C.xinfo_consumers c key ~group with
        | Ok xs ->
            let extract_name = function

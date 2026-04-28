@@ -2089,8 +2089,107 @@ let xinfo_consumers ?timeout ?read_from t key ~group =
   | Ok v -> Error (protocol_violation "XINFO CONSUMERS" v)
 
 (* ---------- blocking commands ----------
-   Caller is responsible for using a dedicated Client. Typed here for
-   ergonomics; typing does not make multiplexed use safe. *)
+
+   Blocking wrappers route through [Blocking_pool] (if
+   configured) so the call never freezes the multiplexed FIFO.
+   Each wrapper:
+     1. computes the first key's slot via [Slot.of_key];
+     2. for multi-key variants, asserts every other key hashes
+        to the same slot (cross-slot is a [Cross_slot] error —
+        server enforces this too but we fail faster and typed);
+     3. resolves the slot's primary node_id via
+        [Router.endpoint_for_slot];
+     4. leases a dedicated conn from the pool's bucket for that
+        node_id via [Blocking_pool.with_borrowed] and runs the
+        command on it;
+     5. decodes the reply with the existing parser.
+
+   If [Client.Config.blocking_pool.max_per_node = 0] (default),
+   no pool exists and the wrapper returns [Error (Pool
+   Pool_not_configured)] — no silent fallback to the
+   multiplexed conn, which would re-introduce the head-of-line
+   bug the pool exists to eliminate.
+
+   [WAIT] / [WAITAOF] do NOT route through the pool.
+   See {!with_dedicated_conn} and {!wait_replicas_on}. *)
+
+type blocking_error =
+  | Pool of Blocking_pool.borrow_error
+  | Exec of Connection.Error.t
+  | Cross_slot of { command : string; slots : int list }
+  | Wait_needs_dedicated_conn of string
+
+let pp_blocking_error fmt = function
+  | Pool e -> Blocking_pool.pp_borrow_error fmt e
+  | Exec e ->
+      Format.fprintf fmt "Blocking command: %a" Connection.Error.pp e
+  | Cross_slot { command; slots } ->
+      Format.fprintf fmt
+        "Blocking command %s: keys span slots [%s] \
+         (cluster requires single slot for multi-key blocking ops)"
+        command
+        (String.concat "; " (List.map string_of_int slots))
+  | Wait_needs_dedicated_conn cmd ->
+      Format.fprintf fmt
+        "%s requires a dedicated connection: use \
+         [Client.with_dedicated_conn] and [wait_replicas_on] / \
+         [wait_aof_on]. WAIT is per-connection and running it on \
+         a multiplexed client has either head-of-line blocking \
+         (on the shared conn) or meaningless results (on a \
+         leased pool conn that never issued the preceding write)."
+        cmd
+
+(* Enforce that every key in [keys] hashes to the same slot.
+   Returns the shared slot on success, or a [Cross_slot] error
+   listing the distinct slots observed. Skipped for standalone
+   clients (single-node → every key is in the same bucket from
+   the client's perspective). Mirrors the pattern in
+   lib/batch.ml:141-166. *)
+let single_slot_of_keys ~cmd ~(t : t) keys :
+    (int, blocking_error) result =
+  match keys with
+  | [] -> Error (Cross_slot { command = cmd; slots = [] })
+  | k1 :: rest ->
+      let s1 = Slot.of_key k1 in
+      if Router.is_standalone t.router then Ok s1
+      else
+        let bad =
+          List.fold_left
+            (fun acc k ->
+              let s = Slot.of_key k in
+              if s <> s1 && not (List.mem s acc) then s :: acc
+              else acc)
+            [] rest
+        in
+        (match bad with
+         | [] -> Ok s1
+         | _ :: _ ->
+             Error
+               (Cross_slot
+                  { command = cmd; slots = s1 :: List.rev bad }))
+
+(* Dispatch a blocking command through the pool. Resolves [slot]'s
+   primary, leases a conn for that node, runs [args] on it. *)
+let run_blocking ?(timeout : float option) t ~slot args :
+    (Resp3.t, blocking_error) result =
+  let _ = timeout in
+  match t.blocking_pool with
+  | None -> Error (Pool Blocking_pool.Pool_not_configured)
+  | Some pool ->
+      (match Router.endpoint_for_slot t.router slot with
+       | None ->
+           Error
+             (Exec
+                (Connection.Error.Terminal
+                   (Printf.sprintf "no primary for slot %d" slot)))
+       | Some (node_id, _host, _port) ->
+           (match
+              Blocking_pool.with_borrowed pool ~node_id (fun conn ->
+                  Connection.request conn args)
+            with
+            | Ok v -> Ok v
+            | Error (`Borrow e) -> Error (Pool e)
+            | Error (`Exec e) -> Error (Exec e)))
 
 type list_side = Left | Right
 let string_of_side = function Left -> "LEFT" | Right -> "RIGHT"
@@ -2115,13 +2214,19 @@ let parse_blpop_reply cmd = function
   | v -> Error (protocol_violation cmd v)
 
 let blpop_like cmd ?timeout t ~keys ~block_seconds =
-  let args =
-    Array.of_list
-      (cmd :: keys @ [ Printf.sprintf "%g" block_seconds ])
-  in
-  match exec ?timeout t args with
+  match single_slot_of_keys ~cmd ~t keys with
   | Error e -> Error e
-  | Ok v -> parse_blpop_reply cmd v
+  | Ok slot ->
+      let args =
+        Array.of_list
+          (cmd :: keys @ [ Printf.sprintf "%g" block_seconds ])
+      in
+      (match run_blocking ?timeout t ~slot args with
+       | Error e -> Error e
+       | Ok v ->
+           (match parse_blpop_reply cmd v with
+            | Ok r -> Ok r
+            | Error e -> Error (Exec e)))
 
 let blpop ?timeout t ~keys ~block_seconds =
   blpop_like "BLPOP" ?timeout t ~keys ~block_seconds
@@ -2130,16 +2235,19 @@ let brpop ?timeout t ~keys ~block_seconds =
   blpop_like "BRPOP" ?timeout t ~keys ~block_seconds
 
 let blmove ?timeout t ~source ~destination ~from ~to_ ~block_seconds =
-  let args =
-    [| "BLMOVE"; source; destination;
-       string_of_side from; string_of_side to_;
-       Printf.sprintf "%g" block_seconds |]
-  in
-  match exec ?timeout t args with
+  match single_slot_of_keys ~cmd:"BLMOVE" ~t [ source; destination ] with
   | Error e -> Error e
-  | Ok Resp3.Null -> Ok None
-  | Ok (Resp3.Bulk_string s) -> Ok (Some s)
-  | Ok v -> Error (protocol_violation "BLMOVE" v)
+  | Ok slot ->
+      let args =
+        [| "BLMOVE"; source; destination;
+           string_of_side from; string_of_side to_;
+           Printf.sprintf "%g" block_seconds |]
+      in
+      (match run_blocking ?timeout t ~slot args with
+       | Error _ as e -> e
+       | Ok Resp3.Null -> Ok None
+       | Ok (Resp3.Bulk_string s) -> Ok (Some s)
+       | Ok v -> Error (Exec (protocol_violation "BLMOVE" v)))
 
 (* WAIT semantics diverge between standalone and cluster:
 
@@ -2157,40 +2265,24 @@ let blmove ?timeout t ~source ~destination ~from ~to_ ~block_seconds =
    the rest" is a separate shape — it needs fiber cancellation in
    exec_multi. Deferred. *)
 
-let wait_replicas ?timeout t ~num_replicas ~block_ms =
-  match
-    exec ?timeout t
-      [| "WAIT"; string_of_int num_replicas; string_of_int block_ms |]
-  with
-  | Error e -> Error e
-  | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
-  | Ok v -> Error (protocol_violation "WAIT" v)
+(* All WAIT variants require a dedicated connection; see
+   [with_dedicated_conn] and [wait_replicas_on] / [wait_aof_on].
+   WAIT measures acks against writes sent on the current
+   connection — running it on a multiplexed client has either
+   head-of-line blocking (on the shared conn) or meaningless
+   results (on a freshly-leased pool conn that never issued
+   the preceding write). *)
+let wait_replicas ?timeout:_ _t ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn "WAIT")
 
-let wait_replicas_all ?timeout t ~num_replicas ~block_ms =
-  let per_node =
-    exec_multi ?timeout ~fan:Router.Fan_target.All_primaries t
-      [| "WAIT"; string_of_int num_replicas; string_of_int block_ms |]
-  in
-  let rec loop acc = function
-    | [] -> Ok (List.rev acc)
-    | (_, Error e) :: _ -> Error e
-    | (node_id, Ok (Resp3.Integer n)) :: rest ->
-        loop ((node_id, Int64.to_int n) :: acc) rest
-    | (_, Ok v) :: _ -> Error (protocol_violation "WAIT" v)
-  in
-  loop [] per_node
+let wait_replicas_all ?timeout:_ _t ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn "WAIT (fan across primaries)")
 
-let wait_replicas_min ?timeout t ~num_replicas ~block_ms =
-  match wait_replicas_all ?timeout t ~num_replicas ~block_ms with
-  | Error e -> Error e
-  | Ok [] -> Ok 0
-  | Ok ((_, n0) :: rest) ->
-      Ok (List.fold_left (fun acc (_, n) -> min acc n) n0 rest)
+let wait_replicas_min ?timeout:_ _t ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn "WAIT (min across primaries)")
 
-let wait_replicas_sum ?timeout t ~num_replicas ~block_ms =
-  match wait_replicas_all ?timeout t ~num_replicas ~block_ms with
-  | Error e -> Error e
-  | Ok xs -> Ok (List.fold_left (fun acc (_, n) -> acc + n) 0 xs)
+let wait_replicas_sum ?timeout:_ _t ~num_replicas:_ ~block_ms:_ =
+  Error (Wait_needs_dedicated_conn "WAIT (sum across primaries)")
 
 (* ---------- pub/sub produce side ---------- *)
 
@@ -2211,47 +2303,57 @@ let spublish ?timeout t ~channel ~message =
   | Ok (Resp3.Integer n) -> Ok (Int64.to_int n)
   | Ok v -> Error (protocol_violation "SPUBLISH" v)
 
-let xread_block ?timeout ?read_from ?count t ~block_ms ~streams =
-  let count_a = match count with
-    | None -> []
-    | Some n -> [ "COUNT"; string_of_int n ]
-  in
+let xread_block ?timeout ?read_from:_ ?count t ~block_ms ~streams =
   let keys = List.map fst streams in
-  let ids = List.map snd streams in
-  let args =
-    Array.of_list (
-      [ "XREAD" ] @ count_a
-      @ [ "BLOCK"; string_of_int block_ms ]
-      @ [ "STREAMS" ] @ keys @ ids
-    )
-  in
-  let target = target_of_streams streams in
-  match exec ?timeout ~target ?read_from t args with
+  match single_slot_of_keys ~cmd:"XREAD BLOCK" ~t keys with
   | Error e -> Error e
-  | Ok v -> parse_streams_reply "XREAD BLOCK" v
+  | Ok slot ->
+      let count_a = match count with
+        | None -> []
+        | Some n -> [ "COUNT"; string_of_int n ]
+      in
+      let ids = List.map snd streams in
+      let args =
+        Array.of_list (
+          [ "XREAD" ] @ count_a
+          @ [ "BLOCK"; string_of_int block_ms ]
+          @ [ "STREAMS" ] @ keys @ ids
+        )
+      in
+      (match run_blocking ?timeout t ~slot args with
+       | Error _ as e -> e
+       | Ok v ->
+           (match parse_streams_reply "XREAD BLOCK" v with
+            | Ok r -> Ok r
+            | Error e -> Error (Exec e)))
 
 let xreadgroup_block ?timeout ?count ?(noack = false) t
     ~block_ms ~group ~consumer ~streams =
-  let count_a = match count with
-    | None -> []
-    | Some n -> [ "COUNT"; string_of_int n ]
-  in
-  let noack_a = if noack then [ "NOACK" ] else [] in
   let keys = List.map fst streams in
-  let ids = List.map snd streams in
-  let args =
-    Array.of_list (
-      [ "XREADGROUP"; "GROUP"; group; consumer ]
-      @ count_a
-      @ [ "BLOCK"; string_of_int block_ms ]
-      @ noack_a
-      @ [ "STREAMS" ] @ keys @ ids
-    )
-  in
-  let target = target_of_streams streams in
-  match exec ?timeout ~target t args with
+  match single_slot_of_keys ~cmd:"XREADGROUP BLOCK" ~t keys with
   | Error e -> Error e
-  | Ok v -> parse_streams_reply "XREADGROUP BLOCK" v
+  | Ok slot ->
+      let count_a = match count with
+        | None -> []
+        | Some n -> [ "COUNT"; string_of_int n ]
+      in
+      let noack_a = if noack then [ "NOACK" ] else [] in
+      let ids = List.map snd streams in
+      let args =
+        Array.of_list (
+          [ "XREADGROUP"; "GROUP"; group; consumer ]
+          @ count_a
+          @ [ "BLOCK"; string_of_int block_ms ]
+          @ noack_a
+          @ [ "STREAMS" ] @ keys @ ids
+        )
+      in
+      (match run_blocking ?timeout t ~slot args with
+       | Error _ as e -> e
+       | Ok v ->
+           (match parse_streams_reply "XREADGROUP BLOCK" v with
+            | Ok r -> Ok r
+            | Error e -> Error (Exec e)))
 
 (* ---------- bitmaps ---------- *)
 
