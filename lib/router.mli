@@ -74,6 +74,15 @@ type endpoint_for_slot_fn =
     mode. Returns [None] if the slot is unowned in the current
     topology. *)
 
+type endpoint_for_node_fn =
+  node_id:string -> (string * int) option
+(** Resolve [(host, port)] for a live [node_id] in the current
+    topology. Used by [Blocking_pool] to open dedicated conns for
+    blocking commands against the slot's primary — the pool is
+    keyed by node_id, so the lookup is by-id rather than by-slot.
+    Returns [None] if the node is not in the current topology
+    (drained / unknown id). *)
+
 val make :
   exec:exec_fn ->
   exec_multi:exec_multi_fn ->
@@ -82,6 +91,7 @@ val make :
   primary:(unit -> Connection.t option) ->
   connection_for_slot:connection_for_slot_fn ->
   endpoint_for_slot:endpoint_for_slot_fn ->
+  endpoint_for_node:endpoint_for_node_fn ->
   is_standalone:bool ->
   atomic_lock_for_slot:(int -> Eio.Mutex.t) ->
   t
@@ -121,6 +131,11 @@ val endpoint_for_slot : t -> int -> (string * string * int) option
 (** Returns [Some (primary_id, host, port)] of the current primary
     for [slot], or [None] if the slot is unowned in the router's
     topology. *)
+
+val endpoint_for_node : t -> node_id:string -> (string * int) option
+(** Returns [Some (host, port)] for [node_id] if that id is live in
+    the current topology, or [None] otherwise (drained / unknown).
+    Consumed by {!Blocking_pool}. *)
 
 val is_standalone : t -> bool
 (** [true] only for the synthetic standalone/single-node path

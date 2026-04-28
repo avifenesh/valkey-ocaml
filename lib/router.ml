@@ -40,6 +40,7 @@ type pair_fn =
 
 type connection_for_slot_fn = int -> Connection.t option
 type endpoint_for_slot_fn = int -> (string * string * int) option
+type endpoint_for_node_fn = node_id:string -> (string * int) option
 
 (* Per-slot mutex used to serialize atomic operations (MULTI/EXEC
    blocks from [Batch ~atomic:true] and [Transaction]) on the
@@ -56,15 +57,17 @@ type t = {
   primary : unit -> Connection.t option;
   connection_for_slot : connection_for_slot_fn;
   endpoint_for_slot : endpoint_for_slot_fn;
+  endpoint_for_node : endpoint_for_node_fn;
   is_standalone : bool;
   atomic_lock_for_slot : atomic_lock_for_slot_fn;
 }
 [@@warning "-69"]
 
 let make ~exec ~exec_multi ~pair ~close ~primary ~connection_for_slot
-    ~endpoint_for_slot ~is_standalone ~atomic_lock_for_slot =
+    ~endpoint_for_slot ~endpoint_for_node ~is_standalone
+    ~atomic_lock_for_slot =
   { exec; exec_multi; pair; close; primary;
-    connection_for_slot; endpoint_for_slot;
+    connection_for_slot; endpoint_for_slot; endpoint_for_node;
     is_standalone;
     atomic_lock_for_slot }
 
@@ -85,6 +88,17 @@ let standalone (conn : Connection.t) : t =
     primary = (fun () -> Some conn);
     connection_for_slot = (fun _ -> Some conn);
     endpoint_for_slot = (fun _ -> None);
+    (* Standalone router is constructed from a Connection with no
+       host/port metadata exposed here; callers that need an
+       endpoint go through the cluster router's by-node lookup.
+       For standalone specifically, the Blocking_pool bucket would
+       open its own connection to the same host anyway — but
+       [Client.connect] builds a synthetic cluster via
+       [from_pool_and_topology] where this path is populated
+       correctly, so this [None] stub is only hit by the direct
+       [Router.standalone] entry point (not exercised by
+       Blocking_pool in practice). *)
+    endpoint_for_node = (fun ~node_id:_ -> None);
     is_standalone = true;
     atomic_lock_for_slot = (fun _ -> atomic_mutex);
   }
@@ -97,5 +111,6 @@ let close t = t.close ()
 let primary_connection t = t.primary ()
 let connection_for_slot t slot = t.connection_for_slot slot
 let endpoint_for_slot t slot = t.endpoint_for_slot slot
+let endpoint_for_node t ~node_id = t.endpoint_for_node ~node_id
 let is_standalone t = t.is_standalone
 let atomic_lock_for_slot t slot = t.atomic_lock_for_slot slot

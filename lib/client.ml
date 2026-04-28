@@ -8,6 +8,30 @@ module Config = struct
     read_from : Read_from.t;
     client_cache : Client_cache.t option;
     connections_per_node : int;
+    blocking_pool : Blocking_pool.Config.t;
+    (** Lease pool for blocking commands
+        ([BLPOP]/[BRPOP]/[BLMOVE]/[BLMPOP]/[BZPOPMIN]/
+        [BZPOPMAX]/[XREAD BLOCK]/[XREADGROUP BLOCK]).
+
+        Default is [Blocking_pool.Config.default], where
+        [max_per_node = 0] disables the feature — every
+        blocking command wrapper on this [Client.t] returns
+        [`Pool_not_configured] until the user opts in.
+
+        Opt in by setting [max_per_node >= 1]. Pool
+        connections never enable CLIENT TRACKING and never
+        participate in MULTI/EXEC or OPTIN pair submits
+        (those stay on the multiplexed bundle). The pool is
+        closed in [Client.close].
+
+        [WAIT] and [WAITAOF] do NOT route through this
+        pool — they require an explicit dedicated connection
+        via {!with_dedicated_conn} (running them on a
+        multiplexed conn freezes every fiber on that socket
+        for the block duration; running them on a leased
+        pool conn is semantically useless because [WAIT]
+        measures acks against the connection that did the
+        preceding write). *)
   }
   let default = {
     connection = Connection.Config.default;
@@ -15,6 +39,7 @@ module Config = struct
     read_from = Read_from.default;
     client_cache = None;
     connections_per_node = 1;
+    blocking_pool = Blocking_pool.Config.default;
   }
 end
 
@@ -47,8 +72,33 @@ type t = {
       check on every call. *)
   loaded_shas : (string, unit) Hashtbl.t;
   loaded_shas_mutex : Eio.Mutex.t;
+  blocking_pool : Blocking_pool.t option;
+  (** [Some pool] iff [config.blocking_pool.max_per_node >= 1] AND
+      [Client.connect] / [Client.from_router] had the Eio environment
+      available to build the pool. [None] otherwise — blocking
+      commands return [Error (Pool Pool_not_configured)]. *)
 }
 [@@warning "-69"]
+
+(* Construct the [Blocking_pool] from Client config + Router, or
+   return [None] if the knob is disabled. The pool is keyed by
+   [node_id] and resolves [(host, port)] via
+   [Router.endpoint_for_node]. Pool conns use a stripped
+   [Connection.Config] (no CLIENT TRACKING — blocking conns never
+   participate in CSC). *)
+let build_blocking_pool ~sw ~net ~clock ?domain_mgr
+    ~(config : Config.t) ~router () =
+  if config.blocking_pool.max_per_node < 1 then None
+  else
+    let endpoint_for_node ~node_id =
+      Router.endpoint_for_node router ~node_id
+    in
+    Some
+      (Blocking_pool.create
+         ~sw ~net ~clock ?domain_mgr
+         ~config:config.blocking_pool
+         ~connection_config:config.connection
+         ~endpoint_for_node ())
 
 let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port () =
   (* Standalone is a degenerate one-shard cluster: synthesise a topology,
@@ -73,19 +123,37 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default) ~host ~port (
   let router =
     Cluster_router.from_pool_and_topology ~clock ~pool ~topology ()
   in
+  let blocking_pool =
+    build_blocking_pool ~sw ~net ~clock ?domain_mgr ~config ~router ()
+  in
   { router; config;
     client_cache = conn_cfg.Connection.Config.client_cache;
     loaded_shas = Hashtbl.create 16;
-    loaded_shas_mutex = Eio.Mutex.create () }
+    loaded_shas_mutex = Eio.Mutex.create ();
+    blocking_pool }
 
-let from_router ~config router =
+let from_router ?sw ?net ?clock ?domain_mgr ~config router =
   let conn_cfg = resolve_connection_config config in
+  (* Blocking pool requires the Eio env; [from_router] callers who
+     want blocking commands must supply it. Omitting any of these
+     leaves [blocking_pool = None] even if the config has
+     [max_per_node >= 1] — in that case blocking commands return
+     [Pool_not_configured] just like the disabled case. *)
+  let blocking_pool =
+    match sw, net, clock with
+    | Some sw, Some net, Some clock ->
+        build_blocking_pool ~sw ~net ~clock ?domain_mgr ~config ~router ()
+    | _ -> None
+  in
   { router; config;
     client_cache = conn_cfg.Connection.Config.client_cache;
     loaded_shas = Hashtbl.create 16;
-    loaded_shas_mutex = Eio.Mutex.create () }
+    loaded_shas_mutex = Eio.Mutex.create ();
+    blocking_pool }
 
-let close t = Router.close t.router
+let close t =
+  Option.iter Blocking_pool.close t.blocking_pool;
+  Router.close t.router
 
 let cache_metrics t =
   match t.client_cache with

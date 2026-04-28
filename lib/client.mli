@@ -55,6 +55,25 @@ module Config : sig
 
         Must be [>= 1]; [Client.connect] raises [Invalid_argument]
         otherwise. *)
+
+    blocking_pool : Blocking_pool.Config.t;
+    (** Lease pool for blocking commands
+        ([BLPOP]/[BRPOP]/[BLMOVE]/[BLMPOP]/[BZPOPMIN]/
+        [BZPOPMAX]/[XREAD BLOCK]/[XREADGROUP BLOCK]).
+
+        Default is [Blocking_pool.Config.default], where
+        [max_per_node = 0] disables the feature — every
+        blocking command wrapper returns
+        [`Pool_not_configured] until the user opts in.
+
+        Opt in by setting [max_per_node >= 1]. Pool
+        connections never enable CLIENT TRACKING and never
+        participate in MULTI/EXEC or OPTIN pair submits.
+        The pool is closed in {!close}.
+
+        [WAIT] / [WAITAOF] do {b not} route through this
+        pool — they require an explicit dedicated connection
+        via {!with_dedicated_conn}. *)
   }
   val default : t
 end
@@ -72,8 +91,21 @@ val connect :
   unit ->
   t
 
-val from_router : config:Config.t -> Router.t -> t
-(** Wrap an arbitrary [Router.t] (e.g. cluster router) as a [Client.t]. *)
+val from_router :
+  ?sw:Eio.Switch.t ->
+  ?net:[> [> `Generic | `Unix ] Eio.Net.ty ] Eio.Resource.t ->
+  ?clock:_ Eio.Time.clock ->
+  ?domain_mgr:_ Eio.Domain_manager.t ->
+  config:Config.t -> Router.t -> t
+(** Wrap an arbitrary [Router.t] (e.g. cluster router) as a
+    [Client.t].
+
+    The Eio environment arguments ([~sw], [~net], [~clock],
+    [?domain_mgr]) are optional — omit them when you just want
+    the typed command surface without blocking-command support.
+    Supply them (plus a
+    [config.blocking_pool.max_per_node >= 1]) to enable the
+    Blocking_pool. *)
 
 val close : t -> unit
 

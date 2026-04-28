@@ -13,6 +13,7 @@ module Redirect = Redirect
 module Router = Router
 module Command_spec = Command_spec
 module Connection = Connection
+module Blocking_pool = Blocking_pool
 module Client = Client
 module Cluster_router = Cluster_router
 module Transaction = Transaction

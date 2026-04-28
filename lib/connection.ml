@@ -315,6 +315,21 @@ type t = {
                                                successful handshake *)
   mutable server_info : Resp3.t option;
   mutable availability_zone : string option;
+  conn_client_id : int64 option Atomic.t;
+  (* Server-assigned CLIENT ID + monotonic generation.
+     Rewritten on every handshake; reads are lock-free so a
+     sibling fiber can observe [None] briefly during a
+     reconnect window. Combined with [conn_handshake_gen] a
+     cached (id, gen) tuple can be validated against
+     [conn_handshake_gen] before use (stale gen = do not
+     trust the id). *)
+  conn_handshake_gen : int Atomic.t;
+  (* Bumps on every successful handshake. Callers that cache
+     [client_id] snapshot this generation alongside the id; if
+     the generation differs when they go to use the id the
+     cached value is stale and must not be used (the old
+     socket is gone, the old id may now belong to a different
+     client on the same server). *)
   closing : bool Atomic.t;
   mutable keepalive_count : int;
   cb : Circuit_breaker.state option;
@@ -351,6 +366,16 @@ let extract_string_field key = function
           match k, v with
           | Resp3.Bulk_string k', Resp3.Bulk_string v' when k' = key ->
               Some v'
+          | _ -> None)
+        kvs
+  | _ -> None
+
+let extract_int64_field key = function
+  | Resp3.Map kvs ->
+      List.find_map
+        (fun (k, v) ->
+          match k, v with
+          | Resp3.Bulk_string k', Resp3.Integer i when k' = key -> Some i
           | _ -> None)
         kvs
   | _ -> None
@@ -419,13 +444,26 @@ let run_client_tracking (sock : socket) (cfg : Client_cache.t) :
   | exception Resp3_parser.Parse_error msg ->
       Error (Protocol_violation msg)
 
+type handshake_result = {
+  hs_hello_map : Resp3.t;
+  hs_availability_zone : string option;
+  hs_client_id : int64 option;
+  (* Server-assigned CLIENT ID for this conn, read from the HELLO
+     response. Consumed by the Blocking_pool to issue CLIENT UNBLOCK
+     against this exact conn from a different (multiplexed) conn on
+     the same node. Rebound on every reconnect — the server assigns
+     a new ID after the socket is re-established, so any cached ID
+     from before a reconnect is stale and must not be used. *)
+}
+
 let full_handshake (sock : socket) (hs : Handshake.t)
     ~(client_cache : Client_cache.t option) :
-    (Resp3.t * string option, Error.t) result =
+    (handshake_result, Error.t) result =
   match run_hello sock hs with
-  | Error _ as e -> e
+  | Error e -> Error e
   | Ok hello_map ->
       let az = extract_string_field "availability_zone" hello_map in
+      let client_id = extract_int64_field "id" hello_map in
       let after_select =
         match hs.select_db with
         | None -> Ok ()
@@ -434,11 +472,16 @@ let full_handshake (sock : socket) (hs : Handshake.t)
       (match after_select with
        | Error e -> Error e
        | Ok () ->
+           let result =
+             { hs_hello_map = hello_map;
+               hs_availability_zone = az;
+               hs_client_id = client_id }
+           in
            (match client_cache with
-            | None -> Ok (hello_map, az)
+            | None -> Ok result
             | Some cfg ->
                 (match run_client_tracking sock cfg with
-                 | Ok () -> Ok (hello_map, az)
+                 | Ok () -> Ok result
                  | Error e -> Error e)))
 
 (* Non-leaking exception describer for [Error.t] payloads.
@@ -546,7 +589,8 @@ let make_tcp_connector ~sw ~net ~host ~port ~tls =
                     Ok { write; reader; read_into; close })
          with exn -> Error (Error.Tcp_refused (describe_exn exn)))
 
-let connect_and_handshake t : (socket * Resp3.t * string option, Error.t) result =
+let connect_and_handshake t :
+    (socket * handshake_result, Error.t) result =
   Observability.connect_span
     ~host:t.host ~port:t.port
     ~tls:(t.config.tls <> None)
@@ -559,7 +603,7 @@ let connect_and_handshake t : (socket * Resp3.t * string option, Error.t) result
              full_handshake sock t.config.handshake
                ~client_cache:t.config.client_cache
            with
-           | Ok (info, az) -> Ok (sock, info, az)
+           | Ok result -> Ok (sock, result)
            | Error e ->
                sock.close ();
                Error e))
@@ -759,7 +803,7 @@ let recovery_loop (t : t) : unit =
       | Ok (Error _) ->
           t.sleep (jittered_backoff policy n);
           attempt (n + 1)
-      | Ok (Ok (sock, info, az)) ->
+      | Ok (Ok (sock, hs_result)) ->
           (* The server forgot our CLIENT TRACKING context while we
              were disconnected. Any cached entry we own for a key
              that routed through this connection is now un-tracked
@@ -774,11 +818,19 @@ let recovery_loop (t : t) : unit =
           (match t.config.client_cache with
            | None -> ()
            | Some ccfg -> Cache.clear ccfg.Client_cache.cache);
+          (* Publish the new CLIENT ID + generation BEFORE flipping
+             the state to Alive. Readers that observe [Alive] must
+             already see the fresh (id, gen); otherwise a
+             Blocking_pool caller could snapshot a stale id and
+             issue CLIENT UNBLOCK against an id that now belongs to
+             a different client on the same server. *)
+          Atomic.set t.conn_client_id hs_result.hs_client_id;
+          ignore (Atomic.fetch_and_add t.conn_handshake_gen 1 : int);
           Eio.Mutex.use_rw ~protect:true t.state_mutex (fun () ->
               drain_sent t (Error Error.Interrupted);
               t.current <- Some sock;
-              t.server_info <- Some info;
-              t.availability_zone <- az;
+              t.server_info <- Some hs_result.hs_hello_map;
+              t.availability_zone <- hs_result.hs_availability_zone;
               set_state t Alive);
           (* Fire the reconnect hook outside the state mutex — the
              hook typically calls [send_fire_and_forget], which takes
@@ -1087,6 +1139,8 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default)
     on_connected;
     server_info = None;
     availability_zone = None;
+    conn_client_id = Atomic.make None;
+    conn_handshake_gen = Atomic.make 0;
     closing = Atomic.make false;
     keepalive_count = 0;
     cb = Option.map Circuit_breaker.make config.circuit_breaker;
@@ -1101,10 +1155,12 @@ let connect ~sw ~net ~clock ?domain_mgr ?(config = Config.default)
    | Error `Timeout ->
        raise (Handshake_failed (Terminal "initial handshake timeout"))
    | Ok (Error e) -> raise (Handshake_failed e)
-   | Ok (Ok (sock, info, az)) ->
+   | Ok (Ok (sock, hs_result)) ->
+       Atomic.set t.conn_client_id hs_result.hs_client_id;
+       ignore (Atomic.fetch_and_add t.conn_handshake_gen 1 : int);
        t.current <- Some sock;
-       t.server_info <- Some info;
-       t.availability_zone <- az;
+       t.server_info <- Some hs_result.hs_hello_map;
+       t.availability_zone <- hs_result.hs_availability_zone;
        t.state <- Alive;
        (* Same hook as recovery: fires after the initial handshake
           too, so callers can register their "send on every
@@ -1155,6 +1211,9 @@ let availability_zone t = t.availability_zone
 let server_info t = t.server_info
 let state t = t.state
 let keepalive_count t = t.keepalive_count
+
+let client_id t = Atomic.get t.conn_client_id
+let handshake_generation t = Atomic.get t.conn_handshake_gen
 
 let interrupt t =
   if Atomic.get t.closing then ()

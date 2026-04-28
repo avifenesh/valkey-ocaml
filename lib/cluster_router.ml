@@ -531,6 +531,28 @@ let endpoint_for_slot_via ~topology_ref ~prefer_hostname
           Some (shard.primary.id, host, port)
       | _ -> None
 
+(* By-node lookup for [Blocking_pool]. Walks the current
+   topology, matches [node_id], returns [(host, port)] using
+   the same address / port helpers as the pool-dial path so
+   every dedicated consumer (pubsub, blocking pool) reaches
+   the same endpoint. *)
+let endpoint_for_node_via ~topology_ref ~prefer_hostname
+    ~connection_config ~node_id =
+  let tls_enabled =
+    connection_config.Connection.Config.tls <> None
+  in
+  List.find_map
+    (fun (n : Topology.Node.t) ->
+      if n.id <> node_id then None
+      else
+        match
+          address_of_node ~prefer_hostname n,
+          port_of_node ~tls:tls_enabled n
+        with
+        | Some host, Some port -> Some (host, port)
+        | _ -> None)
+    (Topology.all_nodes !topology_ref)
+
 (* Per-primary mutex table for atomic-batch serialisation. The
    key is the primary's node_id (stable across refreshes for
    unchanged nodes). Lazily grown; the guard mutex protects the
@@ -600,6 +622,12 @@ let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
       ~connection_config:Connection.Config.default
       slot
   in
+  let endpoint_for_node ~node_id =
+    endpoint_for_node_via ~topology_ref
+      ~prefer_hostname:false
+      ~connection_config:Connection.Config.default
+      ~node_id
+  in
   let is_standalone =
     match Topology.primaries topology, Topology.replicas topology with
     | [ primary ], [] ->
@@ -611,8 +639,8 @@ let from_pool_and_topology ?(max_redirects = 5) ~clock ~pool ~topology () =
     atomic_lock_for_slot_via ~topology_ref ~for_primary slot
   in
   Router.make ~exec ~exec_multi ~pair ~close ~primary
-    ~connection_for_slot ~endpoint_for_slot ~is_standalone
-    ~atomic_lock_for_slot
+    ~connection_for_slot ~endpoint_for_slot ~endpoint_for_node
+    ~is_standalone ~atomic_lock_for_slot
 
 (* ---------- refresh fiber ---------- *)
 
@@ -839,13 +867,20 @@ let create ~sw ~net ~clock ?domain_mgr ~config:(cfg : Config.t) () =
           ~connection_config:cfg.connection
           slot
       in
+      let endpoint_for_node ~node_id =
+        sync_ref ();
+        endpoint_for_node_via ~topology_ref
+          ~prefer_hostname:cfg.prefer_hostname
+          ~connection_config:cfg.connection
+          ~node_id
+      in
       let for_primary = make_atomic_lock_table () in
       let atomic_lock_for_slot slot =
         sync_ref ();
         atomic_lock_for_slot_via ~topology_ref ~for_primary slot
       in
       Ok (Router.make ~exec ~exec_multi ~pair ~close ~primary
-            ~connection_for_slot ~endpoint_for_slot
+            ~connection_for_slot ~endpoint_for_slot ~endpoint_for_node
             ~is_standalone:false
             ~atomic_lock_for_slot)
 

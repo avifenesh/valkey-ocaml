@@ -167,6 +167,25 @@ val keepalive_count : t -> int
 (** Number of successful keepalive PINGs since [connect]. For observability
     and tests; zero if [keepalive_interval] is None. *)
 
+val client_id : t -> int64 option
+(** Server-assigned [CLIENT ID] from the most recent successful
+    HELLO handshake, or [None] if no successful handshake has
+    completed. Refreshed on every reconnect — callers caching
+    the id for later use ({!Blocking_pool} needs it to send
+    [CLIENT UNBLOCK <id>] from a separate multiplexed conn)
+    MUST pair the cache with a generation snapshot via
+    {!handshake_generation} and reject the cached id if the
+    generation has advanced. *)
+
+val handshake_generation : t -> int
+(** Monotonically increasing counter of successful handshakes.
+    Starts at [0] before the initial handshake completes,
+    [1] after the first connect, [2] after the first reconnect,
+    and so on. Pair with {!client_id} to detect staleness —
+    the two values snapshotted together form a valid
+    (id, generation) tuple; if a later read observes a
+    larger generation, the id is stale and must not be used. *)
+
 val interrupt : t -> unit
 (** Force-close the current transport without marking the connection
     permanently closed. If the owning switch is still alive, the
