@@ -5,7 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.1] — 2026-05-01
+
+### Fixed
+
+- `runtest` in the opam sandbox failed because the five
+  `mtls config (pure)` tests read PEM bytes from `tls/`, which is
+  populated at build time by `scripts/gen-tls-certs.sh` (run by
+  our GHA, not by opam). The tests are pure parse coverage of
+  `Tls_config.with_client_cert`, so they should not depend on a
+  shell script + openssl at runtest time.
+
+  Committed self-signed fixtures under `test/fixtures/mtls/`
+  (CA + client cert/key, ~5 KB) and declared them as a
+  `(source_tree fixtures)` dep on the unit_tests stanza so dune
+  copies them next to the test binary. The live mTLS integration
+  test (`test_mtls_integration`, separate executable) keeps
+  reading from `tls/` at runtime — the script remains the source
+  of truth for live-server certs.
+
+  Reported by @jmid on
+  [opam-repository#29825](https://github.com/ocaml/opam-repository/pull/29825).
+
+### Internal
+
+- `dune-project` (depends): no functional change. `valkey.opam`
+  is now regenerated cleanly from `dune-project` rather than
+  carrying drift from the v0.3.0 cut.
+
+## [0.3.0] — 2026-04-30
 
 ### Added — Phase 10: IAM authentication + mTLS
 

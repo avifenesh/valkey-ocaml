@@ -22,6 +22,7 @@
           test_iam_sigv4
           test_iam_provider
           test_mtls_config)
+ (deps (source_tree fixtures))
  (libraries valkey alcotest eio_main opentelemetry))
 
 ; Integration tests — need a live Valkey / cluster. Built as a
